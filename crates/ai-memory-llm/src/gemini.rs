@@ -125,6 +125,9 @@ struct GeminiResponse {
 struct GeminiCandidate {
     #[serde(default)]
     content: Option<GeminiCandidateContent>,
+    /// `"STOP"`, `"MAX_TOKENS"`, `"SAFETY"`, … Absent on some responses.
+    #[serde(rename = "finishReason", default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,7 +177,24 @@ impl LlmProvider for GeminiProvider {
         let text = first_text(&response).ok_or_else(|| {
             LlmError::UnexpectedShape("gemini response had no candidate text".into())
         })?;
-        serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
+        // A response cut at maxOutputTokens is not a parse-shape problem:
+        // measured 2026-09-23, a manual auto_improve run on a 294-observation
+        // session failed as a bare `serde: EOF while parsing a string at
+        // line 2 column 67359` 502 with no run recorded. Name it instead.
+        serde_json::from_str::<serde_json::Value>(&text).map_err(|err| {
+            let cut = response
+                .candidates
+                .first()
+                .and_then(|c| c.finish_reason.as_deref())
+                == Some("MAX_TOKENS");
+            if cut {
+                LlmError::Truncated {
+                    finish_reason: "MAX_TOKENS".into(),
+                }
+            } else {
+                LlmError::from(err)
+            }
+        })
     }
 }
 

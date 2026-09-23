@@ -12,9 +12,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId};
-use ai_memory_llm::{
-    ChatMessage, ChatRequest, LlmError, LlmProvider, Role,
-};
+use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role};
 use ai_memory_store::{AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoredPageBody};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de};
@@ -549,8 +547,7 @@ pub async fn run_auto_improve_review(
                 min_confidence: cfg.min_confidence,
                 proposal_actor: cfg.proposal_actor,
                 pending_path: cfg.pending_path,
-                summary: "review truncated by provider output limit; no proposals produced"
-                    .into(),
+                summary: "review truncated by provider output limit; no proposals produced".into(),
                 proposals: Vec::new(),
                 rejected_candidates: Vec::new(),
                 warnings: vec![format!(
@@ -1647,7 +1644,10 @@ fn proposal_has_body_markdown(obj: &serde_json::Map<String, serde_json::Value>) 
 /// observed run, success or failure) — without rejecting them: silently
 /// discarding those proposals would zero out the only two runs that have
 /// ever produced a validated proposal.
-fn parse_llm_response(value: &serde_json::Value, warnings: &mut Vec<String>) -> AutoImproveLlmResponse {
+fn parse_llm_response(
+    value: &serde_json::Value,
+    warnings: &mut Vec<String>,
+) -> AutoImproveLlmResponse {
     let summary = value
         .get("summary")
         .and_then(|v| v.as_str())
@@ -1664,9 +1664,7 @@ fn parse_llm_response(value: &serde_json::Value, warnings: &mut Vec<String>) -> 
         // flat object sharing none of our field names at all, not even a
         // `proposals` wrapper. `Vec::new()` would silently look identical
         // to "the model legitimately found nothing to propose" — name it.
-        warnings.push(
-            "schema_not_honoured: response missing top-level \"proposals\" array".into(),
-        );
+        warnings.push("schema_not_honoured: response missing top-level \"proposals\" array".into());
         return AutoImproveLlmResponse {
             summary,
             proposals: Vec::new(),
@@ -1784,6 +1782,18 @@ fn validate_proposal(
     proposal.operation = normalize_operation(&proposal.operation);
     if proposal.operation != CANONICAL_OPERATION {
         return Err("unsupported_operation".into());
+    }
+    // The same reasoning for `kind`: it is a label, and the path already
+    // decides where the page lands. Measured live 2026-09-23 on
+    // poolside/laguna-s-2.1: schema-conformant proposals with a sound path
+    // were rejected as `kind_path_mismatch` in 2 of 4 runs. When the path
+    // prefix names exactly one kind, the path wins; an unknown prefix still
+    // fails below as `unsupported_path_prefix` / `kind_path_mismatch`.
+    if !kind_matches_path(&proposal.kind, &proposal.path)
+        && let Some(kind) = kind_for_path(&proposal.path)
+    {
+        tracing::debug!(from = %proposal.kind, to = kind, path = %proposal.path, "auto_improve: kind normalised from path");
+        proposal.kind = kind.to_string();
     }
     if proposal.confidence < cfg.min_confidence {
         return Err("confidence_below_threshold".into());
@@ -2038,6 +2048,23 @@ fn allowed_target_path(path: &str) -> bool {
         || path == "_slots/current-focus.md"
 }
 
+/// The one kind a path prefix implies, or `None` when the prefix is shared
+/// (`concepts/` holds concept, fact and note) or unknown.
+fn kind_for_path(path: &str) -> Option<&'static str> {
+    [
+        ("gotchas/", "gotcha"),
+        ("decisions/", "decision"),
+        ("concepts/", "concept"),
+        ("procedures/", "procedure"),
+        ("_rules/", "rule"),
+        ("_slots/", "slot"),
+        ("notes/", "note"),
+    ]
+    .into_iter()
+    .find(|(prefix, _)| path.starts_with(prefix))
+    .map(|(_, kind)| kind)
+}
+
 fn kind_matches_path(kind: &str, path: &str) -> bool {
     match kind {
         "gotcha" => path.starts_with("gotchas/"),
@@ -2151,7 +2178,10 @@ fn render_proposal_field_contract() -> String {
     let edit_schema = auto_improve_patch_edit_schema();
 
     let mut lines = vec!["Return exactly one JSON object with these top-level fields:".to_string()];
-    if let Some(props) = envelope_schema.get("properties").and_then(|v| v.as_object()) {
+    if let Some(props) = envelope_schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+    {
         for (name, schema) in props {
             lines.push(format!("- {}", render_field_line(name, schema)));
         }
@@ -2163,7 +2193,10 @@ fn render_proposal_field_contract() -> String {
          (no others, no renamed fields):"
             .to_string(),
     );
-    if let Some(props) = proposal_schema.get("properties").and_then(|v| v.as_object()) {
+    if let Some(props) = proposal_schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+    {
         for name in props.keys() {
             if PROPOSAL_PROMPT_EXCLUDED_FIELDS.contains(&name.as_str()) {
                 continue;
@@ -2341,6 +2374,33 @@ mod tests {
             edits: Vec::new(),
             expected_base_body_sha256: None,
         }
+    }
+
+    #[test]
+    fn a_kind_that_contradicts_a_known_path_prefix_is_normalised_from_the_path() {
+        let cfg = AutoImproveReviewConfig::default();
+        let idx = ExistingPageIndex::from_pages(&[], &[]);
+        let mut p = proposal("concepts/sqlite-microseconds.md", "gotcha", 0.9);
+        assert!(validate_proposal(&mut p, &cfg, &idx).is_ok());
+        assert_eq!(p.kind, "concept");
+        let mut leaked = proposal("gotchas/shell-grep.md", "full_page", 0.9);
+        assert!(validate_proposal(&mut leaked, &cfg, &idx).is_ok());
+        assert_eq!(leaked.kind, "gotcha");
+        let mut kept = proposal("concepts/x.md", "fact", 0.9);
+        assert!(validate_proposal(&mut kept, &cfg, &idx).is_ok());
+        assert_eq!(
+            kept.kind, "fact",
+            "a kind the prefix already allows is untouched"
+        );
+    }
+
+    #[test]
+    fn an_unknown_path_prefix_is_still_rejected() {
+        let cfg = AutoImproveReviewConfig::default();
+        let idx = ExistingPageIndex::from_pages(&[], &[]);
+        let mut p = proposal("misc/x.md", "gotcha", 0.9);
+        assert!(validate_proposal(&mut p, &cfg, &idx).is_err());
+        assert_eq!(p.kind, "gotcha");
     }
 
     fn eval_cfg(command: String) -> AutoImproveEvalConfig {
@@ -3846,8 +3906,7 @@ mod tests {
         let mut warnings = Vec::new();
         let raw = parse_llm_response(&envelope, &mut warnings);
         assert_eq!(raw.proposals.len(), 1, "warnings: {warnings:?}");
-        let (accepted, rejected, _) =
-            validate_response(raw, &cfg(), &existing_index_for_test());
+        let (accepted, rejected, _) = validate_response(raw, &cfg(), &existing_index_for_test());
         assert!(rejected.is_empty(), "unexpected rejection(s): {rejected:?}");
         assert_eq!(accepted.len(), 1);
         assert_eq!(accepted[0].kind, "gotcha");
@@ -3902,7 +3961,10 @@ mod tests {
         let mut p = proposal("decisions/foo.md", "gotcha", 0.9);
         let mut warnings = Vec::new();
         normalize_kind(&mut p, &mut warnings);
-        assert_eq!(p.kind, "gotcha", "a recognized-but-mismatched kind is untouched");
+        assert_eq!(
+            p.kind, "gotcha",
+            "a recognized-but-mismatched kind is untouched"
+        );
     }
 
     // ── per-proposal isolation (fix 4) ──
@@ -3927,7 +3989,10 @@ mod tests {
         assert_eq!(raw.proposals.len(), 1, "the good proposal must survive");
         assert_eq!(raw.proposals[0].path, "gotchas/npm-ci-without-lockfile.md");
         assert_eq!(raw.rejected_candidates.len(), 1);
-        assert_eq!(raw.rejected_candidates[0].reason, "proposal_deserialize_failed");
+        assert_eq!(
+            raw.rejected_candidates[0].reason,
+            "proposal_deserialize_failed"
+        );
     }
 
     // ── evidence "unspecified" fallback becomes a warning, not silent (fix 3) ──
@@ -3962,7 +4027,10 @@ mod tests {
             "edit_mode",
             "edits",
         ] {
-            assert!(rendered.contains(field), "missing field {field:?} in:\n{rendered}");
+            assert!(
+                rendered.contains(field),
+                "missing field {field:?} in:\n{rendered}"
+            );
         }
         assert!(rendered.contains("full_page"));
         assert!(rendered.contains("patch"));
@@ -3982,7 +4050,8 @@ mod tests {
             .expect("AutoImproveProposal schema has properties");
         for name in props.keys() {
             assert!(
-                !PROPOSAL_PROMPT_EXCLUDED_FIELDS.contains(&name.as_str()) || name == "expected_base_body_sha256",
+                !PROPOSAL_PROMPT_EXCLUDED_FIELDS.contains(&name.as_str())
+                    || name == "expected_base_body_sha256",
                 "field {name:?} is excluded from the prompt contract by a name other than \
                  the documented expected_base_body_sha256 — update PROPOSAL_PROMPT_EXCLUDED_FIELDS deliberately"
             );
@@ -4069,8 +4138,16 @@ mod tests {
     async fn run_auto_improve_review_sends_the_generated_field_contract() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let ws = store.writer.get_or_create_workspace("default").await.unwrap();
-        let proj = store.writer.get_or_create_project(ws, "proj", None).await.unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
         let session_id = ai_memory_core::SessionId::new();
         store
             .writer
@@ -4123,9 +4200,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(llm.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let sent = llm.last_system.lock().unwrap().clone().expect("system prompt sent");
-        for field in ["operation", "path", "kind", "confidence", "rationale", "evidence", "body_markdown", "edit_mode"] {
-            assert!(sent.contains(field), "sent prompt missing {field:?}:\n{sent}");
+        let sent = llm
+            .last_system
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("system prompt sent");
+        for field in [
+            "operation",
+            "path",
+            "kind",
+            "confidence",
+            "rationale",
+            "evidence",
+            "body_markdown",
+            "edit_mode",
+        ] {
+            assert!(
+                sent.contains(field),
+                "sent prompt missing {field:?}:\n{sent}"
+            );
         }
         assert!(sent.to_lowercase().contains("never put"));
     }
@@ -4168,8 +4262,16 @@ mod tests {
     async fn truncation_produces_a_report_with_a_truncated_warning_and_no_retry() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let ws = store.writer.get_or_create_workspace("default").await.unwrap();
-        let proj = store.writer.get_or_create_project(ws, "proj", None).await.unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
         let session_id = ai_memory_core::SessionId::new();
         store
             .writer
@@ -4299,5 +4401,77 @@ mod operation_normalization_tests {
             serde_json::from_value(serde_json::json!({ "operation": "create" }))
                 .expect("must not fail to parse; normalisation happens in validation");
         assert_eq!(parsed.operation, "create");
+    }
+}
+
+/// Live check against the real Poolside endpoint (FN8-8120). Ignored by
+/// default; run with `LLM_API_KEY` set:
+/// `cargo test -p ai-memory-consolidate live_laguna -- --ignored --nocapture`.
+/// Uses the production system prompt, response schema and validator; only
+/// the user prompt is hand-written.
+#[cfg(test)]
+mod live_laguna_tests {
+    use super::*;
+    use ai_memory_llm::{LlmProvider, OpenAiCompatProvider};
+    use secrecy::SecretString;
+
+    #[tokio::test]
+    #[ignore = "calls the live Poolside API"]
+    async fn live_laguna_structured_review_passes_validation() {
+        let key = std::env::var("LLM_API_KEY").expect("LLM_API_KEY");
+        let llm = OpenAiCompatProvider::new(
+            "https://inference.poolside.ai/v1",
+            Some(SecretString::from(key)),
+            "poolside/laguna-s-2.1",
+        )
+        .unwrap()
+        .with_strict(true)
+        .with_timeout_secs(300);
+        let prompt = "Session observations (coding agent, project floo):\n\
+            [obs 1] tool Bash: `grep -c x file` returned 0 on a file with control bytes; `/usr/bin/grep -c x file` returned 8. The shell's grep is an overridden function.\n\
+            [obs 2] agent: switched every search to /usr/bin/grep; results now match.\n\
+            [obs 3] tool Bash: sqlite `datetime(staged_at/1000,'unixepoch')` returned empty; staged_at is microseconds.\n\
+            [obs 4] agent: `CAST(created_at AS INTEGER)/1000000` fixed the date; integer-vs-text comparison was silently false before the CAST.\n\
+            Existing wiki pages: none relevant.\n\
+            Propose durable wiki pages for reusable lessons. Evidence page = \"sessions/live-test.md\"; quote the observation text.";
+        let request = ChatRequest {
+            system: Some(auto_improve_system_prompt()),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: prompt.into(),
+            }],
+            max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
+            temperature: Some(0.1),
+        };
+        let schema = serde_json::to_value(schemars::schema_for!(AutoImproveLlmResponse)).unwrap();
+        let mut runs = 0;
+        let mut validated_runs = 0;
+        for i in 0..6 {
+            runs += 1;
+            match llm
+                .complete_structured_raw(request.clone(), schema.clone())
+                .await
+            {
+                Ok(value) => {
+                    let mut w = Vec::new();
+                    let raw = parse_llm_response(&value, &mut w);
+                    let cfg = AutoImproveReviewConfig::default();
+                    let idx = ExistingPageIndex::from_pages(&[], &[]);
+                    let (ok, rejected, warnings) = validate_response(raw, &cfg, &idx);
+                    let reasons: Vec<_> = rejected.iter().map(|r| r.reason.clone()).collect();
+                    eprintln!(
+                        "run {i}: validated={} rejected={reasons:?} warnings={:?}",
+                        ok.len(),
+                        [w, warnings].concat()
+                    );
+                    if !ok.is_empty() {
+                        validated_runs += 1;
+                    }
+                }
+                Err(e) => eprintln!("run {i}: ERROR {e}"),
+            }
+        }
+        eprintln!("validated runs: {validated_runs}/{runs}");
+        assert!(validated_runs > 0, "no run produced a validated proposal");
     }
 }
