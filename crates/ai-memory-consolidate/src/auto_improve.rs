@@ -609,6 +609,10 @@ struct AutoImproveEvalRequest<'a> {
     before_body: &'a str,
     after_body: &'a str,
     expected_base_body_sha256: Option<&'a str>,
+    /// The quotes the proposal rests on, so an external judge can check the page's claims against
+    /// them (measured 2026-09-23: a form-only judge approved 37 of 40 pages with one falsified
+    /// fact; truth needs the evidence). Additive field; judges that ignore it are unaffected.
+    evidence: &'a [AutoImproveEvidence],
 }
 
 #[derive(Debug, Deserialize)]
@@ -738,6 +742,7 @@ async fn run_eval_for_proposal(
         before_body,
         after_body: &proposal.body_markdown,
         expected_base_body_sha256: proposal.expected_base_body_sha256.as_deref(),
+        evidence: &proposal.evidence,
     };
     let stdin = serde_json::to_vec(&input).map_err(|e| EvalRunError::Error(e.to_string()))?;
     let mut child = tokio::process::Command::new(program)
@@ -2479,6 +2484,32 @@ mod tests {
         assert_eq!(proposals.len(), 1);
         assert!(rejected.is_empty());
         assert!(warnings.is_empty());
+    }
+
+    /// The judge receives the proposal's evidence quotes (2026-09-23): it passes only when the
+    /// quote from `proposal()` ("quote") reaches its stdin inside an `evidence` array.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eval_request_carries_the_evidence_quotes() {
+        let script = write_eval_script(
+            "#!/bin/sh\nif grep -q '\"evidence\":\\[{\"page\":\"sessions/abc.md\",\"quote\":\"quote\"}' ; then printf '%s' '{\"passed\":true}'; else printf '%s' '{\"passed\":false,\"reason\":\"no evidence\"}'; fi\n",
+        );
+        let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
+        let mut rejected = Vec::new();
+        let mut warnings = Vec::new();
+        apply_eval_gate_with_before_bodies(
+            &eval_cfg(script),
+            &mut proposals,
+            &mut rejected,
+            &mut warnings,
+            &BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(
+            proposals.len(),
+            1,
+            "the evidence array must reach the judge: {rejected:?}"
+        );
     }
 
     #[tokio::test]
