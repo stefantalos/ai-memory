@@ -40,8 +40,9 @@ pub struct ScheduledAutoImproveSettings {
     /// Minimum session age before a completed session becomes a
     /// candidate (`[auto_improve.scheduler] min_session_age_secs`).
     pub min_session_age_secs: u64,
-    /// Maximum sessions reviewed per scope per tick
-    /// (`[auto_improve.scheduler] max_sessions_per_tick`).
+    /// Maximum sessions per scope per tick that reach the model
+    /// (`[auto_improve.scheduler] max_sessions_per_tick`). Sessions the
+    /// preflight filters skip never call the model and do not count.
     pub max_sessions_per_tick: usize,
     /// Cross-session ("experience") pass settings; `None` = disabled
     /// (`[auto_improve.experience]`, docs/experience.md).
@@ -91,7 +92,17 @@ struct ScheduledAutoImproveOutcome {
     /// lost its Nth proposal would otherwise be indistinguishable from a clean
     /// run of N-1.
     skipped: Vec<SkippedProposal>,
+    /// False when the preflight filters skipped the session without calling
+    /// the model; such a run does not use up a `max_sessions_per_tick` slot.
+    reached_model: bool,
 }
+
+/// How many candidates are read per model slot. A preflight skip costs one
+/// observation read and no model call, so it must not hold a slot: measured
+/// 2026-09-23, 31 of 35 ticks spent their only slot on a session with too few
+/// observations while substantial sessions waited behind it. The pool keeps
+/// FIFO order; it only lets the tick look past the sessions it will skip.
+const PREFLIGHT_POOL_FACTOR: usize = 8;
 
 /// Aggregate counters for one scheduler tick across every scope.
 #[derive(Debug, Default)]
@@ -161,7 +172,9 @@ pub async fn run_auto_improve_scheduler_tick(
                 scope.workspace_id,
                 scope.project_id,
                 settings.min_session_age_secs,
-                settings.max_sessions_per_tick,
+                settings
+                    .max_sessions_per_tick
+                    .saturating_mul(PREFLIGHT_POOL_FACTOR),
             )
             .await
         {
@@ -259,7 +272,11 @@ pub async fn run_auto_improve_scheduler_tick(
         }
 
         outcome.scopes_with_candidates += 1;
+        let mut model_slots_used = 0usize;
         for candidate in candidates {
+            if model_slots_used >= settings.max_sessions_per_tick {
+                break;
+            }
             let claimed = match ctx
                 .writer
                 .claim_auto_improve_scheduler_session(
@@ -294,6 +311,9 @@ pub async fn run_auto_improve_scheduler_tick(
             }
             match run_scheduled_auto_improve(&ctx, candidate.session_id).await {
                 Ok(run) => {
+                    if run.reached_model {
+                        model_slots_used += 1;
+                    }
                     outcome.reviewed += 1;
                     outcome.skipped += run.skipped.len();
                     info!(
@@ -324,6 +344,9 @@ pub async fn run_auto_improve_scheduler_tick(
                     }
                 }
                 Err(e) => {
+                    // A failure may have reached the model; it holds its slot
+                    // so a failing provider is not retried across the pool.
+                    model_slots_used += 1;
                     outcome.errors += 1;
                     tracing::warn!(
                         workspace = %scope.workspace_name,
@@ -487,6 +510,7 @@ async fn stage_and_apply(
         pending,
         conflicts,
         skipped: staged.skipped,
+        reached_model: report.provider != "none",
     })
 }
 
@@ -1191,6 +1215,99 @@ mod tests {
             captured.contains("scheduled auto-improve proposal was not staged")
                 && captured.contains(COLLIDING_PATH),
             "the log must name the dropped target: {captured}"
+        );
+    }
+
+    async fn seed_empty_session(store: &Store, ws: WorkspaceId, proj: ProjectId) -> SessionId {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        session_id
+    }
+
+    /// A preflight skip never calls the model, so it must not spend a
+    /// `max_sessions_per_tick` slot: with one slot and three thin sessions
+    /// queued first, the substantial session behind them is reviewed in the
+    /// same tick, and the slot still caps the model calls.
+    #[tokio::test]
+    async fn preflight_skips_do_not_spend_the_model_slot() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+                .await
+                .unwrap(),
+            (1, 0)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        for _ in 0..3 {
+            seed_empty_session(&store, ws, proj).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let substantial = seed_reviewable_session(&store, ws, proj).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let next_substantial = seed_reviewable_session(&store, ws, proj).await;
+
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig {
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 1,
+            experience: None,
+        };
+        let llm: Arc<dyn LlmProvider> = Arc::new(OneProposalLlm);
+        let tick =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(tick.errors, 0);
+        assert_eq!(
+            tick.reviewed, 4,
+            "three preflight skips plus the one model-reviewed session"
+        );
+
+        let left = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        let left: Vec<SessionId> = left.iter().map(|c| c.session_id).collect();
+        assert!(
+            !left.contains(&substantial),
+            "the substantial session must not wait behind the thin ones"
+        );
+        assert_eq!(
+            left,
+            vec![next_substantial],
+            "the single model slot still caps the tick"
         );
     }
 }
