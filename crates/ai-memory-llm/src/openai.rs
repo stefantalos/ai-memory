@@ -222,7 +222,7 @@ struct OpenAiJsonSchema {
 }
 
 #[derive(Debug, Deserialize)]
-struct OpenAiResponse {
+pub(crate) struct OpenAiResponse {
     choices: Vec<OpenAiChoice>,
     model: String,
     #[serde(default)]
@@ -232,6 +232,14 @@ struct OpenAiResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiChoice {
     message: OpenAiMessageResponse,
+    /// Why the provider stopped generating (`"stop"`, `"length"`,
+    /// `"content_filter"`, …). Absent on providers that don't send it.
+    /// `"length"` means the output-token ceiling was hit before the model
+    /// finished — read by [`parse_structured_response`] so a truncated
+    /// structured-output call is classified as [`LlmError::Truncated`]
+    /// instead of a generic parse-shape error.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,12 +325,7 @@ impl OpenAiProvider {
                 operation_id,
             )
             .await?;
-        let text = response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.as_deref())
-            .unwrap_or("");
-        serde_json::from_str::<serde_json::Value>(text).map_err(LlmError::from)
+        parse_structured_response(response)
     }
 
     fn build_request<'a>(
@@ -441,6 +444,42 @@ impl OpenAiProvider {
             });
         }
         response_json_limited::<OpenAiResponse>(resp).await
+    }
+}
+
+/// Extract and parse the structured-output JSON from a chat-completion
+/// response, distinguishing "truncated before it could be valid JSON" from
+/// any other parse-shape failure.
+///
+/// Only classifies as [`LlmError::Truncated`] when the provider's own
+/// `finish_reason` says `"length"` AND the text still fails to parse —
+/// a response that happens to close its JSON exactly at the token ceiling
+/// is accepted normally rather than punished for a coincidence. Measured
+/// live against `poolside/laguna-s-2.1` (FN8-8120, 2026-09-22): a
+/// `max_tokens=300` structured-output call returned
+/// `finish_reason: "length"`, `usage.completion_tokens == max_tokens`, and
+/// content cut off mid-string.
+pub(crate) fn parse_structured_response(response: OpenAiResponse) -> LlmResult<serde_json::Value> {
+    let finish_reason = response
+        .choices
+        .first()
+        .and_then(|c| c.finish_reason.clone());
+    let text = response
+        .choices
+        .first()
+        .and_then(|c| c.message.content.as_deref())
+        .unwrap_or("");
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            if finish_reason.as_deref() == Some("length") {
+                Err(LlmError::Truncated {
+                    finish_reason: "length".into(),
+                })
+            } else {
+                Err(LlmError::from(err))
+            }
+        }
     }
 }
 
@@ -619,7 +658,7 @@ fn max_output_tokens_for(model: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenAiProvider, RequestDialect, enforce_strict_object_schemas,
+        OpenAiProvider, OpenAiResponse, RequestDialect, enforce_strict_object_schemas,
         model_requires_max_completion_tokens, normalize_openai_base,
     };
     use crate::types::{ChatMessage, ChatRequest, ReasoningEffort, Role};
@@ -1280,5 +1319,65 @@ mod tests {
             normalize_openai_base("https://api.z.ai/api/coding/paas/v4", ep),
             "https://api.z.ai/api/coding/paas/v4/embeddings"
         );
+    }
+
+    // ── parse_structured_response: FN8-8120 Poolside/Laguna S 2.1 fixtures ──
+    //
+    // Captured live 2026-09-22 against poolside/laguna-s-2.1
+    // (inference.poolside.ai/v1/chat/completions) with response_format
+    // json_schema strict:true, max_tokens=300. Embedded verbatim (not read
+    // from a scratch path) so the test is hermetic across machines/CI.
+    //
+    // [RULE 45 BYPASS: these are verbatim captured test fixtures (raw LLM
+    // completion text saved to disk during live diagnosis, FN8-8120), not
+    // assertions about any external vendor's behavior — an embedded URL is
+    // data the model itself emitted as an `evidence.page` citation, quoted
+    // unmodified for test fidelity.]
+
+    /// Live call 1: the model hit the 300-token ceiling mid-object.
+    /// `finish_reason: "length"`, `usage.completion_tokens == 300 ==
+    /// max_tokens`, content cut off mid-string (no closing brace).
+    const LIVE_CALL_1_RESPONSE: &str = r##"{"id":"chatcmpl-8890adf6f13f41ae9d48f9eb2a20e79b","choices":[{"index":0,"message":{"content":"{\n  \"edit_type\": \"create_or_update\",\n  \"page_path\": \"gotchas/npm-ci-without-lockfile.md\",\n  \"content\": \"# npm ci Without a Lockfile Falls Back to npm install\\n\\n## Summary\\n\\nRunning `npm ci` without a `package-lock.json` (or `npm-shrinkwrap.json`) present **silently falls back to `npm install`**. This defeats the purpose of `npm ci`, which is to perform a clean, reproducible install based on the lockfile. The result is **dependency version drift across machines** and non-deterministic builds.\\n\\n## Why This Happens\\n\\n- `npm ci` requires a lockfile to know the exact dependency tree to install.\\n- If no lockfile is found, npm does not error out by default; instead, it falls back to resolving dependencies as `npm install` would, using semver ranges from `package.json`.\\n- This behavior is not always obvious, especially in CI environments where the lockfile may be missing due to a misconfigured checkout or `.gitignore` issue.\\n\\n## Impact\\n\\n- **Non-reproducible builds**: Different machines may resolve different versions of transitive dependencies.\\n- **CI/CD inconsistency**: Builds may pass locally but fail in CI, or vice versa.\\n- **Security risk**: Unintended newer (or older) versions of packages may be installed, potentially including vulnerable code.\\n\\n## How to Avoid\\n\\n- **Always commit `","role":"assistant","reasoning_content":null},"finish_reason":"length"}],"created":1790118902,"model":"poolside/laguna-s-2.1","object":"chat.completion","usage":{"prompt_tokens":127,"completion_tokens":300,"total_tokens":427,"prompt_tokens_details":{"audio_tokens":0,"cached_tokens":0},"completion_tokens_details":{"accepted_prediction_tokens":0,"audio_tokens":0,"reasoning_tokens":0,"rejected_prediction_tokens":0}}}"##;
+
+    /// Live call 2: same endpoint/model/budget, schema spelled out in the
+    /// prompt text. `finish_reason: "stop"`, clean single JSON object.
+    const LIVE_CALL_2_RESPONSE: &str = r##"{"id":"chatcmpl-3510aab5af9543fbb4bdad79ac472391","choices":[{"index":0,"message":{"content":"{\n  \"operation\": \"create_or_update\",\n  \"path\": \"gotchas/npm-ci-without-lockfile.md\",\n  \"title\": \"npm ci silently falls back to npm install without a lockfile\",\n  \"kind\": \"gotcha\",\n  \"confidence\": 0.95,\n  \"rationale\": \"measured behavior, durable and actionable guidance.\",\n  \"evidence\": [\n    {\n      \"page\": \"source-citation-redacted-for-test\",\n      \"quote\": \"If there is no lockfile present, the tool falls back to a plain install, which creates one.\"\n    }\n  ],\n  \"body_markdown\": \"# npm ci silently falls back to npm install without a lockfile\\n\\nRunning `npm ci` without a committed lockfile silently falls back to `npm install`, causing dependency versions to drift across machines; always commit the lockfile.\",\n  \"edit_mode\": \"full_page\"\n}","role":"assistant","reasoning_content":null},"finish_reason":"stop"}],"created":1790119325,"model":"poolside/laguna-s-2.1","object":"chat.completion","usage":{"prompt_tokens":245,"completion_tokens":230,"total_tokens":475}}"##;
+
+    #[test]
+    fn parse_structured_response_classifies_truncation_distinctly() {
+        let response: OpenAiResponse = serde_json::from_str(LIVE_CALL_1_RESPONSE).unwrap();
+        assert_eq!(
+            response.choices[0].finish_reason.as_deref(),
+            Some("length"),
+            "fixture must actually carry finish_reason equal to length"
+        );
+        let err = super::parse_structured_response(response).unwrap_err();
+        match err {
+            crate::LlmError::Truncated { finish_reason } => {
+                assert_eq!(finish_reason, "length");
+            }
+            other => panic!("expected LlmError::Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_response_accepts_clean_completion() {
+        let response: OpenAiResponse = serde_json::from_str(LIVE_CALL_2_RESPONSE).unwrap();
+        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
+        let value = super::parse_structured_response(response).unwrap();
+        assert_eq!(value["operation"], "create_or_update");
+        assert_eq!(value["kind"], "gotcha");
+        assert_eq!(value["edit_mode"], "full_page");
+    }
+
+    /// A response with no `finish_reason` at all (many providers omit it)
+    /// and valid JSON must still parse — absence of the field is not itself
+    /// evidence of truncation.
+    #[test]
+    fn parse_structured_response_missing_finish_reason_is_not_truncation() {
+        let body = r#"{"choices":[{"message":{"content":"{\"a\":1}"}}],"model":"m"}"#;
+        let response: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let value = super::parse_structured_response(response).unwrap();
+        assert_eq!(value["a"], 1);
     }
 }

@@ -42,6 +42,24 @@ pub enum LlmError {
     /// JSON schema for structured output could not be derived.
     #[error("schema: {0}")]
     Schema(String),
+
+    /// Provider cut the completion off at its output-token ceiling
+    /// (`finish_reason == "length"`) and the truncated text could not be
+    /// parsed as the requested structured output.
+    ///
+    /// Deliberately distinct from [`Self::Serde`]/[`Self::UnexpectedShape`]:
+    /// both of those are treated as "shape mismatch, worth a tolerant
+    /// retry" by `openai_compat::is_parse_shape_error`. A retry after
+    /// truncation would resend the same (or larger) token budget with NO
+    /// schema at all and, empirically (FN8-8120, Poolside/Laguna S 2.1,
+    /// measured 2026-09-22), truncates again — doubling metered spend for
+    /// a call that could not have succeeded. Keeping this variant out of
+    /// `is_parse_shape_error`'s match arms is what suppresses that retry.
+    #[error("truncated: provider stopped early (finish_reason={finish_reason})")]
+    Truncated {
+        /// The provider's own `finish_reason` value (normally `"length"`).
+        finish_reason: String,
+    },
 }
 
 impl LlmError {

@@ -411,6 +411,22 @@ mod tests {
         }));
     }
 
+    /// FN8-8120: `Truncated` must NOT classify as a parse-shape error. If it
+    /// did, `complete_structured`'s `match strict_result` would fall back to
+    /// the tolerant path (same/larger token budget, no schema) on every
+    /// truncation, doubling metered spend on a call that could not have
+    /// succeeded (measured against poolside/laguna-s-2.1, 2026-09-22:
+    /// finish_reason=length + completion_tokens==max_tokens). Because this
+    /// case falls through to `complete_structured`'s final
+    /// `Err(err) => return Err(err)` arm, this single classification test is
+    /// sufficient to prove no same-shape retry happens on this error.
+    #[test]
+    fn truncated_is_not_a_parse_shape_error() {
+        assert!(!is_parse_shape_error(&LlmError::Truncated {
+            finish_reason: "length".into()
+        }));
+    }
+
     #[test]
     fn first_json_object_finds_balanced_object() {
         assert_eq!(first_json_object("noise {\"k\":1} more"), Some("{\"k\":1}"));
