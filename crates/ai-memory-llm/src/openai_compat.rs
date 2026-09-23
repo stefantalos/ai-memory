@@ -61,6 +61,21 @@ pub struct OpenAiCompatProvider {
     /// instead of the tolerant parser. Set by the factory from
     /// `ProviderConfig::compat_strict` (sourced once by `Config::load`).
     strict: bool,
+    /// Structured output through one forced function call instead of
+    /// `response_format`. On by default for `poolside/*` models, whose
+    /// hosted endpoint ignores `response_format` (see
+    /// `OpenAiProvider::complete_structured_via_tool`).
+    structured_via_tool: bool,
+}
+
+/// Engines measured to ignore `response_format` but honour a forced tool call.
+fn model_prefers_forced_tool(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("poolside/")
+}
+
+/// Hosts that accept Poolside's `chat_template_kwargs.enable_thinking`.
+fn host_accepts_thinking_toggle(base_url: &str) -> bool {
+    base_url.to_ascii_lowercase().contains("poolside.ai")
 }
 
 impl OpenAiCompatProvider {
@@ -76,17 +91,23 @@ impl OpenAiCompatProvider {
         model: impl Into<String>,
     ) -> LlmResult<Self> {
         let key = api_key.unwrap_or_else(|| SecretString::from("dummy"));
+        let base_url = base_url.into();
+        let model = model.into();
+        let structured_via_tool = model_prefers_forced_tool(&model);
+        let disable_thinking = structured_via_tool && host_accepts_thinking_toggle(&base_url);
         // Local / proxy engines speak the legacy OpenAI wire format
         // only — no `max_completion_tokens`, no model-family caps, no
         // temperature massaging. Swap dialect so the inner provider's
         // per-request quirks don't leak into Ollama / vLLM setups.
         let inner = OpenAiProvider::new(key, model)?
             .with_base_url(base_url)
-            .with_dialect(RequestDialect::Compat);
+            .with_dialect(RequestDialect::Compat)
+            .with_disable_thinking(disable_thinking);
         Ok(Self {
             inner,
             name_tag: "openai-compat",
             strict: false,
+            structured_via_tool,
         })
     }
 
@@ -96,6 +117,21 @@ impl OpenAiCompatProvider {
     #[must_use]
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Force (or disable) the forced-tool structured path regardless of model.
+    #[must_use]
+    pub fn with_structured_via_tool(mut self, via_tool: bool) -> Self {
+        self.structured_via_tool = via_tool;
+        self
+    }
+
+    /// Override the Poolside thinking toggle on the forced-tool call
+    /// (default: on for poolside.ai hosts serving `poolside/*` models).
+    #[must_use]
+    pub fn with_disable_thinking(mut self, disable: bool) -> Self {
+        self.inner = self.inner.with_disable_thinking(disable);
         self
     }
 
@@ -203,7 +239,19 @@ impl OpenAiCompatProvider {
         // so we can't reuse the response body. Operators on engines that
         // routinely fall back (e.g. reasoning models with `<think>` in
         // `content`) should keep `strict=false` to avoid the double call.
-        if self.strict {
+        if self.structured_via_tool {
+            match self
+                .inner
+                .complete_structured_via_tool(&request, schema.clone(), operation_id)
+                .await
+            {
+                Ok(v) => return Ok(v),
+                Err(err) if is_parse_shape_error(&err) => {
+                    debug!(error = %err, "compat forced-tool: no usable tool call, falling back to tolerant parser");
+                }
+                Err(err) => return Err(err),
+            }
+        } else if self.strict {
             let mut strict_schema = schema.clone();
             enforce_strict_object_schemas(&mut strict_schema);
             let strict_result = self
@@ -352,6 +400,29 @@ mod tests {
         assert!(!p.strict);
         let p = p.with_strict(true);
         assert!(p.strict);
+    }
+
+    #[test]
+    fn forced_tool_and_thinking_toggle_detection() {
+        assert!(model_prefers_forced_tool("poolside/laguna-s-2.1"));
+        assert!(model_prefers_forced_tool("Poolside/laguna-m.1"));
+        assert!(!model_prefers_forced_tool("mistral-nemo"));
+        assert!(!model_prefers_forced_tool("openrouter/poolside-like"));
+        assert!(host_accepts_thinking_toggle(
+            "https://inference.poolside.ai/v1"
+        ));
+        assert!(!host_accepts_thinking_toggle(
+            "https://openrouter.ai/api/v1"
+        ));
+        let p = OpenAiCompatProvider::new(
+            "https://inference.poolside.ai/v1",
+            None,
+            "poolside/laguna-s-2.1",
+        )
+        .unwrap();
+        assert!(p.structured_via_tool);
+        let q = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "qwen3").unwrap();
+        assert!(!q.structured_via_tool);
     }
 
     #[test]

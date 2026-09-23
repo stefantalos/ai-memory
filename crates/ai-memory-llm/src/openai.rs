@@ -92,6 +92,8 @@ pub struct OpenAiProvider {
     timeout: Duration,
     reasoning_effort: Option<ReasoningEffort>,
     client_headers: Option<ClientHeaders>,
+    /// Sends `chat_template_kwargs.enable_thinking=false` (Poolside API) when set.
+    disable_thinking: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,6 +120,7 @@ impl OpenAiProvider {
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
             reasoning_effort: None,
             client_headers: None,
+            disable_thinking: false,
         })
     }
 
@@ -144,6 +147,16 @@ impl OpenAiProvider {
     #[cfg(test)]
     pub(crate) fn request_timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// Turn model thinking off via `chat_template_kwargs` on the forced-tool
+    /// structured call only (Poolside Platform / deployments). Poolside's docs
+    /// advise it whenever a specific output shape is forced; free-text calls
+    /// keep the model default.
+    #[must_use]
+    pub fn with_disable_thinking(mut self, disable: bool) -> Self {
+        self.disable_thinking = disable;
+        self
     }
 
     /// Switch request dialect. See [`RequestDialect`].
@@ -191,6 +204,12 @@ struct OpenAiRequest<'a> {
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<OpenAiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -245,7 +264,26 @@ struct OpenAiChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiMessageResponse {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OpenAiToolCall>>,
 }
+
+#[derive(Debug, Deserialize)]
+struct OpenAiToolCall {
+    function: OpenAiToolCallFunction,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiToolCallFunction {
+    #[serde(default)]
+    name: String,
+    /// A JSON-encoded string per the OpenAI spec; some engines send an object.
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
+/// Name of the single function offered on the forced-tool structured path.
+pub(crate) const STRUCTURED_OUTPUT_TOOL_NAME: &str = "submit_structured_output";
 
 #[derive(Debug, Deserialize)]
 struct OpenAiUsage {
@@ -384,7 +422,44 @@ impl OpenAiProvider {
             response_format,
             reasoning_effort,
             reasoning,
+            tools: None,
+            tool_choice: None,
+            chat_template_kwargs: None,
         }
+    }
+
+    /// Structured output through ONE forced function call instead of
+    /// `response_format`. Measured live 2026-09-23 against
+    /// `poolside/laguna-s-2.1` on inference.poolside.ai: `response_format`
+    /// with a strict json_schema was ignored 4 of 4 times (a list, prose, or
+    /// an unrelated key set), while a forced `tool_choice` with thinking off
+    /// returned a schema-conformant object 9 of 11 times — the other two
+    /// carried a nested array as a JSON-encoded string, which
+    /// [`decode_stringified_containers`] repairs.
+    pub(crate) async fn complete_structured_via_tool(
+        &self,
+        request: &ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
+        let mut body = self.build_request(request, None);
+        body.tools = Some(vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": STRUCTURED_OUTPUT_TOOL_NAME,
+                "description": "Submit the complete structured result. Every field of the schema is required.",
+                "parameters": schema.clone(),
+            }
+        })]);
+        body.chat_template_kwargs = self
+            .disable_thinking
+            .then(|| serde_json::json!({ "enable_thinking": false }));
+        body.tool_choice = Some(serde_json::json!({
+            "type": "function",
+            "function": { "name": STRUCTURED_OUTPUT_TOOL_NAME }
+        }));
+        let response = self.post(&body, operation_id).await?;
+        parse_tool_call_response(response, &schema)
     }
 
     /// Native reasoning payload for this host / dialect.
@@ -481,6 +556,127 @@ pub(crate) fn parse_structured_response(response: OpenAiResponse) -> LlmResult<s
             }
         }
     }
+}
+
+/// Extract the forced function call's arguments as the structured object.
+/// No tool call at all is a parse-shape error (the caller may fall back to
+/// parsing text); a truncated call is [`LlmError::Truncated`].
+pub(crate) fn parse_tool_call_response(
+    response: OpenAiResponse,
+    schema: &serde_json::Value,
+) -> LlmResult<serde_json::Value> {
+    let Some(choice) = response.choices.into_iter().next() else {
+        return Err(LlmError::UnexpectedShape("no choices in response".into()));
+    };
+    let finish_reason = choice.finish_reason.clone();
+    let call = choice
+        .message
+        .tool_calls
+        .unwrap_or_default()
+        .into_iter()
+        .find(|c| c.function.name.is_empty() || c.function.name == STRUCTURED_OUTPUT_TOOL_NAME);
+    let Some(call) = call else {
+        return Err(LlmError::UnexpectedShape(
+            "model did not call the forced structured-output function".into(),
+        ));
+    };
+    let parsed = match call.function.arguments {
+        serde_json::Value::String(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => v,
+            Err(err) if finish_reason.as_deref() == Some("length") => {
+                let _ = err;
+                return Err(LlmError::Truncated {
+                    finish_reason: "length".into(),
+                });
+            }
+            Err(err) => return Err(LlmError::from(err)),
+        },
+        other => other,
+    };
+    if !parsed.is_object() {
+        return Err(LlmError::UnexpectedShape(
+            "structured-output function arguments are not an object".into(),
+        ));
+    }
+    let mut value = parsed;
+    decode_stringified_containers(&mut value, schema);
+    Ok(value)
+}
+
+/// Where the schema declares an array or object but the model sent a string
+/// holding JSON of that kind, replace the string with the decoded value —
+/// recursively, following `properties`, `items`, and local `$ref`s. Anything
+/// else is left untouched for the caller's validator to judge.
+pub(crate) fn decode_stringified_containers(
+    value: &mut serde_json::Value,
+    schema: &serde_json::Value,
+) {
+    fn resolve<'a>(
+        node: &'a serde_json::Value,
+        root: &'a serde_json::Value,
+    ) -> &'a serde_json::Value {
+        if let Some(path) = node
+            .get("$ref")
+            .and_then(|r| r.as_str())
+            .and_then(|r| r.strip_prefix("#/"))
+        {
+            let mut cur = root;
+            for seg in path.split('/') {
+                match cur.get(seg) {
+                    Some(next) => cur = next,
+                    None => return node,
+                }
+            }
+            return cur;
+        }
+        node
+    }
+    fn wants(node: &serde_json::Value, kind: &str) -> bool {
+        match node.get("type") {
+            Some(serde_json::Value::String(t)) => t == kind,
+            Some(serde_json::Value::Array(ts)) => ts.iter().any(|t| t.as_str() == Some(kind)),
+            _ => kind == "object" && node.get("properties").is_some(),
+        }
+    }
+    fn walk(
+        value: &mut serde_json::Value,
+        node: &serde_json::Value,
+        root: &serde_json::Value,
+        depth: usize,
+    ) {
+        if depth > 32 {
+            return;
+        }
+        let node = resolve(node, root);
+        if let serde_json::Value::String(text) = value {
+            let decoded = serde_json::from_str::<serde_json::Value>(text.trim()).ok();
+            match decoded {
+                Some(v @ serde_json::Value::Array(_)) if wants(node, "array") => *value = v,
+                Some(v @ serde_json::Value::Object(_)) if wants(node, "object") => *value = v,
+                _ => return,
+            }
+        }
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(props) = node.get("properties").and_then(|p| p.as_object()) {
+                    for (key, child) in map.iter_mut() {
+                        if let Some(child_schema) = props.get(key) {
+                            walk(child, child_schema, root, depth + 1);
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                if let Some(item_schema) = node.get("items") {
+                    for item in items.iter_mut() {
+                        walk(item, item_schema, root, depth + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(value, schema, schema, 0);
 }
 
 /// Recursively normalise a JSON schema for OpenAI Structured Outputs
