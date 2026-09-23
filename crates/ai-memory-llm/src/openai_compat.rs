@@ -66,7 +66,15 @@ pub struct OpenAiCompatProvider {
     /// hosted endpoint ignores `response_format` (see
     /// `OpenAiProvider::complete_structured_via_tool`).
     structured_via_tool: bool,
+    /// Upper bound on `max_tokens` for every request. `Some(POOLSIDE_MAX_OUTPUT_TOKENS)`
+    /// by default for `poolside/*` models, `None` otherwise.
+    max_output_cap: Option<u32>,
 }
+
+/// Output ceiling for Poolside/Laguna (operator ruling 2026-09-23). Laguna S 2.1
+/// has a documented overthinking limitation, and a 16k-token review on a
+/// 1520-observation session came back as HTTP 500 after ~275 s, twice.
+pub const POOLSIDE_MAX_OUTPUT_TOKENS: u32 = 14_000;
 
 /// Engines measured to ignore `response_format` but honour a forced tool call.
 fn model_prefers_forced_tool(model: &str) -> bool {
@@ -108,6 +116,7 @@ impl OpenAiCompatProvider {
             name_tag: "openai-compat",
             strict: false,
             structured_via_tool,
+            max_output_cap: structured_via_tool.then_some(POOLSIDE_MAX_OUTPUT_TOKENS),
         })
     }
 
@@ -125,6 +134,20 @@ impl OpenAiCompatProvider {
     pub fn with_structured_via_tool(mut self, via_tool: bool) -> Self {
         self.structured_via_tool = via_tool;
         self
+    }
+
+    /// Override the output ceiling (`None` = the caller's `max_tokens` as-is).
+    #[must_use]
+    pub fn with_max_output_cap(mut self, cap: Option<u32>) -> Self {
+        self.max_output_cap = cap;
+        self
+    }
+
+    fn capped(&self, mut request: ChatRequest) -> ChatRequest {
+        if let Some(cap) = self.max_output_cap {
+            request.max_tokens = request.max_tokens.min(cap);
+        }
+        request
     }
 
     /// Override the Poolside thinking toggle on the forced-tool call
@@ -183,7 +206,7 @@ impl LlmProvider for OpenAiCompatProvider {
         operation_id: LlmOperationId,
     ) -> LlmResult<ChatResponse> {
         self.inner
-            .complete_with_operation_id(request, operation_id)
+            .complete_with_operation_id(self.capped(request), operation_id)
             .await
     }
 
@@ -202,7 +225,7 @@ impl LlmProvider for OpenAiCompatProvider {
         schema: serde_json::Value,
         operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
-        self.complete_structured(request, schema, operation_id)
+        self.complete_structured(self.capped(request), schema, operation_id)
             .await
     }
 }

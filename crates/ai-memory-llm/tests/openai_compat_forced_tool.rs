@@ -220,3 +220,37 @@ async fn other_models_keep_response_format() {
     assert!(seen[0].get("response_format").is_some());
     assert!(seen[0].get("tools").is_none());
 }
+
+#[tokio::test]
+async fn poolside_output_is_capped_at_14k_on_every_call() {
+    let (server, seen) = serve(vec![
+        tool_call_body(json!({ "summary": "s", "proposals": [] })),
+        text_body("plain"),
+        text_body("{\"summary\": \"s\", \"proposals\": []}"),
+    ])
+    .await;
+    let base = format!("{}/v1", server.uri());
+    let mut big = request();
+    big.max_tokens = 32_000;
+    let p = provider(&base, "poolside/laguna-s-2.1");
+    p.complete_structured_raw(big.clone(), schema())
+        .await
+        .unwrap();
+    p.complete(big.clone()).await.unwrap();
+    provider(&base, "mistral-nemo")
+        .complete_structured_raw(big.clone(), schema())
+        .await
+        .unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen[0]["max_tokens"],
+        json!(14_000),
+        "structured call capped"
+    );
+    assert_eq!(seen[1]["max_tokens"], json!(14_000), "text call capped");
+    assert_eq!(
+        seen[2]["max_tokens"],
+        json!(32_000),
+        "other models untouched"
+    );
+}
