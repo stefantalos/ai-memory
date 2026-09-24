@@ -77,8 +77,10 @@ pub struct OpenAiCompatProvider {
     /// prompt again as a plain text call. Off by default for `poolside/*`:
     /// that second call runs with thinking at the template default (max), and
     /// that request shape was cut at the output ceiling 4 of 4 times in the
-    /// 2026-09-25 A/B (and 3 of 3 in production on 2026-09-24, ~16.6k output
-    /// per failure); it doubled the cost of a failure and rescued none.
+    /// 2026-09-25 A/B. In production on 2026-09-24 (b50cd18b) it rescued 1 of
+    /// 4 misses (21:14Z, 9,798 output) and was cut in the other 3 (~16.6k
+    /// output each). The trade: the next attempt is a forced call at 0.7
+    /// (0 of 4 cut on the same input), and a rescue still cost up to 14k.
     tool_text_fallback: bool,
 }
 

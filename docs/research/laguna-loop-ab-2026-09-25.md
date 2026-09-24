@@ -74,8 +74,10 @@ enforce the forced `tool_choice`. With thinking on (Von), all 14,000 tokens go i
 - **Thinking on always loops (strong).** Von was cut 4 of 4 times, against 0 of 4 for T0.7 on
   the same input (Fisher p = 0.029). Production confirms it: at 21:23, 21:29 and 21:35Z,
   consolidate booked `http_calls=2` with 15.8–16.7k output tokens. That is a prose reply
-  followed by this fallback cut at 14,000. The text fallback therefore doubles the cost of a
-  failure and rescued none.
+  followed by this fallback cut at 14,000. The fallback did rescue one miss, at 21:14:41Z
+  (`ok`, 9,798 output, `http_calls=2`), so the production record is 1 rescued and 3 cut. It was
+  removed anyway: the retry that replaces it is a forced call at 0.7, which was cut 0 of 4
+  times on c80b, against 4 of 4 for the thinking-on shape. A rescue also still cost up to 14k.
 - **Temperature 0.7 reduces failures but does not cure them.** On the two looping inputs
   pooled, V0 failed 5 of 7 and T0.7 failed 2 of 8 (Fisher p = 0.13). On c80b alone it was
   2 of 4 against 0 of 4 (p = 0.43). The direction is consistent with Poolside's own recipe
@@ -84,6 +86,11 @@ enforce the forced `tool_choice`. With thinking on (Von), all 14,000 tokens go i
   out. It is not shipped.
 - **ede4 did not reproduce** in 4 of 4 runs.
 - **Every finished answer, in every variant, passed ai-memory's validation on replay.**
+- **Cut answers were checked for salvaged drafts.** Since c09b061, the `content` of a cut answer
+  becomes the `Truncated` partial that auto_improve salvages from, and with thinking off that
+  `content` is the model's deliberation. Three cut V0 bodies (c80b ×1, 322b ×2) were replayed on
+  b50cd18b: each gave "0 proposals recovered". No draft became a proposal. n = 3; this is not a
+  proof.
 
 ## What shipped in code (branch `fix/laguna-truncation-classify`)
 
