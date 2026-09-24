@@ -69,12 +69,35 @@ pub struct OpenAiCompatProvider {
     /// Upper bound on `max_tokens` for every request. `Some(POOLSIDE_MAX_OUTPUT_TOKENS)`
     /// by default for `poolside/*` models, `None` otherwise.
     max_output_cap: Option<u32>,
+    /// Sampling temperature forced on every request, replacing the caller's.
+    /// `Some(POOLSIDE_TEMPERATURE)` by default for `poolside/*` models,
+    /// `None` (caller's value) otherwise.
+    temperature_override: Option<f32>,
+    /// After a forced-tool reply that is not a usable call, send the same
+    /// prompt again as a plain text call. Off by default for `poolside/*`:
+    /// that second call runs with thinking at the template default (max), and
+    /// that request shape was cut at the output ceiling 4 of 4 times in the
+    /// 2026-09-25 A/B (and 3 of 3 in production on 2026-09-24, ~16.6k output
+    /// per failure); it doubled the cost of a failure and rescued none.
+    tool_text_fallback: bool,
 }
 
 /// Output ceiling for Poolside/Laguna (operator ruling 2026-09-23). Laguna S 2.1
 /// has a documented overthinking limitation, and a 16k-token review on a
 /// 1520-observation session came back as HTTP 500 after ~275 s, twice.
 pub const POOLSIDE_MAX_OUTPUT_TOKENS: u32 = 14_000;
+
+/// Sampling temperature for Poolside/Laguna. A/B 2026-09-25 on
+/// inference.poolside.ai, `poolside/laguna-s-2.1`, replaying the exact
+/// forced-tool request ai-memory sends (thinking off, `max_tokens` 14,000) on
+/// the two auto_improve inputs that were looping in production: at the
+/// callers' 0.1 the reply was cut or lost (HTTP 500) 5 of 7 times, the model
+/// deliberating in `content` until the cap without calling the function; at
+/// 0.7, 2 of 8 (Fisher p = 0.13, a reduction, not a cure). Every
+/// finished answer passed ai-memory's own validation on replay. Figures in
+/// `docs/research/laguna-loop-ab-2026-09-25.md`. Poolside's vLLM recipe
+/// samples Laguna at 0.7.
+pub const POOLSIDE_TEMPERATURE: f32 = 0.7;
 
 /// Engines measured to ignore `response_format` but honour a forced tool call.
 fn model_prefers_forced_tool(model: &str) -> bool {
@@ -117,6 +140,8 @@ impl OpenAiCompatProvider {
             strict: false,
             structured_via_tool,
             max_output_cap: structured_via_tool.then_some(POOLSIDE_MAX_OUTPUT_TOKENS),
+            temperature_override: structured_via_tool.then_some(POOLSIDE_TEMPERATURE),
+            tool_text_fallback: !structured_via_tool,
         })
     }
 
@@ -143,9 +168,28 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Override the forced sampling temperature (`None` = the caller's).
+    #[must_use]
+    pub fn with_temperature_override(mut self, temperature: Option<f32>) -> Self {
+        self.temperature_override = temperature;
+        self
+    }
+
+    /// Whether a forced-tool reply without a usable call is retried as a
+    /// plain text call (default: off for `poolside/*`, on otherwise).
+    #[must_use]
+    pub fn with_tool_text_fallback(mut self, fallback: bool) -> Self {
+        self.tool_text_fallback = fallback;
+        self
+    }
+
+    /// The per-provider request shaping: output ceiling and temperature.
     fn capped(&self, mut request: ChatRequest) -> ChatRequest {
         if let Some(cap) = self.max_output_cap {
             request.max_tokens = request.max_tokens.min(cap);
+        }
+        if let Some(temperature) = self.temperature_override {
+            request.temperature = Some(temperature);
         }
         request
     }
@@ -269,7 +313,7 @@ impl OpenAiCompatProvider {
                 .await
             {
                 Ok(v) => return Ok(v),
-                Err(err) if is_parse_shape_error(&err) => {
+                Err(err) if is_parse_shape_error(&err) && self.tool_text_fallback => {
                     debug!(error = %err, "compat forced-tool: no usable tool call, falling back to tolerant parser");
                 }
                 Err(err) => return Err(err),

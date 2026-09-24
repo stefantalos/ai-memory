@@ -2284,6 +2284,44 @@ mod tests {
         );
     }
 
+    /// Measured 2026-09-24: SessionEnd consolidation of c6ce4735 was cut at
+    /// the output ceiling at 21:23, 21:29 and 21:35 and paused the only live
+    /// Laguna key. A session must be parked before its own cuts could reach
+    /// the lane's zero-yield threshold, and the lane chain now counts one
+    /// input once and reports a cut (not MeteredDeclined) when the metered
+    /// lane declines after it (ai-memory-llm fallback tests).
+    #[test]
+    fn a_session_is_parked_before_its_cuts_could_pause_a_lane() {
+        const {
+            assert!(
+                SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS < ai_memory_llm::ZERO_YIELD_THRESHOLD
+            );
+        }
+        let cut =
+            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Truncated {
+                finish_reason: "length".into(),
+                partial: None,
+            });
+        let now = 0_i64;
+        let mut attempts = 0;
+        while session_consolidation_retry_at(attempts + 1, &cut, now).is_some() {
+            attempts += 1;
+        }
+        assert_eq!(attempts + 1, SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS);
+        let declined = ai_memory_consolidate::ConsolidatorError::Llm(
+            ai_memory_llm::LlmError::MeteredDeclined("future_need 0.77 < 0.9".into()),
+        );
+        assert!(
+            session_consolidation_retry_at(
+                SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS,
+                &declined,
+                now
+            )
+            .is_some(),
+            "a decline with no cut behind it (quota wall) keeps waiting for a free lane"
+        );
+    }
+
     use ai_memory_core::{
         AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,
         Sanitized, Sanitizer, SessionId, Tier,

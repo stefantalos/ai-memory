@@ -271,7 +271,8 @@ async fn both_keys_cut_at_the_limit_reach_gemini_through_the_gate_and_book_one_p
 
 /// Both HTTP calls of one lane call are booked with a correct total — not
 /// just the last one. Distinct counts on each call so "keep last" and "keep
-/// first" both fail.
+/// first" both fail. Poolside no longer sends the text fallback by default
+/// (see the next test); the lane here opts back in to get two requests.
 #[tokio::test]
 async fn a_lane_call_that_sent_two_requests_is_booked_for_both() {
     let p = paths();
@@ -284,9 +285,17 @@ async fn a_lane_call_that_sent_two_requests_is_booked_for_both() {
         vec![prose("stop", 100, 7_000), prose("length", 120, 14_000)],
     )
     .await;
-    let chain =
-        FallbackProvider::chain(Lane::new(poolside_lane(&pool, KEY_A), "key-a"), Vec::new())
-            .with_observer(Arc::new(JsonlLedger::new(Some(p.calls.clone()))));
+    let lane: Arc<dyn LlmProvider> = Arc::new(
+        OpenAiCompatProvider::new(
+            pool.uri(),
+            Some(SecretString::from(KEY_A.to_string())),
+            "poolside/laguna-s-2.1",
+        )
+        .unwrap()
+        .with_tool_text_fallback(true),
+    );
+    let chain = FallbackProvider::chain(Lane::new(lane, "key-a"), Vec::new())
+        .with_observer(Arc::new(JsonlLedger::new(Some(p.calls.clone()))));
 
     let err = with_caller(
         "consolidate",
@@ -303,6 +312,37 @@ async fn a_lane_call_that_sent_two_requests_is_booked_for_both() {
     assert_eq!(calls[0]["input_tokens"], 220);
     assert_eq!(calls[0]["output_tokens"], 21_000);
     assert_eq!(calls[0]["outcome"], "truncated");
+}
+
+/// Measured 2026-09-24 on b50cd18b: consolidate booked http_calls=2 and
+/// ~16.6k output three times (a prose reply, then the thinking-on text
+/// fallback cut at 14,000). By default a Poolside lane now sends ONE request:
+/// the prose reply is a shape error, booked once, and no fallback is paid for.
+#[tokio::test]
+async fn a_poolside_prose_reply_is_one_request_and_one_booking() {
+    let p = paths();
+    let pool = MockServer::start().await;
+    let hits = poolside_key(
+        &pool,
+        KEY_A,
+        vec![prose("stop", 100, 7_000), prose("length", 120, 14_000)],
+    )
+    .await;
+    let chain =
+        FallbackProvider::chain(Lane::new(poolside_lane(&pool, KEY_A), "key-a"), Vec::new())
+            .with_observer(Arc::new(JsonlLedger::new(Some(p.calls.clone()))));
+    let err = with_caller(
+        "consolidate",
+        chain.complete_structured_raw(ChatRequest::user_prompt("session"), schema()),
+    )
+    .await
+    .expect_err("prose is not a result");
+    assert!(matches!(err, LlmError::UnexpectedShape(_)), "{err:?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "no text fallback request");
+    let calls = call_rows(&p.calls);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["http_calls"], 1);
+    assert_eq!(calls[0]["output_tokens"], 7_000);
 }
 
 /// Pins a policy gap rather than blessing it: `consolidate` is NOT in the

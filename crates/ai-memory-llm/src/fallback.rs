@@ -202,6 +202,13 @@ struct Circuit {
     half_open: bool,
     consecutive_server_failures: u32,
     consecutive_zero_yield: u32,
+    /// Fingerprints of the requests already counted in the current
+    /// zero-yield streak. One input that keeps degenerating (Laguna S 2.1
+    /// deliberating in prose to the output cap on one session, measured
+    /// 2026-09-24: c80b0238 2/2, the same consolidate 3x in 12 min) is a
+    /// property of that input, not of the key, so it counts once: only
+    /// distinct inputs failing in a row can pause the lane on zero yield.
+    zero_yield_inputs: Vec<u64>,
 }
 
 struct LaneState {
@@ -246,7 +253,10 @@ impl FallbackProvider {
     /// Two lanes: `primary`, then `secondary` as its runtime fallback.
     #[must_use]
     pub fn new(primary: Arc<dyn LlmProvider>, secondary: Arc<dyn LlmProvider>) -> Self {
-        Self::chain(Lane::new(primary, "primary"), vec![Lane::new(secondary, "secondary")])
+        Self::chain(
+            Lane::new(primary, "primary"),
+            vec![Lane::new(secondary, "secondary")],
+        )
     }
 
     /// A chain of `first` followed by `rest`, tried in order.
@@ -345,10 +355,16 @@ impl FallbackProvider {
         *c = Circuit::default();
     }
 
-    fn on_failure(&self, state: &LaneState, class: FailureClass) {
+    fn on_failure(&self, state: &LaneState, class: FailureClass, input_fp: u64) {
         let now = self.clock.now();
         let tripped: Option<(&'static str, u32)> = {
             let mut c = Self::lock(state);
+            if class == FailureClass::ZeroYield && c.zero_yield_inputs.contains(&input_fp) {
+                // Already counted in this streak: the repeat says nothing new
+                // about the lane. No count, no trip, and a half-open probe
+                // stays half-open for the next (different) request.
+                return;
+            }
             let was_half_open = std::mem::take(&mut c.half_open);
             let trip = match class {
                 FailureClass::Quota => Some(("quota", 1)),
@@ -359,6 +375,7 @@ impl FallbackProvider {
                 }
                 FailureClass::ZeroYield => {
                     c.consecutive_zero_yield += 1;
+                    c.zero_yield_inputs.push(input_fp);
                     (was_half_open || c.consecutive_zero_yield >= self.zero_yield_threshold)
                         .then_some(("zero_yield", c.consecutive_zero_yield))
                 }
@@ -368,6 +385,7 @@ impl FallbackProvider {
                 c.open_until = Some(now + self.cooldown);
                 c.consecutive_server_failures = 0;
                 c.consecutive_zero_yield = 0;
+                c.zero_yield_inputs.clear();
             }
             trip
         };
@@ -472,7 +490,7 @@ impl FallbackProvider {
     }
 
     /// Core routing, shared by all four trait entry points.
-    async fn route<T, C, CF>(&self, evidence: String, call: C) -> LlmResult<T>
+    async fn route<T, C, CF>(&self, evidence: String, input_fp: u64, call: C) -> LlmResult<T>
     where
         T: YieldCheck,
         C: Fn(Arc<dyn LlmProvider>) -> CF,
@@ -482,6 +500,12 @@ impl FallbackProvider {
         let mut empty_ok: Option<T> = None;
         let mut skipped: Vec<&str> = Vec::new();
         let mut declined: Option<String> = None;
+        // A lane that cut this very request at the output ceiling. If the
+        // chain then ends on a declined metered lane, the request did not
+        // "wait for a free lane": a free lane answered it and ran out of
+        // budget. Report that truncation so callers park it (consolidate
+        // gives a Truncated generation 2 attempts, not 5).
+        let mut truncated_here: Option<LlmError> = None;
         for (index, state) in self.lanes.iter().enumerate() {
             if self.skipped(state) {
                 skipped.push(&state.lane.label);
@@ -514,7 +538,7 @@ impl FallbackProvider {
                         Self::on_success(state);
                         return Ok(value);
                     }
-                    self.on_failure(state, FailureClass::ZeroYield);
+                    self.on_failure(state, FailureClass::ZeroYield, input_fp);
                     if is_last {
                         return Ok(value);
                     }
@@ -523,7 +547,7 @@ impl FallbackProvider {
                 Err(err) => {
                     self.observe_call(lane, outcome_label(&Err(&err)), usage);
                     let class = classify(&err);
-                    self.on_failure(state, class);
+                    self.on_failure(state, class, input_fp);
                     if class == FailureClass::Fatal {
                         return Err(err);
                     }
@@ -536,6 +560,16 @@ impl FallbackProvider {
                             "LLM lane failed transiently or yielded nothing; retrying this request on the next lane",
                         );
                     }
+                    if let LlmError::Truncated {
+                        finish_reason,
+                        partial,
+                    } = &err
+                    {
+                        truncated_here = Some(LlmError::Truncated {
+                            finish_reason: finish_reason.clone(),
+                            partial: partial.clone(),
+                        });
+                    }
                     last_err = Some(err);
                     empty_ok = None;
                 }
@@ -545,6 +579,13 @@ impl FallbackProvider {
             return Ok(value);
         }
         if let Some(reason) = declined {
+            if let Some(cut) = truncated_here {
+                tracing::warn!(
+                    reason = %reason,
+                    "a free lane cut this request at the output ceiling and the metered lane declined it; reporting the truncation",
+                );
+                return Err(cut);
+            }
             return Err(LlmError::MeteredDeclined(reason));
         }
         Err(last_err.unwrap_or_else(|| {
@@ -554,6 +595,19 @@ impl FallbackProvider {
             ))
         }))
     }
+}
+
+/// Identity of a request for the zero-yield streak: system prompt and every
+/// message. Two calls for the same session / generation hash equal.
+fn input_fingerprint(request: &ChatRequest) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    request.system.hash(&mut h);
+    for m in &request.messages {
+        m.role.as_str().hash(&mut h);
+        m.content.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// The request's user-side text, bounded, for the value gate.
@@ -579,7 +633,7 @@ impl LlmProvider for FallbackProvider {
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
-        self.route(evidence_of(&request), |p| {
+        self.route(evidence_of(&request), input_fingerprint(&request), |p| {
             let r = request.clone();
             async move { p.complete(r).await }
         })
@@ -591,7 +645,7 @@ impl LlmProvider for FallbackProvider {
         request: ChatRequest,
         operation_id: LlmOperationId,
     ) -> LlmResult<ChatResponse> {
-        self.route(evidence_of(&request), |p| {
+        self.route(evidence_of(&request), input_fingerprint(&request), |p| {
             let r = request.clone();
             async move { p.complete_with_operation_id(r, operation_id).await }
         })
@@ -603,7 +657,7 @@ impl LlmProvider for FallbackProvider {
         request: ChatRequest,
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
-        self.route(evidence_of(&request), |p| {
+        self.route(evidence_of(&request), input_fingerprint(&request), |p| {
             let (r, s) = (request.clone(), schema.clone());
             async move { p.complete_structured_raw(r, s).await }
         })
@@ -616,7 +670,7 @@ impl LlmProvider for FallbackProvider {
         schema: serde_json::Value,
         operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
-        self.route(evidence_of(&request), |p| {
+        self.route(evidence_of(&request), input_fingerprint(&request), |p| {
             let (r, s) = (request.clone(), schema.clone());
             async move {
                 p.complete_structured_raw_with_operation_id(r, s, operation_id)
@@ -742,6 +796,18 @@ mod tests {
 
     async fn call(f: &FallbackProvider) -> (LlmResult<serde_json::Value>, Option<Responder>) {
         capture_responder(f.complete_structured_raw(req(), serde_json::json!({}))).await
+    }
+
+    /// A request distinct from every other `n`: a different session's prompt.
+    fn req_n(n: usize) -> ChatRequest {
+        ChatRequest::user_prompt(format!("observations of session {n}"))
+    }
+
+    async fn call_n(
+        f: &FallbackProvider,
+        n: usize,
+    ) -> (LlmResult<serde_json::Value>, Option<Responder>) {
+        capture_responder(f.complete_structured_raw(req_n(n), serde_json::json!({}))).await
     }
 
     #[tokio::test]
@@ -1009,8 +1075,11 @@ mod tests {
     ) -> (FallbackProvider, Arc<FakeClock>, Arc<Recorder>) {
         let clock = Arc::new(FakeClock(Mutex::new(Instant::now())));
         let rec = Arc::new(Recorder::default());
-        let (a, b, g): (Arc<dyn LlmProvider>, Arc<dyn LlmProvider>, Arc<dyn LlmProvider>) =
-            (a.clone(), b.clone(), g.clone());
+        let (a, b, g): (
+            Arc<dyn LlmProvider>,
+            Arc<dyn LlmProvider>,
+            Arc<dyn LlmProvider>,
+        ) = (a.clone(), b.clone(), g.clone());
         let f = FallbackProvider::chain(
             Lane::new(a, "key-a").with_key_fp(Some("aaaa0000".into())),
             vec![
@@ -1046,7 +1115,10 @@ mod tests {
         assert_eq!(a.calls(), 1, "a limited key is skipped during its cooldown");
         let breakers = rec.breakers.lock().unwrap();
         assert_eq!(breakers.len(), 1);
-        assert_eq!((breakers[0].lane.as_str(), breakers[0].reason), ("key-a", "quota"));
+        assert_eq!(
+            (breakers[0].lane.as_str(), breakers[0].reason),
+            ("key-a", "quota")
+        );
     }
 
     #[tokio::test]
@@ -1076,8 +1148,16 @@ mod tests {
         clock.advance(Duration::from_secs(899));
         assert_eq!(call(&f).await.1.unwrap().lane, "key-b");
         clock.advance(Duration::from_secs(2));
-        assert_eq!(call(&f).await.1.unwrap().lane, "key-a", "probed after cooldown");
-        assert_eq!(call(&f).await.1.unwrap().lane, "key-a", "probe success closed it");
+        assert_eq!(
+            call(&f).await.1.unwrap().lane,
+            "key-a",
+            "probed after cooldown"
+        );
+        assert_eq!(
+            call(&f).await.1.unwrap().lane,
+            "key-a",
+            "probe success closed it"
+        );
     }
 
     #[tokio::test]
@@ -1096,10 +1176,13 @@ mod tests {
             .with_clock(clock.clone())
             .with_observer(rec.clone());
         let _ = (a, b);
-        for _ in 0..3 {
-            assert!(matches!(call(&f).await.0, Err(LlmError::Truncated { .. })));
+        for n in 0..3 {
+            assert!(matches!(
+                call_n(&f, n).await.0,
+                Err(LlmError::Truncated { .. })
+            ));
         }
-        match call(&f).await.0 {
+        match call_n(&f, 3).await.0 {
             Err(LlmError::LanesPaused(msg)) => assert!(msg.contains("gemini"), "{msg}"),
             other => panic!("expected LanesPaused, got {other:?}"),
         }
@@ -1107,7 +1190,10 @@ mod tests {
         {
             let breakers = rec.breakers.lock().unwrap();
             assert_eq!(breakers.len(), 1);
-            assert_eq!((breakers[0].reason, breakers[0].consecutive), ("zero_yield", 3));
+            assert_eq!(
+                (breakers[0].reason, breakers[0].consecutive),
+                ("zero_yield", 3)
+            );
         }
         clock.advance(Duration::from_secs(901));
         assert!(call(&f).await.0.is_ok(), "retried after the cooldown");
@@ -1119,7 +1205,13 @@ mod tests {
         let g = Scripted::new(
             "gemini",
             "gemini-2.5-flash",
-            vec![Some(truncated()), Some(truncated()), None, Some(truncated()), Some(truncated())],
+            vec![
+                Some(truncated()),
+                Some(truncated()),
+                None,
+                Some(truncated()),
+                Some(truncated()),
+            ],
         );
         let gd: Arc<dyn LlmProvider> = g.clone();
         let f = FallbackProvider::chain(Lane::new(gd, "gemini"), vec![]);
@@ -1132,11 +1224,15 @@ mod tests {
 
     #[tokio::test]
     async fn truncation_on_key_a_moves_to_key_b_and_pauses_a_after_three() {
-        let a = laguna(vec![Some(truncated()), Some(truncated()), Some(truncated())]);
+        let a = laguna(vec![
+            Some(truncated()),
+            Some(truncated()),
+            Some(truncated()),
+        ]);
         let (b, g) = (laguna(vec![]), Scripted::ok("gemini", "gemini-2.5-flash"));
         let (f, _, _) = three_lanes(&a, &b, &g);
-        for _ in 0..4 {
-            assert_eq!(call(&f).await.1.unwrap().lane, "key-b");
+        for n in 0..4 {
+            assert_eq!(call_n(&f, n).await.1.unwrap().lane, "key-b");
         }
         assert_eq!(a.calls(), 3);
     }
@@ -1171,11 +1267,133 @@ mod tests {
         let e = Arc::new(Empty(AtomicUsize::new(0)));
         let ed: Arc<dyn LlmProvider> = e.clone();
         let f = FallbackProvider::chain(Lane::new(ed, "gemini"), vec![]);
-        for _ in 0..3 {
-            assert!(f.complete(req()).await.is_ok());
+        for n in 0..3 {
+            assert!(f.complete(req_n(n)).await.is_ok());
         }
-        assert!(matches!(f.complete(req()).await, Err(LlmError::LanesPaused(_))));
+        assert!(matches!(
+            f.complete(req_n(3)).await,
+            Err(LlmError::LanesPaused(_))
+        ));
         assert_eq!(e.0.load(Ordering::SeqCst), 3);
+    }
+
+    /// Measured 2026-09-24: one consolidate (session c6ce4735) was cut at the
+    /// output ceiling three times in 12 minutes and paused the only live
+    /// Laguna key for every caller. The same input failing again says
+    /// nothing new about the key.
+    #[tokio::test]
+    async fn the_same_input_cut_again_and_again_never_pauses_the_key() {
+        let a = laguna(vec![
+            Some(truncated()),
+            Some(truncated()),
+            Some(truncated()),
+            Some(truncated()),
+            None,
+        ]);
+        let aa: Arc<dyn LlmProvider> = a.clone();
+        let rec = Arc::new(Recorder::default());
+        let f = FallbackProvider::chain(Lane::new(aa, "key-a"), vec![]).with_observer(rec.clone());
+        for _ in 0..4 {
+            assert!(matches!(
+                call_n(&f, 7).await.0,
+                Err(LlmError::Truncated { .. })
+            ));
+        }
+        assert!(
+            rec.breakers.lock().unwrap().is_empty(),
+            "no breaker for one input"
+        );
+        assert!(
+            call_n(&f, 8).await.0.is_ok(),
+            "another request still reaches the key"
+        );
+        assert_eq!(a.calls(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_input_between_distinct_ones_is_counted_once() {
+        let a = laguna((0..4).map(|_| Some(truncated())).collect());
+        let aa: Arc<dyn LlmProvider> = a.clone();
+        let f = FallbackProvider::chain(Lane::new(aa, "key-a"), vec![]);
+        for n in [1, 1, 2, 2] {
+            let _ = call_n(&f, n).await;
+        }
+        assert_eq!(
+            a.calls(),
+            4,
+            "two distinct inputs: below the threshold of 3"
+        );
+        let a2 = laguna((0..3).map(|_| Some(truncated())).collect());
+        let aa2: Arc<dyn LlmProvider> = a2.clone();
+        let f2 = FallbackProvider::chain(Lane::new(aa2, "key-a"), vec![]);
+        for n in [1, 2, 3] {
+            let _ = call_n(&f2, n).await;
+        }
+        assert!(matches!(
+            call_n(&f2, 4).await.0,
+            Err(LlmError::LanesPaused(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn quota_still_pauses_the_key_on_one_input() {
+        let a = laguna(vec![Some(status(429))]);
+        let aa: Arc<dyn LlmProvider> = a.clone();
+        let f = FallbackProvider::chain(Lane::new(aa, "key-a"), vec![]);
+        let _ = call_n(&f, 1).await;
+        assert!(matches!(
+            call_n(&f, 1).await.0,
+            Err(LlmError::LanesPaused(_))
+        ));
+        assert_eq!(a.calls(), 1);
+    }
+
+    /// A metered gate that declines everything.
+    struct DeclineAll;
+    #[async_trait]
+    impl MeteredGate for DeclineAll {
+        async fn judge(&self, _r: GateRequest<'_>) -> GateVerdict {
+            GateVerdict {
+                admit: false,
+                reason: "future_need 0.77 < 0.9".into(),
+                cost_usd: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cut_on_the_free_lane_then_a_declined_metered_lane_reports_the_cut() {
+        let a = laguna(vec![Some(truncated())]);
+        let b = laguna(vec![Some(status(429))]);
+        let g = Scripted::ok("gemini", "gemini-2.5-flash");
+        let (aa, bb, gg): (
+            Arc<dyn LlmProvider>,
+            Arc<dyn LlmProvider>,
+            Arc<dyn LlmProvider>,
+        ) = (a.clone(), b.clone(), g.clone());
+        let f = FallbackProvider::chain(
+            Lane::new(aa, "key-a"),
+            vec![Lane::new(bb, "key-b"), Lane::new(gg, "gemini")],
+        )
+        .with_metered_gate(Arc::new(DeclineAll), vec!["consolidate".into()]);
+        let out = crate::usage::with_caller("consolidate", call_n(&f, 1))
+            .await
+            .0;
+        assert!(matches!(out, Err(LlmError::Truncated { .. })), "{out:?}");
+        assert_eq!(g.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_quota_wall_then_a_declined_metered_lane_stays_declined() {
+        let a = laguna(vec![Some(status(429))]);
+        let g = Scripted::ok("gemini", "gemini-2.5-flash");
+        let (aa, gg): (Arc<dyn LlmProvider>, Arc<dyn LlmProvider>) = (a.clone(), g.clone());
+        let f = FallbackProvider::chain(Lane::new(aa, "key-a"), vec![Lane::new(gg, "gemini")])
+            .with_metered_gate(Arc::new(DeclineAll), vec!["consolidate".into()]);
+        let out = crate::usage::with_caller("consolidate", call_n(&f, 1))
+            .await
+            .0;
+        assert!(matches!(out, Err(LlmError::MeteredDeclined(_))), "{out:?}");
     }
 
     #[tokio::test]
@@ -1186,7 +1404,10 @@ mod tests {
             Scripted::ok("gemini", "gemini-2.5-flash"),
         );
         let (f, _, rec) = three_lanes(&a, &b, &g);
-        crate::usage::with_caller("auto_improve", call(&f)).await.0.unwrap();
+        crate::usage::with_caller("auto_improve", call(&f))
+            .await
+            .0
+            .unwrap();
         let calls = rec.calls.lock().unwrap();
         let got: Vec<(&str, &str, Option<&str>)> = calls
             .iter()
@@ -1266,7 +1487,10 @@ mod tests {
     }
 
     fn walled() -> (Arc<Scripted>, Arc<Scripted>) {
-        (laguna(vec![Some(status(429))]), laguna(vec![Some(status(429))]))
+        (
+            laguna(vec![Some(status(429))]),
+            laguna(vec![Some(status(429))]),
+        )
     }
 
     #[tokio::test]
@@ -1293,16 +1517,29 @@ mod tests {
         assert_eq!(g.calls(), 0, "a declined request is never paid for");
         assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
         let calls = rec.calls.lock().unwrap();
-        let gate_row = calls.iter().find(|c| c.provider == "jev").expect("gate recorded");
+        let gate_row = calls
+            .iter()
+            .find(|c| c.provider == "jev")
+            .expect("gate recorded");
         assert_eq!(gate_row.outcome, "gate_declined");
-        assert_eq!(gate_row.cost_usd_est, Some(0.0001), "Jev's own cost is recorded");
+        assert_eq!(
+            gate_row.cost_usd_est,
+            Some(0.0001),
+            "Jev's own cost is recorded"
+        );
     }
 
     #[tokio::test]
     async fn jev_unavailable_fails_closed() {
         let (a, b) = walled();
         let g = Scripted::ok("gemini", "gemini-2.5-flash");
-        let (f, _, _) = gated(&a, &b, &g, false, "jev unavailable on future_need: timed out (fail closed)");
+        let (f, _, _) = gated(
+            &a,
+            &b,
+            &g,
+            false,
+            "jev unavailable on future_need: timed out (fail closed)",
+        );
         let (out, _) = crate::usage::with_caller("auto_improve", call(&f)).await;
         assert!(matches!(out, Err(LlmError::MeteredDeclined(_))), "{out:?}");
         assert_eq!(g.calls(), 0);
