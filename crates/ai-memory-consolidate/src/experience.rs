@@ -185,9 +185,15 @@ pub async fn run_experience_review(
         max_tokens: REVIEW_MAX_TOKENS,
         temperature: Some(0.1),
     };
-    let raw: AutoImproveLlmResponse = complete_structured(llm, request)
-        .await
-        .map_err(AutoImproveError::from)?;
+    let (raw, responder) = ai_memory_llm::capture_responder(complete_structured::<
+        AutoImproveLlmResponse,
+    >(llm, request))
+    .await;
+    let raw = raw.map_err(AutoImproveError::from)?;
+    let (answered_provider, answered_model) = match responder {
+        Some(r) => (r.provider.to_string(), r.model),
+        None => (llm.name().to_string(), llm.model().to_string()),
+    };
     let (mut proposals, mut rejected_candidates, mut response_warnings) =
         crate::auto_improve::validate_response(raw, &cfg, &existing_index);
     warnings.append(&mut response_warnings);
@@ -207,8 +213,8 @@ pub async fn run_experience_review(
         observations_considered: session_pages.len(),
         session_duration_secs: 0,
         estimated_input_tokens,
-        provider: llm.name().to_string(),
-        model: llm.model().to_string(),
+        provider: answered_provider,
+        model: answered_model,
         min_confidence: cfg.min_confidence,
         proposal_actor: cfg.proposal_actor,
         pending_path: cfg.pending_path,

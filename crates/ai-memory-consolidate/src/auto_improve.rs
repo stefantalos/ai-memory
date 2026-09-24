@@ -519,9 +519,16 @@ pub async fn run_auto_improve_review(
     };
     let response_schema = serde_json::to_value(schemars::schema_for!(AutoImproveLlmResponse))
         .map_err(LlmError::from)?;
-    let raw_result = llm
-        .complete_structured_raw_with_operation_id(request, response_schema, session_id.into())
-        .await;
+    // A fallback-wrapped provider may answer from its secondary lane; record
+    // the lane that actually answered, not the configured one (FN8-8120).
+    let (raw_result, responder) = ai_memory_llm::capture_responder(
+        llm.complete_structured_raw_with_operation_id(request, response_schema, session_id.into()),
+    )
+    .await;
+    let (answered_provider, answered_model) = match responder {
+        Some(r) => (r.provider.to_string(), r.model),
+        None => (llm.name().to_string(), llm.model().to_string()),
+    };
     let mut parse_warnings = Vec::new();
     let raw = match raw_result {
         Ok(value) => parse_llm_response(&value, &mut parse_warnings),
@@ -542,8 +549,8 @@ pub async fn run_auto_improve_review(
                 observations_considered: observations.len(),
                 session_duration_secs: duration,
                 estimated_input_tokens,
-                provider: llm.name().to_string(),
-                model: llm.model().to_string(),
+                provider: answered_provider,
+                model: answered_model,
                 min_confidence: cfg.min_confidence,
                 proposal_actor: cfg.proposal_actor,
                 pending_path: cfg.pending_path,
@@ -578,8 +585,8 @@ pub async fn run_auto_improve_review(
         observations_considered: observations.len(),
         session_duration_secs: duration,
         estimated_input_tokens,
-        provider: llm.name().to_string(),
-        model: llm.model().to_string(),
+        provider: answered_provider,
+        model: answered_model,
         min_confidence: cfg.min_confidence,
         proposal_actor: cfg.proposal_actor,
         pending_path: cfg.pending_path,
@@ -4363,6 +4370,158 @@ mod tests {
             "warnings: {:?}",
             report.warnings
         );
+    }
+
+    // ── FN8-8120 runtime fallback: a report must name the lane that actually
+    // ── answered. The provider stack mirrors production: health wrapper
+    // ── around FallbackProvider(primary, secondary).
+
+    struct QuotaLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for QuotaLlm {
+        fn name(&self) -> &'static str {
+            "openai-compat"
+        }
+
+        fn model(&self) -> &str {
+            "poolside/laguna-s-2.1"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            unreachable!()
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Err(LlmError::Provider {
+                status: 429,
+                body: r#"{"error":"usage limit exceeded"}"#.into(),
+            })
+        }
+    }
+
+    async fn seeded_session() -> (
+        TempDir,
+        Store,
+        ai_memory_core::WorkspaceId,
+        ai_memory_core::ProjectId,
+        ai_memory_core::SessionId,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        let session_id = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        (tmp, store, ws, proj, session_id)
+    }
+
+    fn production_stack(
+        secondary: std::sync::Arc<dyn LlmProvider>,
+    ) -> std::sync::Arc<dyn LlmProvider> {
+        let fallback =
+            ai_memory_llm::FallbackProvider::new(std::sync::Arc::new(QuotaLlm), secondary);
+        ai_memory_llm::ProviderHealth::default().wrap_llm_provider(
+            std::sync::Arc::new(fallback),
+            "openai-compat",
+            "poolside/laguna-s-2.1",
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn fallback_answer_is_recorded_as_the_secondary_provider() {
+        let (_tmp, store, ws, proj, session_id) = seeded_session().await;
+        let llm = production_stack(std::sync::Arc::new(FakeLlm));
+        let report = run_auto_improve_review(
+            &store.reader,
+            llm.as_ref(),
+            ws,
+            proj,
+            session_id,
+            AutoImproveReviewConfig {
+                min_session_duration_secs: 0,
+                ..cfg()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.provider, "fake",
+            "429 on the primary: the fallback answered"
+        );
+        assert_eq!(report.model, "fake-model");
+        assert_eq!(report.proposals.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_truncation_is_recorded_as_the_secondary_provider() {
+        let (_tmp, store, ws, proj, session_id) = seeded_session().await;
+        let llm = production_stack(std::sync::Arc::new(TruncatingLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let report = run_auto_improve_review(
+            &store.reader,
+            llm.as_ref(),
+            ws,
+            proj,
+            session_id,
+            AutoImproveReviewConfig {
+                min_session_duration_secs: 0,
+                ..cfg()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.provider, "truncating");
+        assert_eq!(report.model, "truncating-model");
     }
 }
 
