@@ -307,10 +307,11 @@ impl OpenAiCompatProvider {
         // Default (and strict fallback): most older local engines don't
         // honour `response_format`. Ask for JSON and extract the first
         // balanced `{…}` object from the text.
-        let res = self
+        let (res, finish_reason) = self
             .inner
-            .complete_with_operation_id(request, operation_id)
+            .complete_text_with_finish_reason(&request, operation_id)
             .await?;
+        let cut_at_limit = finish_reason.as_deref() == Some("length");
         // Reasoning models (DeepSeek, Qwen, MiniMax M2.7, …) prepend
         // `<think>…</think>` before the JSON. Strip those blocks (and any
         // surrounding markdown fences) before trying to parse — otherwise
@@ -333,13 +334,30 @@ impl OpenAiCompatProvider {
                         total_len = cleaned.len(),
                         "no balanced JSON object found"
                     );
+                    // Cut at the output ceiling before any JSON closed:
+                    // a zero yield the lane chain can route past, not a
+                    // shape error it must treat as fatal.
+                    if cut_at_limit {
+                        return Err(truncated(res.text));
+                    }
                     return Err(LlmError::UnexpectedShape(
                         "openai-compat response did not contain a JSON object".into(),
                     ));
                 };
-                serde_json::from_str::<serde_json::Value>(slice).map_err(LlmError::from)
+                match serde_json::from_str::<serde_json::Value>(slice) {
+                    Ok(v) => Ok(v),
+                    Err(_) if cut_at_limit => Err(truncated(res.text)),
+                    Err(err) => Err(LlmError::from(err)),
+                }
             }
         }
+    }
+}
+
+fn truncated(text: String) -> LlmError {
+    LlmError::Truncated {
+        finish_reason: "length".into(),
+        partial: (!text.trim().is_empty()).then_some(crate::error::PartialText(text)),
     }
 }
 

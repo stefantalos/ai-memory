@@ -264,6 +264,10 @@ struct OpenAiChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiMessageResponse {
     content: Option<String>,
+    /// Hidden reasoning some engines return beside `content` (Poolside,
+    /// vLLM reasoning parsers). Read only to salvage a partial on a cut.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAiToolCall>>,
 }
@@ -462,6 +466,24 @@ impl OpenAiProvider {
         parse_tool_call_response(response, &schema)
     }
 
+    /// A plain text completion plus the provider's `finish_reason`, so a
+    /// caller that parses the text can tell a cut at the output ceiling
+    /// from a model that answered in the wrong shape.
+    pub(crate) async fn complete_text_with_finish_reason(
+        &self,
+        request: &ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<(ChatResponse, Option<String>)> {
+        let response = self
+            .post(&self.build_request(request, None), operation_id)
+            .await?;
+        let finish_reason = response
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.clone());
+        Ok((self.to_chat_response(response), finish_reason))
+    }
+
     /// Native reasoning payload for this host / dialect.
     ///
     /// Official OpenAI and generic openai-compat send top-level
@@ -574,17 +596,35 @@ pub(crate) fn parse_tool_call_response(
         return Err(LlmError::UnexpectedShape("no choices in response".into()));
     };
     let finish_reason = choice.finish_reason.clone();
-    let call = choice
-        .message
+    let cut_at_limit = finish_reason.as_deref() == Some("length");
+    let message = choice.message;
+    let call = message
         .tool_calls
         .unwrap_or_default()
         .into_iter()
         .find(|c| c.function.name.is_empty() || c.function.name == STRUCTURED_OUTPUT_TOOL_NAME);
     let Some(call) = call else {
+        // No call AND the output ceiling was hit: the model spent the whole
+        // budget (typically overthinking) before it could call the function.
+        // That is a paid-for zero yield, not a shape mismatch — a shape error
+        // would send the same prompt again as a text call on the same lane
+        // (measured 2026-09-24: 14,000 output tokens, twice per attempt).
+        if cut_at_limit {
+            return Err(LlmError::Truncated {
+                finish_reason: "length".into(),
+                partial: partial_of(message.content, message.reasoning_content),
+            });
+        }
         return Err(LlmError::UnexpectedShape(
             "model did not call the forced structured-output function".into(),
         ));
     };
+    if cut_at_limit && call.function.arguments.is_null() {
+        return Err(LlmError::Truncated {
+            finish_reason: "length".into(),
+            partial: partial_of(message.content, message.reasoning_content),
+        });
+    }
     let parsed = match call.function.arguments {
         serde_json::Value::String(text) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(v) => v,
@@ -607,6 +647,17 @@ pub(crate) fn parse_tool_call_response(
     let mut value = parsed;
     decode_stringified_containers(&mut value, schema);
     Ok(value)
+}
+
+/// The text a cut response did emit: `content` first, else the reasoning.
+fn partial_of(
+    content: Option<String>,
+    reasoning: Option<String>,
+) -> Option<crate::error::PartialText> {
+    content
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| reasoning.filter(|t| !t.trim().is_empty()))
+        .map(crate::error::PartialText)
 }
 
 /// Where the schema declares an array or object but the model sent a string

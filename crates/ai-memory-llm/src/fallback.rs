@@ -420,6 +420,7 @@ impl FallbackProvider {
             status: outcome.1,
             input_tokens: usage.map(|u| u.input_tokens),
             output_tokens: usage.map(|u| u.output_tokens),
+            http_calls: usage.map(|u| u.http_calls),
             cost_usd_est: usage
                 .and_then(|u| estimate_cost(provider, model, u.input_tokens, u.output_tokens)),
             funding: funding_for(provider, model),
@@ -464,6 +465,7 @@ impl FallbackProvider {
             status: None,
             input_tokens: None,
             output_tokens: None,
+            http_calls: None,
             cost_usd_est: verdict.cost_usd,
             funding: "Jev value gate (OpenRouter, recorded by floo authoriseMeteredCall)",
         });

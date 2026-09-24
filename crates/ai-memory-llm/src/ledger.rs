@@ -110,6 +110,9 @@ pub struct CallRecord {
     pub input_tokens: Option<u32>,
     /// Output tokens the provider reported.
     pub output_tokens: Option<u32>,
+    /// HTTP requests this lane call sent (the token counts are their sum);
+    /// `None` when the provider reported no usage.
+    pub http_calls: Option<u32>,
     /// Estimate from [`published_price`] (see module docs); `None` when unpriced.
     pub cost_usd_est: Option<f64>,
     /// Funding label ([`funding_for`]).
@@ -234,10 +237,11 @@ impl LaneObserver for JsonlLedger {
                 "taskId": format!("ai-memory:{}", record.caller),
                 "operator": "Stefan",
                 "notes": format!(
-                    "ai-memory {} lane={} outcome={} in={} out={} est_usd={}",
+                    "ai-memory {} lane={} outcome={} http_calls={} in={} out={} est_usd={}",
                     record.caller,
                     record.lane,
                     record.outcome,
+                    record.http_calls.map_or("?".into(), |t| t.to_string()),
                     record.input_tokens.map_or("?".into(), |t| t.to_string()),
                     record.output_tokens.map_or("?".into(), |t| t.to_string()),
                     record.cost_usd_est.map_or("?".into(), |c| format!("{c:.6}")),
@@ -312,6 +316,7 @@ mod tests {
             status: None,
             input_tokens: Some(100),
             output_tokens: Some(10),
+            http_calls: Some(1),
             cost_usd_est: estimate_cost("gemini", "gemini-2.5-flash", 100, 10),
             funding: funding_for("gemini", "gemini-2.5-flash"),
         };

@@ -254,3 +254,93 @@ async fn poolside_output_is_capped_at_14k_on_every_call() {
         "other models untouched"
     );
 }
+
+/// Laguna's documented overthinking: the whole output budget goes to
+/// reasoning, no function call, `finish_reason: "length"`.
+fn overthought_body(prompt: u32, completion: u32) -> serde_json::Value {
+    json!({
+        "id": "id", "object": "chat.completion", "created": 0, "model": "poolside/laguna-s-2.1",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": null,
+                         "reasoning_content": "Let me think about the observations again..." },
+            "finish_reason": "length"
+        }],
+        "usage": { "prompt_tokens": prompt, "completion_tokens": completion }
+    })
+}
+
+/// Measured 2026-09-24 (consolidate, session d3345285): 14,000 output tokens,
+/// no call. Before the fix this was a shape error, so the SAME prompt was sent
+/// again as a text call with thinking on and its failure masked the cut.
+#[tokio::test]
+async fn no_tool_call_cut_at_the_limit_is_truncated_and_sends_nothing_else() {
+    let (server, seen) = serve(vec![
+        overthought_body(6_646, 14_000),
+        text_body("{\"summary\": \"s\", \"proposals\": []}"),
+    ])
+    .await;
+    let err = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
+        .complete_structured_raw(request(), schema())
+        .await
+        .expect_err("a cut is not a result");
+    match err {
+        ai_memory_llm::LlmError::Truncated {
+            finish_reason,
+            partial,
+        } => {
+            assert_eq!(finish_reason, "length");
+            assert!(
+                partial
+                    .expect("the reasoning is salvaged")
+                    .0
+                    .contains("think about"),
+                "partial carries what the model did emit"
+            );
+        }
+        other => panic!("expected Truncated, got {other:?}"),
+    }
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "no text fallback on the same lane after a cut"
+    );
+}
+
+/// The text fallback still runs when the forced call ended for another
+/// reason — but if THAT call is cut at the limit with no JSON, the caller must
+/// see `Truncated` (routable to the next lane), not a fatal shape error.
+#[tokio::test]
+async fn a_text_fallback_cut_at_the_limit_is_truncated_not_a_shape_error() {
+    let cut_text = json!({
+        "id": "id", "object": "chat.completion", "created": 0, "model": "poolside/laguna-s-2.1",
+        "choices": [{ "index": 0,
+            "message": { "role": "assistant", "content": "<think>first I will list every" },
+            "finish_reason": "length" }]
+    });
+    let (server, seen) = serve(vec![text_body("I'll propose two pages."), cut_text]).await;
+    let err = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
+        .complete_structured_raw(request(), schema())
+        .await
+        .expect_err("a cut is not a result");
+    assert!(
+        matches!(err, ai_memory_llm::LlmError::Truncated { .. }),
+        "expected Truncated, got {err:?}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+/// Same prose without the cut stays a shape error: the classification rides
+/// on `finish_reason`, not on the absence of JSON alone.
+#[tokio::test]
+async fn a_text_fallback_without_json_that_stopped_normally_stays_a_shape_error() {
+    let (server, _) = serve(vec![text_body("prose"), text_body("still prose")]).await;
+    let err = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
+        .complete_structured_raw(request(), schema())
+        .await
+        .expect_err("no JSON");
+    assert!(
+        matches!(err, ai_memory_llm::LlmError::UnexpectedShape(_)),
+        "{err:?}"
+    );
+}
