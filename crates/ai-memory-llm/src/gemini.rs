@@ -24,6 +24,22 @@ use crate::types::{ChatRequest, ChatResponse, Role, Usage};
 /// Default Gemini API base.
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
+/// Published output-token limit for a Gemini model, when known.
+///
+/// gemini-2.5-flash: "Output token limit: 65,536" —
+/// <https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash>, read
+/// 2026-09-24.
+#[must_use]
+pub fn model_max_output_tokens(model: &str) -> Option<u32> {
+    let model = model.to_ascii_lowercase();
+    model
+        .contains("gemini-2.5-flash")
+        .then_some(GEMINI_25_FLASH_MAX_OUTPUT_TOKENS)
+}
+
+/// gemini-2.5-flash's published output-token limit.
+pub const GEMINI_25_FLASH_MAX_OUTPUT_TOKENS: u32 = 65_536;
+
 /// Gemini-backed provider.
 pub struct GeminiProvider {
     client: reqwest::Client,
@@ -31,6 +47,7 @@ pub struct GeminiProvider {
     base_url: String,
     model: String,
     timeout: Duration,
+    structured_max_output_tokens: Option<u32>,
 }
 
 impl GeminiProvider {
@@ -41,13 +58,25 @@ impl GeminiProvider {
     /// Returns a `reqwest::Error` if the HTTP client cannot be built.
     pub fn new(api_key: SecretString, model: impl Into<String>) -> LlmResult<Self> {
         let client = reqwest::Client::builder().build()?;
+        let model = model.into();
         Ok(Self {
             client,
             api_key,
             base_url: DEFAULT_BASE_URL.to_string(),
-            model: model.into(),
+            structured_max_output_tokens: model_max_output_tokens(&model),
+            model,
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
         })
+    }
+
+    /// Output-token budget for structured (JSON-mode) calls. Defaults to the
+    /// model's published maximum (operator decision 2026-09-24: a run killed
+    /// by an artificial limit is paid in full and yields nothing); `None`
+    /// sends the caller's `max_tokens` unchanged.
+    #[must_use]
+    pub fn with_structured_max_output_tokens(mut self, tokens: Option<u32>) -> Self {
+        self.structured_max_output_tokens = tokens;
+        self
     }
 
     /// Override the API base URL (mostly for tests against wiremock).
@@ -239,11 +268,20 @@ impl GeminiProvider {
             parts: vec![GeminiPart { text: s }],
         });
         let response_mime_type = response_schema.as_ref().map(|_| "application/json");
+        // Structured calls use the configured budget (default: the model's
+        // published maximum) exactly; every call stays within the model max.
+        let ceiling = model_max_output_tokens(&self.model).unwrap_or(u32::MAX);
+        let max_output_tokens = match (response_schema.is_some(), self.structured_max_output_tokens)
+        {
+            (true, Some(budget)) => budget,
+            _ => request.max_tokens,
+        }
+        .min(ceiling);
         GeminiRequest {
             contents,
             system_instruction,
             generation_config: GeminiGenerationConfig {
-                max_output_tokens: request.max_tokens,
+                max_output_tokens,
                 thinking_config: default_thinking_config_for(&self.model),
                 temperature: request.temperature,
                 response_mime_type,
@@ -634,6 +672,38 @@ mod tests {
         });
         let prepared = prepare_schema_for_gemini(schema.clone()).unwrap();
         assert_eq!(prepared, schema);
+    }
+
+    #[test]
+    fn structured_calls_ask_for_the_model_maximum_by_default_and_honour_an_override() {
+        let req = ChatRequest {
+            system: None,
+            messages: vec![crate::types::ChatMessage {
+                role: Role::User,
+                content: "x".into(),
+            }],
+            max_tokens: 16_000,
+            temperature: None,
+        };
+        let p = GeminiProvider::new(SecretString::from("k"), "gemini-2.5-flash").unwrap();
+        let schema = Some(json!({"type": "object"}));
+        assert_eq!(
+            p.build_request(&req, schema.clone()).generation_config.max_output_tokens,
+            65_536
+        );
+        // Unstructured calls keep the caller's budget.
+        assert_eq!(p.build_request(&req, None).generation_config.max_output_tokens, 16_000);
+        let p = p.with_structured_max_output_tokens(Some(40_000));
+        assert_eq!(
+            p.build_request(&req, schema.clone()).generation_config.max_output_tokens,
+            40_000
+        );
+        // Never above the published model limit.
+        let p = p.with_structured_max_output_tokens(Some(100_000));
+        assert_eq!(
+            p.build_request(&req, schema).generation_config.max_output_tokens,
+            65_536
+        );
     }
 
     #[test]

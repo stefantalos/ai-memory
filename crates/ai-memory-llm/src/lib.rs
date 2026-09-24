@@ -87,7 +87,7 @@ pub use ledger::{
     BreakerEvent, CallRecord, JsonlLedger, LaneObserver, METERED_FUNDING_TYPE, key_fingerprint,
 };
 pub use usage::{ReportedUsage, capture_usage, current_caller, with_caller};
-pub use gemini::GeminiProvider;
+pub use gemini::{GEMINI_25_FLASH_MAX_OUTPUT_TOKENS, GeminiProvider, model_max_output_tokens};
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{
     ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot,

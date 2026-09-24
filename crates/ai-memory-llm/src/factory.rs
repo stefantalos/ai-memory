@@ -283,6 +283,14 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
         ProviderChoice::Gemini => {
             let key = config.auth.require_api_key()?;
             let mut provider = GeminiProvider::new(key, config.model)?;
+            // Operator override for the structured (review) output budget;
+            // default is the model's published maximum.
+            if let Some(tokens) = std::env::var("AI_MEMORY_GEMINI_STRUCTURED_MAX_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+            {
+                provider = provider.with_structured_max_output_tokens(Some(tokens));
+            }
             if let Some(url) = config.base_url {
                 provider = provider.with_base_url(url);
             }
