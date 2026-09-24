@@ -550,6 +550,17 @@ pub(crate) enum WriteCmd {
         ended_at: i64,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    ReleaseAutoImproveSchedulerClaim {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        kind: crate::auto_improve::SchedulerFailureKind,
+        error: String,
+        reply: oneshot::Sender<StoreResult<Option<crate::auto_improve::ReleasedSchedulerClaim>>>,
+    },
+    ReleaseOrphanAutoImproveSchedulerClaims {
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
     RecordMaintenanceJobSuccess {
         job: crate::maintenance::MaintenanceJob,
         reply: oneshot::Sender<StoreResult<()>>,
@@ -2253,6 +2264,39 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Release the held claim of a scheduled run that failed so a later tick
+    /// can review the session again; see
+    /// [`crate::auto_improve::release_scheduler_claim`].
+    pub async fn release_auto_improve_scheduler_claim(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        kind: crate::auto_improve::SchedulerFailureKind,
+        error: String,
+    ) -> StoreResult<Option<crate::auto_improve::ReleasedSchedulerClaim>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReleaseAutoImproveSchedulerClaim {
+            workspace_id,
+            project_id,
+            session_id,
+            kind,
+            error,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Release every held scheduler claim that has no run (startup only);
+    /// see [`crate::auto_improve::release_orphan_scheduler_claims`].
+    pub async fn release_orphan_auto_improve_scheduler_claims(&self) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReleaseOrphanAutoImproveSchedulerClaims { reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Persist a global maintenance job's successful completion time.
     pub async fn record_maintenance_job_success(
         &self,
@@ -3214,6 +3258,32 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     ended_at,
                 );
                 send_or_warn(reply, result, "claim_auto_improve_scheduler_session");
+            }
+            WriteCmd::ReleaseAutoImproveSchedulerClaim {
+                workspace_id,
+                project_id,
+                session_id,
+                kind,
+                error,
+                reply,
+            } => {
+                let result = crate::auto_improve::release_scheduler_claim(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    kind,
+                    &error,
+                );
+                send_or_warn(reply, result, "release_auto_improve_scheduler_claim");
+            }
+            WriteCmd::ReleaseOrphanAutoImproveSchedulerClaims { reply } => {
+                let result = crate::auto_improve::release_orphan_scheduler_claims(&mut conn);
+                send_or_warn(
+                    reply,
+                    result,
+                    "release_orphan_auto_improve_scheduler_claims",
+                );
             }
             WriteCmd::RecordMaintenanceJobSuccess { job, reply } => {
                 let result = crate::maintenance::record_success(&conn, job);

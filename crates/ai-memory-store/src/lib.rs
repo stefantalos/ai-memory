@@ -39,8 +39,9 @@ pub use auto_improve::{
     AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
     AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
-    OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, SkippedProposal,
-    StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
+    OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, ReleasedSchedulerClaim,
+    SCHEDULER_MAX_FAILED_ATTEMPTS, SchedulerFailureKind, SkippedProposal, StageAutoImproveRun,
+    StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use decay::{
     DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
@@ -3918,6 +3919,391 @@ mod tests {
             )
             .unwrap();
         assert_eq!(claim_rows, 1);
+    }
+
+    /// One ended session past a fresh scope watermark, for the claim-release
+    /// tests. Returns the store handles, scope and the session's `ended_at`.
+    async fn claim_release_fixture(
+        tmp: &TempDir,
+    ) -> (Store, WorkspaceId, ProjectId, SessionId, i64) {
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        let ended_at = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 1)
+            .await
+            .unwrap()[0]
+            .ended_at;
+        (store, ws, proj, session_id, ended_at)
+    }
+
+    async fn is_candidate(store: &Store, ws: WorkspaceId, proj: ProjectId, id: SessionId) -> bool {
+        store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.session_id == id)
+    }
+
+    fn claim_row(store: &Store, id: SessionId) -> (i64, Option<i64>, Option<String>) {
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.query_row(
+            "SELECT failed_attempts, released_at, last_error \
+             FROM auto_improve_scheduler_claims WHERE session_id = ?1",
+            params![id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// A failed run used to keep its claim forever, and the candidate query
+    /// hides every claimed session: the session left the backlog without a
+    /// review. A released claim must put it back, and a HELD claim must still
+    /// never be taken twice.
+    #[tokio::test]
+    async fn a_released_scheduler_claim_returns_the_session_to_the_backlog() {
+        let tmp = TempDir::new().unwrap();
+        let (store, ws, proj, id, ended_at) = claim_release_fixture(&tmp).await;
+
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !is_candidate(&store, ws, proj, id).await,
+            "held claim hides it"
+        );
+        assert!(
+            !store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap(),
+            "a held claim is never taken a second time"
+        );
+
+        let released = store
+            .writer
+            .release_auto_improve_scheduler_claim(
+                ws,
+                proj,
+                id,
+                SchedulerFailureKind::SessionAttributable,
+                "provider error 500: boom".into(),
+            )
+            .await
+            .unwrap()
+            .expect("the held claim is released");
+        assert_eq!(released.failed_attempts, 1);
+        assert!(!released.exhausted);
+        assert!(
+            is_candidate(&store, ws, proj, id).await,
+            "back in the backlog"
+        );
+        let (attempts, released_at, last_error) = claim_row(&store, id);
+        assert_eq!(attempts, 1);
+        assert!(released_at.is_some());
+        assert_eq!(last_error.as_deref(), Some("provider error 500: boom"));
+
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap(),
+            "a released claim is taken again"
+        );
+        assert!(!is_candidate(&store, ws, proj, id).await);
+        assert_eq!(claim_row(&store, id).1, None, "re-claim holds it again");
+        assert!(
+            store
+                .writer
+                .release_auto_improve_scheduler_claim(
+                    ws,
+                    proj,
+                    id,
+                    SchedulerFailureKind::SessionAttributable,
+                    "x".into(),
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .writer
+                .release_auto_improve_scheduler_claim(
+                    ws,
+                    proj,
+                    id,
+                    SchedulerFailureKind::SessionAttributable,
+                    "x".into(),
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "releasing an already released claim changes nothing"
+        );
+        assert_eq!(claim_row(&store, id).0, 2);
+    }
+
+    /// Measured 2026-09-24: three ticks in a row, 24 of 24 calls were
+    /// Poolside 429s. A lane that could not be asked says nothing about the
+    /// session, so any number of those must leave the session eligible.
+    #[tokio::test]
+    async fn lane_unavailable_failures_never_spend_the_session_budget() {
+        let tmp = TempDir::new().unwrap();
+        let (store, ws, proj, id, ended_at) = claim_release_fixture(&tmp).await;
+        for _ in 0..5 {
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                    .await
+                    .unwrap()
+            );
+            let released = store
+                .writer
+                .release_auto_improve_scheduler_claim(
+                    ws,
+                    proj,
+                    id,
+                    SchedulerFailureKind::LaneUnavailable,
+                    "provider error 429: usage limit exceeded".into(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(released.failed_attempts, 0);
+            assert!(!released.exhausted);
+            assert!(is_candidate(&store, ws, proj, id).await);
+        }
+    }
+
+    /// Three session-attributable failures and the session is done: not a
+    /// candidate, not claimable, and the claim row names the last error.
+    /// The expected 3 is the specification, not read from the constant.
+    #[tokio::test]
+    async fn the_third_session_attributable_failure_is_terminal_and_named() {
+        let tmp = TempDir::new().unwrap();
+        let (store, ws, proj, id, ended_at) = claim_release_fixture(&tmp).await;
+        for attempt in 1..=3_i64 {
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                    .await
+                    .unwrap(),
+                "attempt {attempt} must be claimable"
+            );
+            let released = store
+                .writer
+                .release_auto_improve_scheduler_claim(
+                    ws,
+                    proj,
+                    id,
+                    SchedulerFailureKind::SessionAttributable,
+                    format!("unexpected response shape #{attempt}"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(released.failed_attempts, attempt);
+            assert_eq!(released.exhausted, attempt == 3);
+        }
+        assert!(
+            !is_candidate(&store, ws, proj, id).await,
+            "exhausted: not a candidate"
+        );
+        assert!(
+            !store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap(),
+            "exhausted: not claimable"
+        );
+        let (attempts, released_at, last_error) = claim_row(&store, id);
+        assert_eq!(attempts, 3);
+        assert!(released_at.is_some(), "stays released, not silently held");
+        assert_eq!(last_error.as_deref(), Some("unexpected response shape #3"));
+    }
+
+    /// A released claim for a session that since got a run (a manual review,
+    /// say) must not be re-claimed: the run check applies on the re-claim
+    /// path too, not only to a fresh insert.
+    #[tokio::test]
+    async fn a_released_claim_is_not_retaken_once_the_session_has_a_run() {
+        let tmp = TempDir::new().unwrap();
+        let (store, ws, proj, id, ended_at) = claim_release_fixture(&tmp).await;
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap()
+        );
+        store
+            .writer
+            .release_auto_improve_scheduler_claim(
+                ws,
+                proj,
+                id,
+                SchedulerFailureKind::SessionAttributable,
+                "boom".into(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: Some(id),
+                provider: Some("none".into()),
+                model: Some("none".into()),
+                summary: Some("reviewed manually".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                proposal_actor: ActorContext::default(),
+                proposals: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(!is_candidate(&store, ws, proj, id).await);
+        assert!(
+            !store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap(),
+            "a reviewed session is never claimed again"
+        );
+    }
+
+    /// Startup releases held claims that have no run (the 32 stranded before
+    /// this change), without spending budget, and leaves a held claim whose
+    /// run exists alone.
+    #[tokio::test]
+    async fn startup_releases_orphan_claims_but_not_reviewed_ones() {
+        let tmp = TempDir::new().unwrap();
+        let (store, ws, proj, orphan, orphan_ended) = claim_release_fixture(&tmp).await;
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, orphan, orphan_ended)
+                .await
+                .unwrap()
+        );
+
+        let reviewed = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: reviewed,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(reviewed, None).await.unwrap();
+        let reviewed_ended = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.session_id == reviewed)
+            .unwrap()
+            .ended_at;
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, reviewed, reviewed_ended)
+                .await
+                .unwrap()
+        );
+        store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: Some(reviewed),
+                provider: Some("none".into()),
+                model: Some("none".into()),
+                summary: Some("reviewed".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                proposal_actor: ActorContext::default(),
+                proposals: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !is_candidate(&store, ws, proj, orphan).await,
+            "stranded before"
+        );
+        assert_eq!(
+            store
+                .writer
+                .release_orphan_auto_improve_scheduler_claims()
+                .await
+                .unwrap(),
+            1,
+            "exactly the run-less claim is released"
+        );
+        assert!(
+            is_candidate(&store, ws, proj, orphan).await,
+            "back after startup"
+        );
+        assert_eq!(claim_row(&store, orphan).0, 0, "no budget spent");
+        assert_eq!(
+            claim_row(&store, reviewed).1,
+            None,
+            "reviewed claim untouched"
+        );
+        assert!(!is_candidate(&store, ws, proj, reviewed).await);
     }
 
     #[tokio::test]

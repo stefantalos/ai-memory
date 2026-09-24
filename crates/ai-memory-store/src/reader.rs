@@ -2874,6 +2874,7 @@ impl ReaderPool {
                        WHERE c.workspace_id = s.workspace_id \
                          AND c.project_id = s.project_id \
                          AND c.session_id = s.id \
+                         AND (c.released_at IS NULL OR c.failed_attempts >= ?6) \
                    ) \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM auto_improve_runs r \
@@ -2891,6 +2892,9 @@ impl ReaderPool {
                     watermark,
                     cutoff,
                     limit.min(i64::MAX as usize) as i64,
+                    // Same bound the claim upsert enforces: a released claim is
+                    // a candidate again only while its failure budget lasts.
+                    crate::auto_improve::SCHEDULER_MAX_FAILED_ATTEMPTS,
                 ],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;

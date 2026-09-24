@@ -16,16 +16,18 @@
 use std::sync::Arc;
 
 use ai_memory_core::{ActorContext, PagePath, ProjectId, SessionId, WorkspaceId};
-use ai_memory_llm::LlmProvider;
+use ai_memory_llm::{LlmError, LlmProvider};
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, NewAutoImproveProposal,
-    ReaderPool, SkippedProposal, StageAutoImproveRun, WriterHandle,
+    ReaderPool, SchedulerFailureKind, SkippedProposal, StageAutoImproveRun, WriterHandle,
 };
 use ai_memory_wiki::Wiki;
 use anyhow::Result;
 use tracing::info;
 
-use crate::{AutoImproveReport, AutoImproveReviewConfig, run_auto_improve_review};
+use crate::{
+    AutoImproveError, AutoImproveReport, AutoImproveReviewConfig, run_auto_improve_review,
+};
 
 /// Settings for the scheduled auto-improvement loop, already mapped from
 /// the host's configuration. Bundles the review config with the
@@ -63,6 +65,22 @@ pub async fn initialize_auto_improve_scheduler_scopes(
     let scopes = reader.list_all_scopes().await?;
     let total = scopes.len();
     let mut errors = 0usize;
+    // A held claim with no run at startup is a review that failed or was
+    // interrupted before the release path existed (or by a crash): release
+    // it so the session is reviewed instead of silently dropped. Safe here
+    // because the single-instance serve lock means no review is in flight.
+    match writer.release_orphan_auto_improve_scheduler_claims().await {
+        Ok(0) => {}
+        Ok(released) => info!(
+            released,
+            "auto-improve scheduler released claims held without a run; \
+             those sessions are candidates again"
+        ),
+        Err(e) => {
+            errors += 1;
+            tracing::warn!(error = %e, "auto-improve orphan claim release failed");
+        }
+    }
     for scope in scopes {
         if let Err(e) = writer
             .ensure_auto_improve_scheduler_state(scope.workspace_id, scope.project_id)
@@ -120,6 +138,12 @@ pub struct ScheduledAutoImproveTickOutcome {
     pub errors: usize,
     /// Cross-session ("experience") passes that ran this tick.
     pub experience_runs: usize,
+    /// Failed runs whose claim was released so a later tick retries the
+    /// session (a failure no longer removes a session from the backlog).
+    pub released: usize,
+    /// Failed runs that used up the session's failure budget; the claim row
+    /// keeps `last_error`, and the session is not retried.
+    pub exhausted: usize,
 }
 
 struct ScheduledAutoImproveContext<'a> {
@@ -348,19 +372,99 @@ pub async fn run_auto_improve_scheduler_tick(
                     // so a failing provider is not retried across the pool.
                     model_slots_used += 1;
                     outcome.errors += 1;
+                    let kind = classify_scheduled_failure(&e);
                     tracing::warn!(
                         workspace = %scope.workspace_name,
                         project = %scope.project_name,
                         session_id = %candidate.session_id,
                         error = %e,
+                        failure_kind = ?kind,
                         "scheduled auto-improve failed"
                     );
+                    // The failed run wrote no run row. Keeping the claim would
+                    // drop this session from the backlog for good; release it.
+                    match ctx
+                        .writer
+                        .release_auto_improve_scheduler_claim(
+                            ctx.workspace_id,
+                            ctx.project_id,
+                            candidate.session_id,
+                            kind,
+                            format!("{e:#}"),
+                        )
+                        .await
+                    {
+                        Ok(Some(released)) if released.exhausted => {
+                            outcome.exhausted += 1;
+                            tracing::warn!(
+                                workspace = %scope.workspace_name,
+                                project = %scope.project_name,
+                                session_id = %candidate.session_id,
+                                failed_attempts = released.failed_attempts,
+                                error = %e,
+                                "scheduled auto-improve gave up on session: failure budget \
+                                 exhausted; the claim keeps the last error"
+                            );
+                        }
+                        Ok(Some(_)) => outcome.released += 1,
+                        Ok(None) => {
+                            outcome.errors += 1;
+                            tracing::warn!(
+                                workspace = %scope.workspace_name,
+                                project = %scope.project_name,
+                                session_id = %candidate.session_id,
+                                "scheduled auto-improve found no held claim to release"
+                            );
+                        }
+                        Err(release_err) => {
+                            outcome.errors += 1;
+                            tracing::warn!(
+                                workspace = %scope.workspace_name,
+                                project = %scope.project_name,
+                                session_id = %candidate.session_id,
+                                error = %release_err,
+                                "scheduled auto-improve claim release failed; the session \
+                                 stays claimed until the next startup"
+                            );
+                        }
+                    }
                 }
             }
         }
     }
 
     Ok(outcome)
+}
+
+/// Decide whether a failed scheduled run is evidence about the session.
+///
+/// Only a failure where the lane could not be asked at all is
+/// [`SchedulerFailureKind::LaneUnavailable`]: a quota `429`, a refused
+/// connection, an auth failure, no configured provider. Measured 2026-09-24:
+/// three consecutive ticks where 24 of 24 calls were Poolside 429s — with
+/// those counted, a three-strike budget would have exhausted the head of
+/// the queue and reproduced the loss this fixes.
+///
+/// Everything else spends budget, including a timeout and a `5xx`: both
+/// can be caused by the request itself (a very large session), and a
+/// session that fails that way on every tick must stop holding a model
+/// slot. An unrecognised error is session-attributable too — the budget is
+/// the bound that keeps an unknown failure from retrying forever.
+fn classify_scheduled_failure(e: &anyhow::Error) -> SchedulerFailureKind {
+    let llm = match e.downcast_ref::<AutoImproveError>() {
+        Some(AutoImproveError::Llm(llm)) => Some(llm),
+        Some(_) => None,
+        None => e.downcast_ref::<LlmError>(),
+    };
+    match llm {
+        Some(LlmError::Provider { status: 429, .. })
+        | Some(LlmError::Auth(_))
+        | Some(LlmError::NotConfigured(_)) => SchedulerFailureKind::LaneUnavailable,
+        Some(LlmError::Http(http)) if http.is_connect() && !http.is_timeout() => {
+            SchedulerFailureKind::LaneUnavailable
+        }
+        _ => SchedulerFailureKind::SessionAttributable,
+    }
 }
 
 async fn run_scheduled_auto_improve(
@@ -1308,6 +1412,308 @@ mod tests {
             left,
             vec![next_substantial],
             "the single model slot still caps the tick"
+        );
+    }
+
+    /// Fails every structured call with a fixed provider status and counts
+    /// the calls, so a test can tell "not retried" from "retried and failed".
+    struct FailingLlm {
+        status: u16,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FailingLlm {
+        fn new(status: u16) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    status,
+                    calls: Arc::clone(&calls),
+                },
+                calls,
+            )
+        }
+    }
+
+    impl LlmProvider for FailingLlm {
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+
+        fn model(&self) -> &str {
+            "failing"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let status = self.status;
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                Err(LlmError::Provider {
+                    status,
+                    body: "injected".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let status = self.status;
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                Err(LlmError::Provider {
+                    status,
+                    body: "injected".into(),
+                })
+            })
+        }
+    }
+
+    /// Only the preflight thresholds are set (the fixture session is small);
+    /// the retry bound is left to its default and never named here.
+    fn failure_test_settings() -> ScheduledAutoImproveSettings {
+        ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig {
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 1,
+            experience: None,
+        }
+    }
+
+    async fn failure_fixture(tmp: &TempDir) -> (Store, Wiki, WorkspaceId, ProjectId, SessionId) {
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let session_id = seed_reviewable_session(&store, ws, proj).await;
+        (store, wiki, ws, proj, session_id)
+    }
+
+    async fn tick(
+        store: &Store,
+        wiki: &Wiki,
+        llm: Arc<dyn LlmProvider>,
+        settings: &ScheduledAutoImproveSettings,
+    ) -> ScheduledAutoImproveTickOutcome {
+        run_auto_improve_scheduler_tick(&store.reader, &store.writer, wiki, &llm, settings)
+            .await
+            .unwrap()
+    }
+
+    async fn is_candidate(store: &Store, ws: WorkspaceId, proj: ProjectId, id: SessionId) -> bool {
+        store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.session_id == id)
+    }
+
+    fn run_count(store: &Store, id: SessionId) -> i64 {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM auto_improve_runs WHERE session_id = ?1",
+            rusqlite::params![id.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The measured defect: a provider failure kept the session's claim and
+    /// wrote no run, so the session left the backlog unreviewed (32 sessions
+    /// in 24h on 2026-09-24). After a failure the session must be a candidate
+    /// again, and the next healthy tick must actually review it.
+    #[tokio::test]
+    async fn a_provider_failure_does_not_remove_the_session_from_the_backlog() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, id) = failure_fixture(&tmp).await;
+        let settings = failure_test_settings();
+
+        let (failing, calls) = FailingLlm::new(500);
+        let failed = tick(&store, &wiki, Arc::new(failing), &settings).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the model was asked"
+        );
+        assert_eq!(failed.errors, 1);
+        assert_eq!(failed.released, 1, "the failed run's claim is released");
+        assert_eq!(run_count(&store, id), 0, "a failure writes no run");
+        assert!(
+            is_candidate(&store, ws, proj, id).await,
+            "still in the backlog"
+        );
+
+        let healthy = tick(&store, &wiki, Arc::new(OneProposalLlm), &settings).await;
+        assert_eq!(healthy.errors, 0);
+        assert_eq!(healthy.reviewed, 1, "the retried session is reviewed");
+        assert_eq!(run_count(&store, id), 1);
+        assert!(!is_candidate(&store, ws, proj, id).await);
+    }
+
+    /// Three ticks of Poolside 429s (the 2026-09-23/24 quota wall) must not
+    /// cost the session anything: it is still eligible after four of them
+    /// and is reviewed once the lane recovers.
+    #[tokio::test]
+    async fn a_quota_wall_never_exhausts_a_session() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, id) = failure_fixture(&tmp).await;
+        let settings = failure_test_settings();
+        let (failing, calls) = FailingLlm::new(429);
+        let failing: Arc<dyn LlmProvider> = Arc::new(failing);
+        for n in 1..=4 {
+            let t = tick(&store, &wiki, Arc::clone(&failing), &settings).await;
+            assert_eq!(t.released, 1, "tick {n} releases");
+            assert_eq!(t.exhausted, 0, "tick {n}: a 429 spends no budget");
+            assert!(is_candidate(&store, ws, proj, id).await, "tick {n}");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let healthy = tick(&store, &wiki, Arc::new(OneProposalLlm), &settings).await;
+        assert_eq!(healthy.reviewed, 1);
+        assert_eq!(run_count(&store, id), 1);
+    }
+
+    /// A session that fails by itself (here a 500 on every call) is given up
+    /// after its third failure: that tick reports it exhausted, and the next
+    /// tick does not call the model for it at all. 3 is the specification.
+    #[tokio::test]
+    async fn a_session_that_keeps_failing_is_given_up_after_three_attempts() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, id) = failure_fixture(&tmp).await;
+        let settings = failure_test_settings();
+        let (failing, calls) = FailingLlm::new(500);
+        let failing: Arc<dyn LlmProvider> = Arc::new(failing);
+        for n in 1..=3 {
+            let t = tick(&store, &wiki, Arc::clone(&failing), &settings).await;
+            assert_eq!(t.exhausted, usize::from(n == 3), "tick {n}");
+            assert_eq!(t.released, usize::from(n < 3), "tick {n}");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(!is_candidate(&store, ws, proj, id).await, "given up");
+        let after = tick(&store, &wiki, Arc::clone(&failing), &settings).await;
+        assert_eq!(after.reviewed + after.errors, 0, "nothing left to try");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "an exhausted session never reaches the model again"
+        );
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let last_error: String = conn
+            .query_row(
+                "SELECT last_error FROM auto_improve_scheduler_claims WHERE session_id = ?1",
+                rusqlite::params![id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            last_error.contains("500"),
+            "terminal reason is named: {last_error}"
+        );
+    }
+
+    /// Scheduler startup is where claims stranded by earlier failures (and
+    /// by crashes) are handed back.
+    #[tokio::test]
+    async fn scheduler_startup_hands_back_claims_stranded_without_a_run() {
+        let tmp = TempDir::new().unwrap();
+        let (store, _wiki, ws, proj, id) = failure_fixture(&tmp).await;
+        let ended_at = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap()[0]
+            .ended_at;
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap()
+        );
+        assert!(!is_candidate(&store, ws, proj, id).await, "stranded");
+        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+            .await
+            .unwrap();
+        assert!(
+            is_candidate(&store, ws, proj, id).await,
+            "handed back at startup"
+        );
+    }
+
+    #[test]
+    fn only_a_lane_that_could_not_be_asked_is_lane_unavailable() {
+        let lane = SchedulerFailureKind::LaneUnavailable;
+        let session = SchedulerFailureKind::SessionAttributable;
+        let wrapped = |e: LlmError| anyhow::Error::from(AutoImproveError::Llm(e));
+        let provider = |status: u16| LlmError::Provider {
+            status,
+            body: String::new(),
+        };
+        assert_eq!(classify_scheduled_failure(&wrapped(provider(429))), lane);
+        assert_eq!(
+            classify_scheduled_failure(&anyhow::Error::from(provider(429))),
+            lane
+        );
+        assert_eq!(
+            classify_scheduled_failure(&wrapped(LlmError::Auth("x".into()))),
+            lane
+        );
+        assert_eq!(
+            classify_scheduled_failure(&wrapped(LlmError::NotConfigured("x".into()))),
+            lane
+        );
+        for e in [
+            provider(500),
+            provider(503),
+            provider(400),
+            LlmError::UnexpectedShape("no JSON object".into()),
+            LlmError::Serde("bad".into()),
+            LlmError::Truncated {
+                finish_reason: "length".into(),
+            },
+        ] {
+            assert_eq!(classify_scheduled_failure(&wrapped(e)), session);
+        }
+        assert_eq!(
+            classify_scheduled_failure(&anyhow::Error::from(AutoImproveError::Eval("x".into()))),
+            session
+        );
+        assert_eq!(
+            classify_scheduled_failure(&anyhow::anyhow!("unknown")),
+            session
         );
     }
 }
