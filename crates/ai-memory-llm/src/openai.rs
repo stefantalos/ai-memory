@@ -518,7 +518,11 @@ impl OpenAiProvider {
                 body,
             });
         }
-        response_json_limited::<OpenAiResponse>(resp).await
+        let response = response_json_limited::<OpenAiResponse>(resp).await?;
+        if let Some(u) = &response.usage {
+            crate::usage::report(u.prompt_tokens, u.completion_tokens);
+        }
+        Ok(response)
     }
 }
 
@@ -550,6 +554,7 @@ pub(crate) fn parse_structured_response(response: OpenAiResponse) -> LlmResult<s
             if finish_reason.as_deref() == Some("length") {
                 Err(LlmError::Truncated {
                     finish_reason: "length".into(),
+                    partial: Some(crate::error::PartialText(text.to_string())),
                 })
             } else {
                 Err(LlmError::from(err))
@@ -587,6 +592,7 @@ pub(crate) fn parse_tool_call_response(
                 let _ = err;
                 return Err(LlmError::Truncated {
                     finish_reason: "length".into(),
+                    partial: Some(crate::error::PartialText(text)),
                 });
             }
             Err(err) => return Err(LlmError::from(err)),
@@ -1549,7 +1555,7 @@ mod tests {
         );
         let err = super::parse_structured_response(response).unwrap_err();
         match err {
-            crate::LlmError::Truncated { finish_reason } => {
+            crate::LlmError::Truncated { finish_reason, .. } => {
                 assert_eq!(finish_reason, "length");
             }
             other => panic!("expected LlmError::Truncated, got {other:?}"),

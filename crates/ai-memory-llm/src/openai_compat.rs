@@ -517,7 +517,8 @@ mod tests {
     #[test]
     fn truncated_is_not_a_parse_shape_error() {
         assert!(!is_parse_shape_error(&LlmError::Truncated {
-            finish_reason: "length".into()
+            finish_reason: "length".into(),
+            partial: None,
         }));
     }
 

@@ -163,6 +163,7 @@ impl LlmProvider for GeminiProvider {
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
         let body = self.build_request(&request, None);
         let response: GeminiResponse = self.post(&body).await?;
+        report_gemini_usage(&response);
         Ok(self.to_chat_response(response))
     }
 
@@ -174,8 +175,25 @@ impl LlmProvider for GeminiProvider {
         let prepared = prepare_schema_for_gemini(schema)?;
         let body = self.build_request(&request, Some(prepared));
         let response: GeminiResponse = self.post(&body).await?;
+        report_gemini_usage(&response);
+        tracing::info!(
+            model = %self.model,
+            max_output_tokens = body.generation_config.max_output_tokens,
+            prompt_tokens = response.usage_metadata.as_ref().map(|u| u.prompt_token_count),
+            output_tokens = response.usage_metadata.as_ref().map(|u| u.candidates_token_count),
+            finish_reason = response.candidates.first().and_then(|c| c.finish_reason.as_deref()),
+            "gemini structured call finished",
+        );
         let text = first_text(&response).ok_or_else(|| {
-            LlmError::UnexpectedShape("gemini response had no candidate text".into())
+            // Paid for and empty: a zero-yield outcome, not a shape bug.
+            LlmError::EmptyResponse(format!(
+                "gemini response had no candidate text (finish_reason={})",
+                response
+                    .candidates
+                    .first()
+                    .and_then(|c| c.finish_reason.as_deref())
+                    .unwrap_or("none")
+            ))
         })?;
         // A response cut at maxOutputTokens is not a parse-shape problem:
         // measured 2026-09-23, a manual auto_improve run on a 294-observation
@@ -190,6 +208,7 @@ impl LlmProvider for GeminiProvider {
             if cut {
                 LlmError::Truncated {
                     finish_reason: "MAX_TOKENS".into(),
+                    partial: Some(crate::error::PartialText(text.clone())),
                 }
             } else {
                 LlmError::from(err)
@@ -296,6 +315,12 @@ fn default_thinking_config_for(model: &str) -> Option<GeminiThinkingConfig> {
     None
 }
 
+fn report_gemini_usage(response: &GeminiResponse) {
+    if let Some(u) = &response.usage_metadata {
+        crate::usage::report(u.prompt_token_count, u.candidates_token_count);
+    }
+}
+
 fn first_text(response: &GeminiResponse) -> Option<String> {
     let candidate = response.candidates.first()?;
     let content = candidate.content.as_ref()?;
@@ -334,7 +359,60 @@ pub fn prepare_schema_for_gemini(mut schema: serde_json::Value) -> LlmResult<ser
     inline_refs(&mut schema, &defs, 0)?;
     strip_unsupported(&mut schema);
     normalize_nullable_types(&mut schema);
+    pin_property_order(&mut schema);
     Ok(schema)
+}
+
+/// Give every object schema an explicit `propertyOrdering` equal to the
+/// order its `properties` are declared in.
+///
+/// Without it Gemini picks the generation order itself. Measured 2026-09-24
+/// on a real auto_improve review (session 12a072a7…, 35,441 prompt tokens):
+/// `gemini-2.5-flash` wrote the free-text `summary` FIRST and fell into a
+/// degenerate loop inside it — "The session also identified …" 204 times,
+/// one 65,734-byte string — until `MAX_TOKENS` at 15,990 output tokens,
+/// never reaching `proposals`. Pinning the declared order lets the caller
+/// put the payload before any open-ended prose, so a runaway tail can only
+/// cost the fields after the payload, which a truncated-prefix salvage can
+/// then still recover.
+/// <https://ai.google.dev/gemini-api/docs/structured-output> ("To enforce a
+/// specific order for property generation, use the propertyOrdering field").
+fn pin_property_order(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let order: Option<Vec<serde_json::Value>> = map
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .filter(|p| p.len() > 1)
+                .map(|p| p.keys().cloned().map(serde_json::Value::String).collect());
+            if let Some(order) = order
+                && !map.contains_key("propertyOrdering")
+            {
+                map.insert("propertyOrdering".into(), serde_json::Value::Array(order));
+            }
+            for (k, v) in map.iter_mut() {
+                if k == "propertyOrdering" {
+                    continue;
+                }
+                if k == "properties" {
+                    // Keys here are field names, not schema keywords.
+                    if let Some(props) = v.as_object_mut() {
+                        for field in props.values_mut() {
+                            pin_property_order(field);
+                        }
+                    }
+                } else {
+                    pin_property_order(v);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                pin_property_order(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn extract_defs(schema: &mut serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
@@ -556,6 +634,32 @@ mod tests {
         });
         let prepared = prepare_schema_for_gemini(schema.clone()).unwrap();
         assert_eq!(prepared, schema);
+    }
+
+    #[test]
+    fn prepare_schema_pins_declared_property_order_at_every_level() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "proposals": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "body": { "type": "string" }
+                        }
+                    }
+                },
+                "summary": { "type": "string" }
+            }
+        });
+        let prepared = prepare_schema_for_gemini(schema).unwrap();
+        assert_eq!(prepared["propertyOrdering"], json!(["proposals", "summary"]));
+        assert_eq!(
+            prepared["properties"]["proposals"]["items"]["propertyOrdering"],
+            json!(["path", "body"])
+        );
     }
 
     #[test]

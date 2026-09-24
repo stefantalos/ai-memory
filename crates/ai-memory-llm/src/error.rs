@@ -43,6 +43,17 @@ pub enum LlmError {
     #[error("schema: {0}")]
     Schema(String),
 
+    /// The provider answered successfully but produced no usable text
+    /// (e.g. a Gemini candidate with no parts). Like [`Self::Truncated`] it
+    /// is a zero-yield outcome: paid for, nothing delivered.
+    #[error("empty response: {0}")]
+    EmptyResponse(String),
+
+    /// Every configured LLM lane is paused by its circuit breaker. No
+    /// request was sent; the lane, not the request, is unavailable.
+    #[error("all LLM lanes paused: {0}")]
+    LanesPaused(String),
+
     /// Provider cut the completion off at its output-token ceiling
     /// (`finish_reason == "length"`) and the truncated text could not be
     /// parsed as the requested structured output.
@@ -59,7 +70,26 @@ pub enum LlmError {
     Truncated {
         /// The provider's own `finish_reason` value (normally `"length"`).
         finish_reason: String,
+        /// The text the provider did emit before it was cut, when the
+        /// provider exposes it. Callers may salvage complete items from it
+        /// (auto_improve recovers whole proposals from a valid prefix);
+        /// `Debug` prints only its length so an error log never carries the
+        /// session-derived body.
+        partial: Option<PartialText>,
     },
+}
+
+/// Text a provider emitted before an output-limit cut.
+///
+/// A newtype so `Debug` (and therefore `{err:?}` in logs) reports only the
+/// size, never the body.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PartialText(pub String);
+
+impl std::fmt::Debug for PartialText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PartialText({} bytes)", self.0.len())
+    }
 }
 
 impl LlmError {
