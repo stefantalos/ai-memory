@@ -325,6 +325,8 @@ mod tests {
         assert_eq!(presence.lines().count(), 1);
         let row: serde_json::Value =
             serde_json::from_str(presence.lines().next().unwrap()).unwrap();
+        assert_eq!(row["harness"], "gemini", "only the metered call is copied");
+        assert_eq!(row["model"], "gemini-2.5-flash");
         assert_eq!(row["fundingType"], METERED_FUNDING_TYPE);
         assert_eq!(row["entity"], "Personal");
         assert_eq!(row["taskId"], "ai-memory:auto_improve");
