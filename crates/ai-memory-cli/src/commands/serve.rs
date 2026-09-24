@@ -1607,6 +1607,8 @@ async fn start_maintenance_scheduler(
                         reviewed = outcome.reviewed,
                         skipped = outcome.skipped,
                         errors = outcome.errors,
+                        released = outcome.released,
+                        exhausted = outcome.exhausted,
                         elapsed_ms = started.elapsed().as_millis(),
                         "scheduled auto-improve tick completed"
                     ),
