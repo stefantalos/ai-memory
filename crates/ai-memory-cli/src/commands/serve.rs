@@ -579,6 +579,34 @@ fn session_consolidation_retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
 }
 
+/// Attempts a generation gets when the model keeps hitting the output
+/// ceiling. The prompt is bounded by `max_input_tokens`, so a retry sends the
+/// SAME prompt to the same model: measured 2026-09-24, session d3345285 cut at
+/// 14,000 output tokens on 10 of 10 retries. One retry covers the rare
+/// non-deterministic cut; after that the generation is parked (`failed`) and
+/// the heuristic page stays.
+const SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS: u32 = 2;
+
+/// When to retry a failed SessionEnd consolidation, or `None` to park it.
+fn session_consolidation_retry_at(
+    attempts: u32,
+    error: &ai_memory_consolidate::ConsolidatorError,
+    now_micros: i64,
+) -> Option<i64> {
+    let truncated = matches!(
+        error,
+        ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Truncated { .. })
+    );
+    if attempts >= ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS
+        || (truncated && attempts >= SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS)
+    {
+        return None;
+    }
+    let delay = session_consolidation_retry_delay(attempts);
+    let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
+    Some(now_micros.saturating_add(delay_micros))
+}
+
 async fn run_session_consolidation_worker(
     writer: WriterHandle,
     consolidator: Arc<Consolidator>,
@@ -657,17 +685,11 @@ async fn run_session_consolidation_worker(
                 ),
             },
             Err(error) => {
-                let retry_at = if attempts < ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS {
-                    let delay = session_consolidation_retry_delay(attempts);
-                    let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
-                    Some(
-                        jiff::Timestamp::now()
-                            .as_microsecond()
-                            .saturating_add(delay_micros),
-                    )
-                } else {
-                    None
-                };
+                let retry_at = session_consolidation_retry_at(
+                    attempts,
+                    &error,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
                 let terminal = retry_at.is_none();
                 if let Err(store_error) = writer
                     .fail_session_consolidation(job, error.to_string(), retry_at)
@@ -2213,6 +2235,55 @@ fn host_without_port(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A persistent cut is parked after SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS;
+    /// any other failure keeps the full budget and backoff.
+    #[test]
+    fn a_truncated_consolidation_is_parked_after_the_truncation_budget() {
+        let truncated =
+            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Truncated {
+                finish_reason: "length".into(),
+                partial: None,
+            });
+        let other =
+            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Provider {
+                status: 503,
+                body: "overloaded".into(),
+            });
+        let now = 1_000_000_i64;
+        assert_eq!(
+            session_consolidation_retry_at(1, &truncated, now),
+            Some(now + 30_000_000),
+            "one retry for a cut"
+        );
+        assert_eq!(
+            session_consolidation_retry_at(
+                SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS,
+                &truncated,
+                now
+            ),
+            None,
+            "then parked, not re-sent on the same prompt"
+        );
+        assert_eq!(
+            session_consolidation_retry_at(
+                SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS,
+                &other,
+                now
+            ),
+            Some(now + 60_000_000),
+            "a non-truncation failure keeps retrying with backoff"
+        );
+        assert_eq!(
+            session_consolidation_retry_at(
+                ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
+                &other,
+                now
+            ),
+            None
+        );
+    }
+
     use ai_memory_core::{
         AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,
         Sanitized, Sanitizer, SessionId, Tier,

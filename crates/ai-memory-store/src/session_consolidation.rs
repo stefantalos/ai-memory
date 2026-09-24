@@ -238,6 +238,28 @@ pub fn fail(
             ],
         )?;
         require_claim_update(changed)
+    } else if has_newer_generation(conn, job)? {
+        // A newer generation was enqueued while this one ran (enqueue only
+        // supersedes PENDING rows; a running row keeps its lease). Retrying
+        // the older snapshot now would be a second consolidation of the same
+        // session — measured 2026-09-24: generations 4751 and 4781 of session
+        // d3345285 retried five times each on an identical prompt.
+        let changed = conn.execute(
+            "UPDATE session_consolidation_jobs \
+             SET state = 'superseded', completed_at = ?1, claim_id = NULL, last_error = ?2 \
+             WHERE session_id = ?3 AND generation = ?4 \
+               AND state = 'running' AND claim_id = ?5",
+            params![
+                now,
+                truncate_error(&format!(
+                    "{error} (superseded by a newer observation generation; not retried)"
+                )),
+                job.session_id.as_bytes(),
+                generation_i64(job),
+                job.claim_id.as_bytes(),
+            ],
+        )?;
+        require_claim_update(changed)
     } else {
         let retry_at = retry_at.unwrap_or(now);
         let changed = conn.execute(
@@ -278,6 +300,15 @@ pub fn release(conn: &mut Connection, job: &SessionConsolidationJob) -> StoreRes
         ],
     )?;
     require_claim_update(changed)
+}
+
+fn has_newer_generation(conn: &Connection, job: &SessionConsolidationJob) -> StoreResult<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_consolidation_jobs \
+                       WHERE session_id = ?1 AND generation > ?2)",
+        params![job.session_id.as_bytes(), generation_i64(job)],
+        |row| row.get::<_, bool>(0),
+    )?)
 }
 
 fn require_claim_update(changed: usize) -> StoreResult<()> {
@@ -623,5 +654,100 @@ mod tests {
             .fail_session_consolidation(recovered, "terminal".into(), None)
             .await
             .unwrap();
+    }
+
+    /// Measured 2026-09-24: generation 4751 of session d3345285 was RUNNING
+    /// when 4781 was enqueued, so enqueue could not supersede it; each failure
+    /// then put it back to pending and both generations spent all five
+    /// attempts on an identical prompt. A failure of an older generation must
+    /// not be retried once a newer one exists.
+    #[tokio::test]
+    async fn a_failed_older_generation_is_superseded_not_retried_when_a_newer_one_exists() {
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let older = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(older.generation(), 1);
+
+        // New work arrives while generation 1 is running.
+        insert_observation(&store, workspace_id, project_id, session_id).await;
+        store.writer.end_session(session_id, None).await.unwrap();
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(workspace_id, project_id, session_id)
+                .await
+                .unwrap()
+        );
+
+        // Generation 1 fails with a retry scheduled for right now.
+        store
+            .writer
+            .fail_session_consolidation(older, "truncated".into(), Some(now))
+            .await
+            .unwrap();
+
+        let later = Timestamp::now().as_microsecond() + 1;
+        let next = store
+            .writer
+            .claim_session_consolidation(later, later - 1)
+            .await
+            .unwrap()
+            .expect("the newer generation runs");
+        assert_eq!(next.generation(), 2, "the older snapshot is not retried");
+        store
+            .writer
+            .complete_session_consolidation(next)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(later, later - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "generation 1 must be terminal, not pending"
+        );
+    }
+
+    /// Without a newer generation the ordinary retry still happens.
+    #[tokio::test]
+    async fn a_failed_generation_without_a_newer_one_is_still_retried() {
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let job = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .writer
+            .fail_session_consolidation(job, "transient".into(), Some(now))
+            .await
+            .unwrap();
+        let later = Timestamp::now().as_microsecond() + 1;
+        let retry = store
+            .writer
+            .claim_session_consolidation(later, later - 1)
+            .await
+            .unwrap()
+            .expect("retried");
+        assert_eq!((retry.generation(), retry.attempts()), (1, 2));
     }
 }
