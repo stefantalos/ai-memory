@@ -4098,4 +4098,60 @@ mod tests {
             ]
         );
     }
+
+    /// The production path from env to lanes: `LLM_API_KEY` is key A, an
+    /// extra key FILE is key B, and a 429 on A sends the same request with
+    /// B's key — proven on the wire by the Authorization header.
+    #[tokio::test]
+    async fn extra_key_file_becomes_a_lane_that_sends_its_own_key() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        const KEY_A: &str = "lane-test-key-A-0123456789";
+        const KEY_B: &str = "lane-test-key-B-0123456789";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", format!("Bearer {KEY_A}").as_str()))
+            .respond_with(ResponseTemplate::new(429).set_body_string("usage limit exceeded"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(header("authorization", format!("Bearer {KEY_B}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "{\"summary\":\"b\"}"},
+                             "finish_reason": "stop"}],
+                "model": "m",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        let tmp = TempDir::new().unwrap();
+        let key_b = tmp.path().join("key-b");
+        std::fs::write(&key_b, format!("{KEY_B}\n")).unwrap();
+        let ledger = tmp.path().join("calls.jsonl");
+        let config = Config {
+            llm_provider: Some("openai-compat".into()),
+            llm_model: Some("local-model".into()),
+            llm_base_url: Some(server.uri()),
+            runtime_env: crate::config::RuntimeEnv::for_lane_test(
+                KEY_A,
+                vec![key_b],
+                ledger.clone(),
+            ),
+            ..Config::default()
+        };
+        let cfg = config.llm_provider_config().unwrap().unwrap();
+        let primary = build_provider(cfg.clone()).unwrap();
+        let llm = with_runtime_fallback(&config, &cfg, primary).unwrap();
+        let (out, who) = ai_memory_llm::capture_responder(llm.complete_structured_raw(
+            ChatRequest::user_prompt("x"),
+            serde_json::json!({"type": "object", "properties": {"summary": {"type": "string"}}}),
+        ))
+        .await;
+        assert_eq!(out.unwrap()["summary"], "b");
+        assert_eq!(who.unwrap().lane, "key-b");
+        let ledger = std::fs::read_to_string(ledger).unwrap();
+        assert!(ledger.contains(&ai_memory_llm::key_fingerprint(KEY_A)));
+        assert!(ledger.contains(&ai_memory_llm::key_fingerprint(KEY_B)));
+        assert!(!ledger.contains(KEY_A) && !ledger.contains(KEY_B));
+    }
 }

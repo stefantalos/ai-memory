@@ -360,6 +360,21 @@ pub struct RuntimeEnv {
 }
 
 impl RuntimeEnv {
+    /// Test-only: the lane-chain inputs, everything else default.
+    #[cfg(test)]
+    pub(crate) fn for_lane_test(
+        llm_api_key: &str,
+        extra_key_files: Vec<PathBuf>,
+        ledger: PathBuf,
+    ) -> Self {
+        Self {
+            llm_api_key: Some(SecretString::from(llm_api_key.to_string())),
+            llm_extra_api_key_files: extra_key_files,
+            llm_ledger_path: Some(ledger),
+            ..Self::default()
+        }
+    }
+
     fn from_process() -> Self {
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
