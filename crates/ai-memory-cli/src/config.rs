@@ -345,6 +345,11 @@ pub struct RuntimeEnv {
     llm_fallback_model: Option<String>,
     llm_fallback_base_url: Option<String>,
     llm_fallback_api_key_file: Option<PathBuf>,
+    llm_extra_api_key_files: Vec<PathBuf>,
+    llm_ledger_path: Option<PathBuf>,
+    finops_presence_path: Option<PathBuf>,
+    metered_entity: Option<String>,
+    llm_alarm_path: Option<PathBuf>,
     embedding_api_key: Option<SecretString>,
     copilot_github_token: Option<SecretString>,
     github_copilot_api_token: Option<SecretString>,
@@ -390,6 +395,27 @@ impl RuntimeEnv {
             llm_fallback_model: env_string("AI_MEMORY_LLM_FALLBACK_MODEL"),
             llm_fallback_base_url: env_string("AI_MEMORY_LLM_FALLBACK_BASE_URL"),
             llm_fallback_api_key_file: env_path("AI_MEMORY_LLM_FALLBACK_API_KEY_FILE"),
+            // Further keys for the PRIMARY provider (e.g. a second Poolside
+            // account), colon-separated FILE PATHS: each becomes its own lane
+            // ahead of the fallback, with its own breaker.
+            llm_extra_api_key_files: env_string("AI_MEMORY_LLM_EXTRA_API_KEY_FILES")
+                .map(|v| {
+                    v.split(':')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // Call ledger (every lane call, key named by fingerprint only);
+            // default `<data_dir>/llm-calls.jsonl`, `off` disables it.
+            llm_ledger_path: env_path("AI_MEMORY_LLM_LEDGER_PATH"),
+            // floo `state/finops/harness-presence.jsonl`: metered calls are
+            // copied there so the charter's FinOps ledger sees them.
+            finops_presence_path: env_path("AI_MEMORY_FINOPS_PRESENCE_PATH"),
+            metered_entity: env_string("AI_MEMORY_METERED_ENTITY"),
+            // Actionable bus for breaker alarms (chyros shape).
+            llm_alarm_path: env_path("AI_MEMORY_LLM_ALARM_PATH"),
             // The embedding counterpart of LLM_API_KEY: it credentials the
             // embedding role alone, so the embedder can target a different
             // provider than the chat model instead of borrowing its key.
@@ -746,6 +772,9 @@ pub struct AutoImproveSettings {
     pub max_rule_page_tokens: usize,
     /// Maximum approximate tokens allowed in one procedures/ page.
     pub max_procedure_page_tokens: usize,
+    /// Output-token budget for one review call; providers clamp it to their
+    /// own ceiling (Poolside 14,000, Gemini 2.5 Flash 65,536).
+    pub review_max_output_tokens: u32,
     /// Whether future reviewers may include raw observation fallback details.
     pub include_raw_fallback: bool,
     /// Synthetic actor used for autonomous proposal provenance.
@@ -847,6 +876,8 @@ impl Default for AutoImproveSettings {
             max_rule_page_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS,
             max_procedure_page_tokens:
                 ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
+            review_max_output_tokens:
+                ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS,
             include_raw_fallback: false,
             proposal_actor: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
             pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
@@ -1142,6 +1173,73 @@ impl Config {
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
         }))
+    }
+
+    /// Extra lanes for the PRIMARY provider: one [`ProviderConfig`] per
+    /// readable key file in `AI_MEMORY_LLM_EXTRA_API_KEY_FILES`, identical to
+    /// `primary` except for the key, each paired with its key fingerprint.
+    ///
+    /// A file that is unreadable, empty, or holds the primary's own key is
+    /// skipped with a warning naming the path only. Only providers
+    /// authenticated by an API key can have extra lanes.
+    #[must_use]
+    pub fn llm_extra_primary_configs(&self, primary: &ProviderConfig) -> Vec<(ProviderConfig, String)> {
+        let primary_fp = self.primary_key_fingerprint(primary.provider);
+        let mut seen: Vec<String> = primary_fp.into_iter().collect();
+        let mut out = Vec::new();
+        for path in &self.runtime_env.llm_extra_api_key_files {
+            let key = match std::fs::read_to_string(path) {
+                Ok(raw) if !raw.trim().is_empty() => raw.trim().to_string(),
+                Ok(_) => {
+                    tracing::warn!(path = %path.display(), "extra LLM key file is empty; lane skipped");
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(path = %path.display(), error = %err, "extra LLM key file unreadable; lane skipped");
+                    continue;
+                }
+            };
+            let fp = ai_memory_llm::key_fingerprint(&key);
+            if seen.contains(&fp) {
+                tracing::warn!(path = %path.display(), key_fp = %fp, "extra LLM key duplicates a configured key; lane skipped");
+                continue;
+            }
+            seen.push(fp.clone());
+            let mut cfg = primary.clone();
+            cfg.auth = self.provider_auth(primary.provider, Some(SecretString::from(key)));
+            out.push((cfg, fp));
+        }
+        out
+    }
+
+    /// Fingerprint of the primary provider's env-sourced API key, if any.
+    #[must_use]
+    pub fn primary_key_fingerprint(&self, provider: ProviderChoice) -> Option<String> {
+        self.provider_api_key(provider)
+            .map(|k| ai_memory_llm::key_fingerprint(k.expose_secret()))
+    }
+
+    /// Fingerprint of the fallback lane's key file, if one is configured.
+    #[must_use]
+    pub fn fallback_key_fingerprint(&self) -> Option<String> {
+        let path = self.runtime_env.llm_fallback_api_key_file.as_deref()?;
+        let raw = std::fs::read_to_string(path).ok()?;
+        (!raw.trim().is_empty()).then(|| ai_memory_llm::key_fingerprint(&raw))
+    }
+
+    /// The LLM call ledger configured by the environment. See
+    /// [`ai_memory_llm::JsonlLedger`].
+    #[must_use]
+    pub fn llm_ledger(&self) -> ai_memory_llm::JsonlLedger {
+        let env = &self.runtime_env;
+        let calls = match env.llm_ledger_path.as_deref() {
+            Some(p) if p.as_os_str() == "off" => None,
+            Some(p) => Some(p.to_path_buf()),
+            None => Some(self.data_dir.join("llm-calls.jsonl")),
+        };
+        ai_memory_llm::JsonlLedger::new(calls)
+            .with_presence(env.finops_presence_path.clone(), env.metered_entity.clone())
+            .with_alarm(env.llm_alarm_path.clone())
     }
 
     /// OpenAI-compatible embedding key. `EMBEDDING_API_KEY` is checked first

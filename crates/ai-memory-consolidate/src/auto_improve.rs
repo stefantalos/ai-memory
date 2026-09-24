@@ -46,7 +46,11 @@ pub const DEFAULT_AUTO_IMPROVE_MAX_FINAL_BODY_CHARS: usize = MAX_PROPOSAL_BODY_C
 pub const DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS: usize = 2_000;
 /// Default approximate token budget for one procedure page.
 pub const DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS: usize = 2_000;
-const DEFAULT_REVIEW_MAX_TOKENS: u32 = 16_000;
+/// Default output-token budget for one review call (operator decision
+/// 2026-09-24: raise Gemini's limit). Was a fixed 16,000; Poolside clamps it
+/// to its own 14,000 ceiling, Gemini 2.5 Flash's documented output limit is
+/// 65,536 (<https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash>).
+pub const DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS: u32 = 32_768;
 const MAX_SESSION_PAGE_CHARS: usize = 32_000;
 const SAMPLE_LIMIT_WITH_SESSION_PAGE: usize = 48;
 const SAMPLE_LIMIT_WITHOUT_SESSION_PAGE: usize = 72;
@@ -156,6 +160,9 @@ pub struct AutoImproveReviewConfig {
     pub max_procedure_page_tokens: usize,
     /// Optional executable eval gate settings.
     pub eval: AutoImproveEvalConfig,
+    /// Output-token budget for the review call. Providers clamp it to their
+    /// own ceiling (Poolside 14,000; Gemini 2.5 Flash accepts up to 65,536).
+    pub review_max_output_tokens: u32,
 }
 
 impl Default for AutoImproveReviewConfig {
@@ -181,6 +188,7 @@ impl Default for AutoImproveReviewConfig {
             max_rule_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS,
             max_procedure_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
             eval: AutoImproveEvalConfig::default(),
+            review_max_output_tokens: DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS,
         }
     }
 }
@@ -385,16 +393,24 @@ pub struct AutoImproveRejectedCandidate {
 
 /// Structured response requested from the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+///
+/// Field ORDER is load-bearing: the schema, the prompt's field contract and
+/// Gemini's pinned `propertyOrdering` all follow it. The payload comes first
+/// and the free-text `summary` last — measured 2026-09-24, Gemini wrote a
+/// leading `summary` into a 65 KB repetition loop and never reached
+/// `proposals`. With `summary` last, a runaway tail costs only the summary,
+/// and [`salvage_truncated_response`] recovers the complete proposals.
 pub struct AutoImproveLlmResponse {
-    /// Short summary of the review.
-    #[serde(default)]
-    pub summary: String,
     /// Candidate edits.
     #[serde(default)]
     pub proposals: Vec<AutoImproveProposal>,
     /// Candidates the model chose not to promote.
     #[serde(default)]
     pub rejected_candidates: Vec<AutoImproveRejectedCandidate>,
+    /// One or two sentences summarising the review, written last. Never
+    /// restate the proposals here.
+    #[serde(default)]
+    pub summary: String,
 }
 
 /// Report returned by the reviewer.
@@ -514,16 +530,17 @@ pub async fn run_auto_improve_review(
             role: Role::User,
             content: prompt_input.prompt,
         }],
-        max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
+        max_tokens: cfg.review_max_output_tokens,
         temperature: Some(0.1),
     };
     let response_schema = serde_json::to_value(schemars::schema_for!(AutoImproveLlmResponse))
         .map_err(LlmError::from)?;
     // A fallback-wrapped provider may answer from its secondary lane; record
     // the lane that actually answered, not the configured one (FN8-8120).
-    let (raw_result, responder) = ai_memory_llm::capture_responder(
+    let (raw_result, responder) = ai_memory_llm::capture_responder(ai_memory_llm::with_caller(
+        "auto_improve",
         llm.complete_structured_raw_with_operation_id(request, response_schema, session_id.into()),
-    )
+    ))
     .await;
     let (answered_provider, answered_model) = match responder {
         Some(r) => (r.provider.to_string(), r.model),
@@ -532,7 +549,21 @@ pub async fn run_auto_improve_review(
     let mut parse_warnings = Vec::new();
     let raw = match raw_result {
         Ok(value) => parse_llm_response(&value, &mut parse_warnings),
-        Err(LlmError::Truncated { finish_reason }) => {
+        Err(LlmError::Truncated {
+            finish_reason,
+            partial: Some(ai_memory_llm::PartialText(text)),
+        }) if salvage_truncated_response(&text).is_some() => {
+            // The cut landed after at least one complete proposal: keep
+            // those, run them through the normal validation, and say so.
+            let salvaged = salvage_truncated_response(&text).unwrap_or_default();
+            let recovered = salvaged["proposals"].as_array().map_or(0, Vec::len);
+            parse_warnings.push(format!(
+                "llm response truncated (finish_reason={finish_reason}); {recovered} complete \
+                 proposal(s) recovered from the valid prefix"
+            ));
+            parse_llm_response(&salvaged, &mut parse_warnings)
+        }
+        Err(LlmError::Truncated { finish_reason, .. }) => {
             // #FN8-8120: previously this same truncation surfaced as a
             // generic Serde parse error, propagated via `?`, and the whole
             // run vanished — no DB row, only a `tracing::warn!` (see
@@ -1656,6 +1687,80 @@ fn proposal_has_body_markdown(obj: &serde_json::Map<String, serde_json::Value>) 
 /// observed run, success or failure) — without rejecting them: silently
 /// discarding those proposals would zero out the only two runs that have
 /// ever produced a validated proposal.
+/// Recover the COMPLETE proposal objects from a response cut at the output
+/// limit.
+///
+/// Walks the partial text to the top-level `"proposals"` array and parses
+/// its elements one by one; the first element that does not parse (the one
+/// the cut landed in) ends the walk. Returns `None` when no complete
+/// proposal precedes the cut — a truncated response is never allowed to
+/// look like a legitimate "found nothing". The recovered proposals go
+/// through exactly the same validation as a whole response.
+pub(crate) fn salvage_truncated_response(partial: &str) -> Option<serde_json::Value> {
+    let start = top_level_key_value_offset(partial, "proposals")?;
+    let rest = partial[start..].trim_start();
+    let mut rest = rest.strip_prefix('[')?;
+    let mut items = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix(',') {
+            rest = r.trim_start();
+        }
+        if rest.starts_with(']') || rest.is_empty() {
+            break;
+        }
+        let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(v)) => {
+                let used = stream.byte_offset();
+                items.push(v);
+                rest = &rest[used..];
+            }
+            _ => break,
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "proposals": items }))
+}
+
+/// Byte offset just past `"key":` for a key of the top-level JSON object,
+/// skipping strings and nested containers so a quoted `"proposals"` inside a
+/// summary or body never matches.
+fn top_level_key_value_offset(text: &str, key: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let needle = format!("\"{key}\"");
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let string_start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                let string_end = (i + 1).min(bytes.len());
+                if depth == 1 && text[string_start..string_end] == needle {
+                    let after = text[string_end..].trim_start();
+                    if let Some(value) = after.strip_prefix(':') {
+                        return Some(text.len() - value.len());
+                    }
+                }
+            }
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 fn parse_llm_response(
     value: &serde_json::Value,
     warnings: &mut Vec<String>,
@@ -2366,6 +2471,7 @@ mod tests {
             max_rule_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS,
             max_procedure_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
             eval: AutoImproveEvalConfig::default(),
+            review_max_output_tokens: DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS,
         }
     }
 
@@ -4268,6 +4374,8 @@ mod tests {
 
     struct TruncatingLlm {
         calls: std::sync::atomic::AtomicUsize,
+        partial: Option<String>,
+        seen_max_tokens: std::sync::atomic::AtomicU32,
     }
 
     #[async_trait::async_trait]
@@ -4286,18 +4394,102 @@ mod tests {
 
         async fn complete_structured_raw(
             &self,
-            _request: ChatRequest,
+            request: ChatRequest,
             _schema: serde_json::Value,
         ) -> LlmResult<serde_json::Value> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.seen_max_tokens
+                .store(request.max_tokens, std::sync::atomic::Ordering::SeqCst);
             Err(LlmError::Truncated {
                 finish_reason: "length".into(),
+                partial: self.partial.clone().map(ai_memory_llm::PartialText),
             })
         }
     }
 
     #[tokio::test]
     async fn truncation_produces_a_report_with_a_truncated_warning_and_no_retry() {
+        let (report, calls) = truncated_review(None).await;
+        assert_eq!(calls, 1);
+        assert!(report.proposals.is_empty());
+        assert!(
+            report.warnings.iter().any(|w| w.contains("truncated")),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    const SALVAGE_PROPOSAL: &str = r##"{"path": "procedures/release.md", "title": "Release Procedure", "kind": "procedure", "confidence": 0.91, "rationale": "The session repeated a release workflow with verification.", "evidence": [{"page": "sessions/test.md", "quote": "run the full gate before release"}], "body_markdown": "# Release Procedure\n\nRun the full gate before release."}"##;
+
+    /// The measured 2026-09-24 shape, with the order fixed: proposals first,
+    /// then a runaway summary cut by the output limit.
+    #[tokio::test]
+    async fn truncation_after_a_complete_proposal_recovers_it() {
+        let partial = format!(
+            "{{\n  \"proposals\": [{SALVAGE_PROPOSAL}, {{\"path\": \"gotchas/cut.md\", \"rationale\": \"The sess"
+        );
+        let (report, calls) = truncated_review(Some(partial)).await;
+        assert_eq!(calls, 1);
+        assert_eq!(report.proposals.len(), 1, "report: {report:?}");
+        assert_eq!(report.proposals[0].path, "procedures/release.md");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("1 complete proposal(s) recovered")),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    /// The measured failure itself: summary first, looping, never reaching
+    /// proposals. Nothing is recoverable and the run still says truncated.
+    #[tokio::test]
+    async fn truncation_inside_a_leading_summary_recovers_nothing() {
+        let looping = "The session also identified a thing. ".repeat(50);
+        let partial = format!("{{\n  \"summary\": \"{looping} \\\"proposals\\\": [");
+        let (report, _) = truncated_review(Some(partial)).await;
+        assert!(report.proposals.is_empty());
+        assert!(
+            report.warnings.iter().any(|w| w.contains("0 proposals recovered")),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn salvage_stops_at_the_cut_and_ignores_quoted_keys() {
+        let two = format!(
+            "{{\"summary\": \"says \\\"proposals\\\": [1]\", \"proposals\": [{SALVAGE_PROPOSAL},{SALVAGE_PROPOSAL}, {{\"path\": \"x"
+        );
+        let v = salvage_truncated_response(&two).expect("two complete proposals");
+        assert_eq!(v["proposals"].as_array().unwrap().len(), 2);
+        assert!(salvage_truncated_response("{\"proposals\": [{\"path\": \"x").is_none());
+        assert!(salvage_truncated_response("{\"summary\": \"x").is_none());
+        // A nested "proposals" key (inside a proposal) is not the top-level array.
+        assert!(salvage_truncated_response("{\"a\": {\"proposals\": [{}]").is_none());
+    }
+
+    async fn truncated_review(partial: Option<String>) -> (AutoImproveReport, usize) {
+        let (report, calls, _) =
+            truncated_review_with_budget(partial, DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS)
+                .await;
+        (report, calls)
+    }
+
+    /// Operator decision 2026-09-24: the review budget is configurable and the
+    /// configured value is what the provider is asked for.
+    #[tokio::test]
+    async fn the_review_asks_for_the_configured_output_budget() {
+        let (_, _, seen) = truncated_review_with_budget(None, 40_000).await;
+        assert_eq!(seen, 40_000);
+        assert_eq!(AutoImproveReviewConfig::default().review_max_output_tokens, 32_768);
+    }
+
+    async fn truncated_review_with_budget(
+        partial: Option<String>,
+        budget: u32,
+    ) -> (AutoImproveReport, usize, u32) {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let ws = store
@@ -4349,6 +4541,8 @@ mod tests {
         }
         let llm = TruncatingLlm {
             calls: std::sync::atomic::AtomicUsize::new(0),
+            partial,
+            seen_max_tokens: std::sync::atomic::AtomicU32::new(0),
         };
         let report = run_auto_improve_review(
             &store.reader,
@@ -4358,18 +4552,17 @@ mod tests {
             session_id,
             AutoImproveReviewConfig {
                 min_session_duration_secs: 0,
+                review_max_output_tokens: budget,
                 ..cfg()
             },
         )
         .await
         .expect("truncation must surface as Ok(report), not Err");
-        assert_eq!(llm.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(report.proposals.is_empty());
-        assert!(
-            report.warnings.iter().any(|w| w.contains("truncated")),
-            "warnings: {:?}",
-            report.warnings
-        );
+        let calls = llm.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let seen = llm
+            .seen_max_tokens
+            .load(std::sync::atomic::Ordering::SeqCst);
+        (report, calls, seen)
     }
 
     // ── FN8-8120 runtime fallback: a report must name the lane that actually
@@ -4506,6 +4699,8 @@ mod tests {
         let (_tmp, store, ws, proj, session_id) = seeded_session().await;
         let llm = production_stack(std::sync::Arc::new(TruncatingLlm {
             calls: std::sync::atomic::AtomicUsize::new(0),
+            partial: None,
+            seen_max_tokens: std::sync::atomic::AtomicU32::new(0),
         }));
         let report = run_auto_improve_review(
             &store.reader,
@@ -4630,7 +4825,7 @@ mod live_laguna_tests {
                 role: Role::User,
                 content: prompt.into(),
             }],
-            max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
+            max_tokens: DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS,
             temperature: Some(0.1),
         };
         let schema = serde_json::to_value(schemars::schema_for!(AutoImproveLlmResponse)).unwrap();

@@ -185,9 +185,10 @@ pub async fn run_experience_review(
         max_tokens: REVIEW_MAX_TOKENS,
         temperature: Some(0.1),
     };
-    let (raw, responder) = ai_memory_llm::capture_responder(complete_structured::<
-        AutoImproveLlmResponse,
-    >(llm, request))
+    let (raw, responder) = ai_memory_llm::capture_responder(ai_memory_llm::with_caller(
+        "experience",
+        complete_structured::<AutoImproveLlmResponse>(llm, request),
+    ))
     .await;
     let raw = raw.map_err(AutoImproveError::from)?;
     let (answered_provider, answered_model) = match responder {

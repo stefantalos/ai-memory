@@ -1820,6 +1820,7 @@ fn auto_improve_review_config_from_settings(
         max_final_body_chars: settings.max_final_body_chars,
         max_rule_page_tokens: settings.max_rule_page_tokens,
         max_procedure_page_tokens: settings.max_procedure_page_tokens,
+        review_max_output_tokens: settings.review_max_output_tokens,
         eval: ai_memory_consolidate::AutoImproveEvalConfig {
             enabled: settings.eval.enabled,
             command: settings.eval.command.clone(),
@@ -1949,29 +1950,53 @@ fn start_watcher(args: &ServeArgs, wiki: &Wiki) -> Result<Option<WatcherHandle>>
     Ok(Some(WatcherHandle::start(wiki.clone())?))
 }
 
-/// Wrap the primary LLM with the runtime fallback lane when one is configured
-/// (FN8-8120). Without `AI_MEMORY_LLM_FALLBACK_PROVIDER` the primary is
-/// returned untouched, so behaviour is exactly the single-lane path.
+/// Build the runtime lane chain around the primary LLM (FN8-8120).
+///
+/// Lanes, in order: the primary (key A), one lane per extra primary key
+/// (`AI_MEMORY_LLM_EXTRA_API_KEY_FILES`, e.g. Poolside key B), then the
+/// fallback provider (`AI_MEMORY_LLM_FALLBACK_PROVIDER`, e.g. Gemini). The
+/// chain is built even for a single lane so every call reaches the ledger and
+/// every lane — the last one included — has a breaker that a run of
+/// truncated/empty answers can open.
 fn with_runtime_fallback(
     config: &Config,
+    primary_cfg: &ai_memory_llm::ProviderConfig,
     primary: Arc<dyn ai_memory_llm::LlmProvider>,
 ) -> Result<Arc<dyn ai_memory_llm::LlmProvider>> {
-    let Some(fallback_cfg) = config.llm_fallback_provider_config()? else {
-        return Ok(primary);
+    let extras = config.llm_extra_primary_configs(primary_cfg);
+    let primary_label = if extras.is_empty() {
+        primary.name().to_string()
+    } else {
+        "key-a".to_string()
     };
-    let secondary =
-        build_provider(fallback_cfg).context("building fallback LLM provider from config")?;
+    let first = ai_memory_llm::Lane::new(primary, primary_label)
+        .with_key_fp(config.primary_key_fingerprint(primary_cfg.provider));
+    let mut rest = Vec::new();
+    for (i, (cfg, fp)) in extras.into_iter().enumerate() {
+        let label = format!("key-{}", char::from(b'b' + u8::try_from(i.min(24)).unwrap_or(24)));
+        let provider =
+            build_provider(cfg).context("building extra-key LLM provider from config")?;
+        rest.push(ai_memory_llm::Lane::new(provider, label).with_key_fp(Some(fp)));
+    }
+    if let Some(fallback_cfg) = config.llm_fallback_provider_config()? {
+        let secondary =
+            build_provider(fallback_cfg).context("building fallback LLM provider from config")?;
+        let label = secondary.name().to_string();
+        rest.push(
+            ai_memory_llm::Lane::new(secondary, label)
+                .with_key_fp(config.fallback_key_fingerprint()),
+        );
+    }
+    let chain = ai_memory_llm::FallbackProvider::chain(first, rest)
+        .with_observer(Arc::new(config.llm_ledger()));
     info!(
-        primary = primary.name(),
-        primary_model = primary.model(),
-        fallback = secondary.name(),
-        fallback_model = secondary.model(),
+        lanes = ?chain.lane_labels(),
         cooldown_secs = ai_memory_llm::DEFAULT_COOLDOWN.as_secs(),
-        "runtime LLM fallback enabled: 429/5xx/timeout/truncation on the primary retries on the fallback",
+        zero_yield_threshold = ai_memory_llm::ZERO_YIELD_THRESHOLD,
+        "LLM lane chain: 429/5xx/timeout/truncated/empty on a lane retries on the next; \
+         each lane has its own breaker",
     );
-    Ok(Arc::new(ai_memory_llm::FallbackProvider::new(
-        primary, secondary,
-    )))
+    Ok(Arc::new(chain))
 }
 
 fn configure_consolidator(
@@ -2012,8 +2037,9 @@ fn configure_consolidator(
     let provider_name = cfg.provider.name().to_string();
     let model = cfg.model.clone();
     let retry_hint = llm_retry_hint(&provider_name, &model, cfg.base_url.as_deref());
+    let lane_cfg = cfg.clone();
     let llm = build_provider(cfg).context("building LLM provider from config")?;
-    let llm = with_runtime_fallback(config, llm)?;
+    let llm = with_runtime_fallback(config, &lane_cfg, llm)?;
     // Health wraps the composite: ProviderHealth has one LLM role, and the
     // configured label stays the primary's.
     let llm = provider_health.wrap_llm_provider(llm, provider_name, model, Some(retry_hint));

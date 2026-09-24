@@ -458,6 +458,7 @@ fn classify_scheduled_failure(e: &anyhow::Error) -> SchedulerFailureKind {
     };
     match llm {
         Some(LlmError::Provider { status: 429, .. })
+        | Some(LlmError::LanesPaused(_))
         | Some(LlmError::Auth(_))
         | Some(LlmError::NotConfigured(_)) => SchedulerFailureKind::LaneUnavailable,
         Some(LlmError::Http(http)) if http.is_connect() && !http.is_timeout() => {
@@ -1695,6 +1696,12 @@ mod tests {
             classify_scheduled_failure(&wrapped(LlmError::NotConfigured("x".into()))),
             lane
         );
+        // Every lane paused by its breaker: nothing was asked, the session
+        // must not be charged an attempt.
+        assert_eq!(
+            classify_scheduled_failure(&wrapped(LlmError::LanesPaused("gemini".into()))),
+            lane
+        );
         for e in [
             provider(500),
             provider(503),
@@ -1703,6 +1710,7 @@ mod tests {
             LlmError::Serde("bad".into()),
             LlmError::Truncated {
                 finish_reason: "length".into(),
+                partial: None,
             },
         ] {
             assert_eq!(classify_scheduled_failure(&wrapped(e)), session);

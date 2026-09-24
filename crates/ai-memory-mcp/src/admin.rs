@@ -290,6 +290,10 @@ struct AutoImproveRequest {
     /// Maximum approximate tokens allowed in one procedures/ page.
     #[serde(default = "default_auto_improve_max_procedure_page_tokens")]
     max_procedure_page_tokens: usize,
+    /// Output-token budget for the review call. `None` (an older CLI that
+    /// does not send it) inherits the server's configured budget.
+    #[serde(default)]
+    review_max_output_tokens: Option<u32>,
     /// Synthetic actor used for staged proposal provenance.
     #[serde(default = "default_auto_improve_proposal_actor")]
     proposal_actor: String,
@@ -1932,6 +1936,9 @@ async fn handle_auto_improve(
             .eval
             .clone()
             .unwrap_or_else(|| state.auto_improve_review_config.eval.clone()),
+        review_max_output_tokens: req
+            .review_max_output_tokens
+            .unwrap_or(state.auto_improve_review_config.review_max_output_tokens),
     };
 
     let report =

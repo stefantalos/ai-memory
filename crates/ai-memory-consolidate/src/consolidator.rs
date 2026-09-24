@@ -189,8 +189,11 @@ impl Consolidator {
             model = self.llm.model(),
             "consolidating session"
         );
-        let page: ConsolidatedPage =
-            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
+        let page: ConsolidatedPage = ai_memory_llm::with_caller(
+            "consolidate",
+            complete_structured_with_operation_id(&*self.llm, request, session_id.into()),
+        )
+        .await?;
 
         let frontmatter = build_frontmatter(&page, session_id, agent_kind);
         let id = self
@@ -483,8 +486,11 @@ impl Consolidator {
             provider = self.llm.name(),
             "consolidating session (multi-page)",
         );
-        let batch: ConsolidatedBatch =
-            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
+        let batch: ConsolidatedBatch = ai_memory_llm::with_caller(
+            "consolidate_multi",
+            complete_structured_with_operation_id(&*self.llm, request, session_id.into()),
+        )
+        .await?;
 
         // `dry_run` is always false past the early return above, so every
         // update here is a real write.

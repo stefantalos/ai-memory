@@ -314,7 +314,12 @@ async fn complete_chunk_with_retry(
 ) -> Result<BootstrapBatch, LlmError> {
     let mut attempt = 1;
     loop {
-        match complete_structured::<BootstrapBatch>(llm, request.clone()).await {
+        match ai_memory_llm::with_caller(
+            "bootstrap",
+            complete_structured::<BootstrapBatch>(llm, request.clone()),
+        )
+        .await
+        {
             Ok(batch) => return Ok(batch),
             Err(e) if attempt < BOOTSTRAP_CHUNK_MAX_ATTEMPTS && e.is_transient() => {
                 warn!(
