@@ -263,7 +263,7 @@ fn overthought_body(prompt: u32, completion: u32) -> serde_json::Value {
         "choices": [{
             "index": 0,
             "message": { "role": "assistant", "content": null,
-                         "reasoning_content": "Let me think about the observations again..." },
+                         "reasoning_content": "Draft: {\"summary\": \"s\", \"proposals\": [{\"rationale\": \"r\", \"evidence\": [\"e\"]}]}" },
             "finish_reason": "length"
         }],
         "usage": { "prompt_tokens": prompt, "completion_tokens": completion }
@@ -291,11 +291,8 @@ async fn no_tool_call_cut_at_the_limit_is_truncated_and_sends_nothing_else() {
         } => {
             assert_eq!(finish_reason, "length");
             assert!(
-                partial
-                    .expect("the reasoning is salvaged")
-                    .0
-                    .contains("think about"),
-                "partial carries what the model did emit"
+                partial.is_none(),
+                "reasoning is not output: never offered for salvage"
             );
         }
         other => panic!("expected Truncated, got {other:?}"),

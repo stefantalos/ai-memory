@@ -264,10 +264,6 @@ struct OpenAiChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiMessageResponse {
     content: Option<String>,
-    /// Hidden reasoning some engines return beside `content` (Poolside,
-    /// vLLM reasoning parsers). Read only to salvage a partial on a cut.
-    #[serde(default)]
-    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAiToolCall>>,
 }
@@ -612,7 +608,7 @@ pub(crate) fn parse_tool_call_response(
         if cut_at_limit {
             return Err(LlmError::Truncated {
                 finish_reason: "length".into(),
-                partial: partial_of(message.content, message.reasoning_content),
+                partial: partial_of(message.content),
             });
         }
         return Err(LlmError::UnexpectedShape(
@@ -622,7 +618,7 @@ pub(crate) fn parse_tool_call_response(
     if cut_at_limit && call.function.arguments.is_null() {
         return Err(LlmError::Truncated {
             finish_reason: "length".into(),
-            partial: partial_of(message.content, message.reasoning_content),
+            partial: partial_of(message.content),
         });
     }
     let parsed = match call.function.arguments {
@@ -649,14 +645,15 @@ pub(crate) fn parse_tool_call_response(
     Ok(value)
 }
 
-/// The text a cut response did emit: `content` first, else the reasoning.
-fn partial_of(
-    content: Option<String>,
-    reasoning: Option<String>,
-) -> Option<crate::error::PartialText> {
+/// The answer text a cut response did emit, if any.
+///
+/// Deliberately NOT `reasoning_content`: a partial is what callers salvage
+/// complete items from (auto_improve recovers whole proposals from a valid
+/// prefix), and a draft object inside the model's thinking is not output —
+/// promoting it would turn an unfinished thought into a proposal.
+fn partial_of(content: Option<String>) -> Option<crate::error::PartialText> {
     content
         .filter(|t| !t.trim().is_empty())
-        .or_else(|| reasoning.filter(|t| !t.trim().is_empty()))
         .map(crate::error::PartialText)
 }
 
