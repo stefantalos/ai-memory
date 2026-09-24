@@ -1947,6 +1947,31 @@ fn start_watcher(args: &ServeArgs, wiki: &Wiki) -> Result<Option<WatcherHandle>>
     Ok(Some(WatcherHandle::start(wiki.clone())?))
 }
 
+/// Wrap the primary LLM with the runtime fallback lane when one is configured
+/// (FN8-8120). Without `AI_MEMORY_LLM_FALLBACK_PROVIDER` the primary is
+/// returned untouched, so behaviour is exactly the single-lane path.
+fn with_runtime_fallback(
+    config: &Config,
+    primary: Arc<dyn ai_memory_llm::LlmProvider>,
+) -> Result<Arc<dyn ai_memory_llm::LlmProvider>> {
+    let Some(fallback_cfg) = config.llm_fallback_provider_config()? else {
+        return Ok(primary);
+    };
+    let secondary =
+        build_provider(fallback_cfg).context("building fallback LLM provider from config")?;
+    info!(
+        primary = primary.name(),
+        primary_model = primary.model(),
+        fallback = secondary.name(),
+        fallback_model = secondary.model(),
+        cooldown_secs = ai_memory_llm::DEFAULT_COOLDOWN.as_secs(),
+        "runtime LLM fallback enabled: 429/5xx/timeout/truncation on the primary retries on the fallback",
+    );
+    Ok(Arc::new(ai_memory_llm::FallbackProvider::new(
+        primary, secondary,
+    )))
+}
+
 fn configure_consolidator(
     config: &Config,
     mut server: AiMemoryServer,
@@ -1986,6 +2011,9 @@ fn configure_consolidator(
     let model = cfg.model.clone();
     let retry_hint = llm_retry_hint(&provider_name, &model, cfg.base_url.as_deref());
     let llm = build_provider(cfg).context("building LLM provider from config")?;
+    let llm = with_runtime_fallback(config, llm)?;
+    // Health wraps the composite: ProviderHealth has one LLM role, and the
+    // configured label stays the primary's.
     let llm = provider_health.wrap_llm_provider(llm, provider_name, model, Some(retry_hint));
     info!(
         provider = llm.name(),

@@ -341,6 +341,10 @@ pub struct RuntimeEnv {
     gemini_api_key: Option<SecretString>,
     llm_api_key: Option<SecretString>,
     llm_base_url: Option<String>,
+    llm_fallback_provider: Option<String>,
+    llm_fallback_model: Option<String>,
+    llm_fallback_base_url: Option<String>,
+    llm_fallback_api_key_file: Option<PathBuf>,
     embedding_api_key: Option<SecretString>,
     copilot_github_token: Option<SecretString>,
     github_copilot_api_token: Option<SecretString>,
@@ -379,6 +383,13 @@ impl RuntimeEnv {
             gemini_api_key: env_secret("GEMINI_API_KEY").or_else(|| env_secret("GOOGLE_API_KEY")),
             llm_api_key: env_secret("LLM_API_KEY"),
             llm_base_url: env_string("LLM_BASE_URL"),
+            // Runtime fallback lane (FN8-8120). Deliberately its own names:
+            // the fallback never inherits the primary's LLM_BASE_URL or
+            // LLM_API_KEY, and its key is read from a file, not the env.
+            llm_fallback_provider: env_string("AI_MEMORY_LLM_FALLBACK_PROVIDER"),
+            llm_fallback_model: env_string("AI_MEMORY_LLM_FALLBACK_MODEL"),
+            llm_fallback_base_url: env_string("AI_MEMORY_LLM_FALLBACK_BASE_URL"),
+            llm_fallback_api_key_file: env_path("AI_MEMORY_LLM_FALLBACK_API_KEY_FILE"),
             // The embedding counterpart of LLM_API_KEY: it credentials the
             // embedding role alone, so the embedder can target a different
             // provider than the chat model instead of borrowing its key.
@@ -1052,41 +1063,8 @@ impl Config {
         let Some(provider_raw) = non_empty(self.llm_provider.as_deref()) else {
             return Ok(None);
         };
-        let provider = match provider_raw {
-            "anthropic" => ProviderChoice::Anthropic,
-            "openai" => ProviderChoice::OpenAi,
-            "gemini" | "google" => ProviderChoice::Gemini,
-            "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
-            "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
-            "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
-            "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
-            "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
-            other => {
-                return Err(LlmError::NotConfigured(format!(
-                    "AI_MEMORY_LLM_PROVIDER={other} is not one of \
-                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
-                )));
-            }
-        };
-        let model = match non_empty(self.llm_model.as_deref()) {
-            Some(s) => s.to_string(),
-            None => match provider {
-                ProviderChoice::Anthropic => "claude-haiku-4-5".to_string(),
-                ProviderChoice::AnthropicOAuth => "claude-sonnet-4-6".to_string(),
-                ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
-                ProviderChoice::Gemini => "gemini-3.5-flash".to_string(),
-                ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
-                ProviderChoice::Copilot => "gpt-5.5".to_string(),
-                ProviderChoice::OpenAiCompat => {
-                    return Err(LlmError::NotConfigured(
-                        "AI_MEMORY_LLM_MODEL must be set explicitly for openai-compat \
-                         (no safe default for self-hosted / aggregator endpoints)"
-                            .into(),
-                    ));
-                }
-                ProviderChoice::OpenCode => OPENCODE_DEFAULT_MODEL.to_string(),
-            },
-        };
+        let provider = parse_provider_choice(provider_raw, "AI_MEMORY_LLM_PROVIDER")?;
+        let model = resolve_llm_model(provider, self.llm_model.as_deref(), "AI_MEMORY_LLM_MODEL")?;
         Ok(Some(ProviderConfig {
             provider,
             model,
@@ -1098,6 +1076,68 @@ impl Config {
                 .llm_base_url
                 .clone()
                 .or_else(|| self.runtime_env.llm_base_url.clone()),
+            compat_strict: self.llm_compat_strict,
+            request_timeout_secs: self.llm_timeout_secs,
+            reasoning_effort: self.llm_reasoning_effort,
+        }))
+    }
+
+    /// Build the runtime fallback LLM provider settings (FN8-8120), if one is
+    /// configured via `AI_MEMORY_LLM_FALLBACK_PROVIDER`.
+    ///
+    /// The fallback is resolved in isolation from the primary: its base URL
+    /// comes only from `AI_MEMORY_LLM_FALLBACK_BASE_URL` (never `LLM_BASE_URL`),
+    /// and its key from `AI_MEMORY_LLM_FALLBACK_API_KEY_FILE` when set — so an
+    /// openai-compat fallback cannot silently borrow the primary's key. Without
+    /// a key file the provider's standard env var is used.
+    ///
+    /// A key file that cannot be read disables the fallback with a warning
+    /// instead of failing startup: an optional secondary must never take down
+    /// the primary lane. A misspelt provider or a missing openai-compat model
+    /// is an operator error and still fails loudly.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] for an unknown provider or a
+    /// provider that needs an explicit model.
+    pub fn llm_fallback_provider_config(&self) -> LlmResult<Option<ProviderConfig>> {
+        let env = &self.runtime_env;
+        let Some(provider_raw) = non_empty(env.llm_fallback_provider.as_deref()) else {
+            return Ok(None);
+        };
+        let provider = parse_provider_choice(provider_raw, "AI_MEMORY_LLM_FALLBACK_PROVIDER")?;
+        let model = resolve_llm_model(
+            provider,
+            env.llm_fallback_model.as_deref(),
+            "AI_MEMORY_LLM_FALLBACK_MODEL",
+        )?;
+        let key_override = match env.llm_fallback_api_key_file.as_deref() {
+            None => None,
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(raw) if !raw.trim().is_empty() => {
+                    Some(SecretString::from(raw.trim().to_string()))
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "AI_MEMORY_LLM_FALLBACK_API_KEY_FILE is empty; runtime LLM fallback disabled"
+                    );
+                    return Ok(None);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "AI_MEMORY_LLM_FALLBACK_API_KEY_FILE unreadable; runtime LLM fallback disabled"
+                    );
+                    return Ok(None);
+                }
+            },
+        };
+        Ok(Some(ProviderConfig {
+            provider,
+            model,
+            auth: self.provider_auth(provider, key_override),
+            base_url: env.llm_fallback_base_url.clone(),
             compat_strict: self.llm_compat_strict,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
@@ -1347,6 +1387,53 @@ impl Config {
             .clone()
             .or_else(|| self.runtime_env.llm_base_url.clone())
     }
+}
+
+/// Parse a user-facing LLM provider name. `var` names the setting in errors.
+fn parse_provider_choice(raw: &str, var: &str) -> LlmResult<ProviderChoice> {
+    Ok(match raw {
+        "anthropic" => ProviderChoice::Anthropic,
+        "openai" => ProviderChoice::OpenAi,
+        "gemini" | "google" => ProviderChoice::Gemini,
+        "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
+        "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
+        "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
+        "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
+        "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
+        other => {
+            return Err(LlmError::NotConfigured(format!(
+                "{var}={other} is not one of \
+                 anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
+            )));
+        }
+    })
+}
+
+/// The configured model, or the provider's built-in default. `var` names the
+/// model setting in errors.
+fn resolve_llm_model(
+    provider: ProviderChoice,
+    configured: Option<&str>,
+    var: &str,
+) -> LlmResult<String> {
+    Ok(match non_empty(configured) {
+        Some(s) => s.to_string(),
+        None => match provider {
+            ProviderChoice::Anthropic => "claude-haiku-4-5".to_string(),
+            ProviderChoice::AnthropicOAuth => "claude-sonnet-4-6".to_string(),
+            ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
+            ProviderChoice::Gemini => "gemini-3.5-flash".to_string(),
+            ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
+            ProviderChoice::Copilot => "gpt-5.5".to_string(),
+            ProviderChoice::OpenAiCompat => {
+                return Err(LlmError::NotConfigured(format!(
+                    "{var} must be set explicitly for openai-compat \
+                     (no safe default for self-hosted / aggregator endpoints)"
+                )));
+            }
+            ProviderChoice::OpenCode => OPENCODE_DEFAULT_MODEL.to_string(),
+        },
+    })
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -2408,6 +2495,93 @@ mod tests {
             }
         );
         assert!(auth.optional_api_key().is_none());
+    }
+
+    // ── FN8-8120 runtime fallback lane configuration.
+
+    fn primary_poolside(runtime_env: RuntimeEnv) -> Config {
+        Config {
+            llm_provider: Some("openai-compat".into()),
+            llm_model: Some("poolside/laguna-s-2.1".into()),
+            runtime_env: RuntimeEnv {
+                llm_api_key: Some(SecretString::from("primary-key")),
+                llm_base_url: Some("https://inference.poolside.ai/v1".into()),
+                ..runtime_env
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn no_fallback_provider_means_no_fallback() {
+        let cfg = primary_poolside(RuntimeEnv::default());
+        assert!(cfg.llm_fallback_provider_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn fallback_reads_key_file_and_never_inherits_the_primary_base_url() {
+        let tmp = TempDir::new().unwrap();
+        let key_file = tmp.path().join("gemini-api-key");
+        std::fs::write(&key_file, "fallback-key\n").unwrap();
+        let cfg = primary_poolside(RuntimeEnv {
+            llm_fallback_provider: Some("gemini".into()),
+            llm_fallback_model: Some("gemini-2.5-flash".into()),
+            llm_fallback_api_key_file: Some(key_file),
+            ..RuntimeEnv::default()
+        });
+        let fb = cfg.llm_fallback_provider_config().unwrap().unwrap();
+        assert_eq!(fb.provider, ProviderChoice::Gemini);
+        assert_eq!(fb.model, "gemini-2.5-flash");
+        assert_eq!(fb.base_url, None, "LLM_BASE_URL belongs to the primary");
+        assert_eq!(
+            fb.auth.require_api_key().unwrap().expose_secret(),
+            "fallback-key"
+        );
+    }
+
+    #[test]
+    fn openai_compat_fallback_does_not_borrow_the_primary_key() {
+        let tmp = TempDir::new().unwrap();
+        let key_file = tmp.path().join("k");
+        std::fs::write(&key_file, "own-key").unwrap();
+        let cfg = primary_poolside(RuntimeEnv {
+            llm_fallback_provider: Some("openai-compat".into()),
+            llm_fallback_model: Some("other".into()),
+            llm_fallback_base_url: Some("https://example.invalid/v1".into()),
+            llm_fallback_api_key_file: Some(key_file),
+            ..RuntimeEnv::default()
+        });
+        let fb = cfg.llm_fallback_provider_config().unwrap().unwrap();
+        assert_eq!(fb.base_url.as_deref(), Some("https://example.invalid/v1"));
+        assert_eq!(
+            fb.auth.optional_api_key().unwrap().expose_secret(),
+            "own-key"
+        );
+    }
+
+    #[test]
+    fn unreadable_fallback_key_file_disables_only_the_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = primary_poolside(RuntimeEnv {
+            llm_fallback_provider: Some("gemini".into()),
+            llm_fallback_api_key_file: Some(tmp.path().join("missing")),
+            ..RuntimeEnv::default()
+        });
+        assert!(cfg.llm_fallback_provider_config().unwrap().is_none());
+        assert!(cfg.llm_provider_config().unwrap().is_some());
+    }
+
+    #[test]
+    fn unknown_fallback_provider_fails_loudly() {
+        let cfg = primary_poolside(RuntimeEnv {
+            llm_fallback_provider: Some("gemnii".into()),
+            ..RuntimeEnv::default()
+        });
+        let err = cfg.llm_fallback_provider_config().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("AI_MEMORY_LLM_FALLBACK_PROVIDER=gemnii")
+        );
     }
 
     #[test]
