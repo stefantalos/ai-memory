@@ -350,6 +350,9 @@ pub struct RuntimeEnv {
     finops_presence_path: Option<PathBuf>,
     metered_entity: Option<String>,
     llm_alarm_path: Option<PathBuf>,
+    metered_gate_jev_script: Option<PathBuf>,
+    metered_gate_node: Option<PathBuf>,
+    metered_gate_callers: Option<String>,
     embedding_api_key: Option<SecretString>,
     copilot_github_token: Option<SecretString>,
     github_copilot_api_token: Option<SecretString>,
@@ -431,6 +434,12 @@ impl RuntimeEnv {
             metered_entity: env_string("AI_MEMORY_METERED_ENTITY"),
             // Actionable bus for breaker alarms (chyros shape).
             llm_alarm_path: env_path("AI_MEMORY_LLM_ALARM_PATH"),
+            // Jev value gate in front of metered lanes (operator decision
+            // 2026-09-24): the floo Jev CLI, the node that runs it, and the
+            // callers it gates (default auto_improve,experience).
+            metered_gate_jev_script: env_path("AI_MEMORY_METERED_GATE_JEV_SCRIPT"),
+            metered_gate_node: env_path("AI_MEMORY_METERED_GATE_NODE"),
+            metered_gate_callers: env_string("AI_MEMORY_METERED_GATE_CALLERS"),
             // The embedding counterpart of LLM_API_KEY: it credentials the
             // embedding role alone, so the embedder can target a different
             // provider than the chat model instead of borrowing its key.
@@ -1240,6 +1249,28 @@ impl Config {
         let path = self.runtime_env.llm_fallback_api_key_file.as_deref()?;
         let raw = std::fs::read_to_string(path).ok()?;
         (!raw.trim().is_empty()).then(|| ai_memory_llm::key_fingerprint(&raw))
+    }
+
+    /// The Jev value gate for metered lanes, when configured, with the
+    /// callers it applies to.
+    #[must_use]
+    pub fn metered_gate(&self) -> Option<(ai_memory_llm::JevCliGate, Vec<String>)> {
+        let env = &self.runtime_env;
+        let script = env.metered_gate_jev_script.clone()?;
+        let node = env
+            .metered_gate_node
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/usr/local/bin/node"));
+        let callers = env
+            .metered_gate_callers
+            .as_deref()
+            .unwrap_or("auto_improve,experience")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        Some((ai_memory_llm::JevCliGate::new(node, script), callers))
     }
 
     /// The LLM call ledger configured by the environment. See

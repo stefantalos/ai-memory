@@ -51,6 +51,7 @@ use crate::error::{LlmError, LlmResult};
 use crate::ledger::{
     BreakerEvent, CallRecord, LaneObserver, estimate_cost, funding_for, now_rfc3339,
 };
+use crate::metered_gate::{GateRequest, GateVerdict, MeteredGate};
 use crate::provider::LlmProvider;
 use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 use crate::usage::{ReportedUsage, capture_usage, current_caller};
@@ -237,6 +238,8 @@ pub struct FallbackProvider {
     zero_yield_threshold: u32,
     clock: Arc<dyn Clock>,
     observer: Option<Arc<dyn LaneObserver>>,
+    gate: Option<Arc<dyn MeteredGate>>,
+    gated_callers: Vec<String>,
 }
 
 impl FallbackProvider {
@@ -262,7 +265,19 @@ impl FallbackProvider {
             zero_yield_threshold: ZERO_YIELD_THRESHOLD,
             clock: Arc::new(SystemClock),
             observer: None,
+            gate: None,
+            gated_callers: Vec::new(),
         }
+    }
+
+    /// Ask `gate` (Jev) before any request from one of `callers` reaches a
+    /// metered lane. Availability stays deterministic; the gate only decides
+    /// whether the request is worth paying for. See [`crate::metered_gate`].
+    #[must_use]
+    pub fn with_metered_gate(mut self, gate: Arc<dyn MeteredGate>, callers: Vec<String>) -> Self {
+        self.gate = Some(gate);
+        self.gated_callers = callers;
+        self
     }
 
     /// Override the circuit cooldown.
@@ -411,8 +426,51 @@ impl FallbackProvider {
         });
     }
 
+    /// Whether this request must pass the value gate before `lane`.
+    fn gate_applies(&self, lane: &Lane) -> Option<&Arc<dyn MeteredGate>> {
+        let gate = self.gate.as_ref()?;
+        let caller = current_caller();
+        (crate::ledger::is_metered(lane.provider.name())
+            && self.gated_callers.iter().any(|c| c == caller))
+        .then_some(gate)
+    }
+
+    fn observe_gate(&self, lane: &Lane, verdict: &GateVerdict) {
+        if verdict.admit {
+            tracing::info!(lane = %lane.label, reason = %verdict.reason, "metered lane admitted by value gate");
+        } else {
+            tracing::warn!(
+                lane = %lane.label,
+                reason = %verdict.reason,
+                "metered lane skipped by value gate (skipped-by-jev); the request waits for a free lane",
+            );
+        }
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        observer.on_call(&CallRecord {
+            ts: now_rfc3339(),
+            kind: "call",
+            caller: current_caller().to_string(),
+            lane: lane.label.clone(),
+            provider: "jev".into(),
+            model: format!("value-gate for {}", lane.provider.model()),
+            key_fp: None,
+            outcome: if verdict.admit {
+                "gate_admitted"
+            } else {
+                "gate_declined"
+            },
+            status: None,
+            input_tokens: None,
+            output_tokens: None,
+            cost_usd_est: verdict.cost_usd,
+            funding: "Jev value gate (OpenRouter, recorded by floo authoriseMeteredCall)",
+        });
+    }
+
     /// Core routing, shared by all four trait entry points.
-    async fn route<T, C, CF>(&self, call: C) -> LlmResult<T>
+    async fn route<T, C, CF>(&self, evidence: String, call: C) -> LlmResult<T>
     where
         T: YieldCheck,
         C: Fn(Arc<dyn LlmProvider>) -> CF,
@@ -421,12 +479,28 @@ impl FallbackProvider {
         let mut last_err: Option<LlmError> = None;
         let mut empty_ok: Option<T> = None;
         let mut skipped: Vec<&str> = Vec::new();
+        let mut declined: Option<String> = None;
         for (index, state) in self.lanes.iter().enumerate() {
             if self.skipped(state) {
                 skipped.push(&state.lane.label);
                 continue;
             }
             let lane = &state.lane;
+            if let Some(gate) = self.gate_applies(lane) {
+                let verdict = gate
+                    .judge(GateRequest {
+                        caller: current_caller(),
+                        provider: lane.provider.name(),
+                        model: lane.provider.model(),
+                        evidence: &evidence,
+                    })
+                    .await;
+                self.observe_gate(lane, &verdict);
+                if !verdict.admit {
+                    declined = Some(verdict.reason);
+                    continue;
+                }
+            }
             record_responder(lane);
             let (result, usage) = capture_usage(call(lane.provider.clone())).await;
             let is_last = index + 1 == self.lanes.len();
@@ -468,6 +542,9 @@ impl FallbackProvider {
         if let Some(value) = empty_ok {
             return Ok(value);
         }
+        if let Some(reason) = declined {
+            return Err(LlmError::MeteredDeclined(reason));
+        }
         Err(last_err.unwrap_or_else(|| {
             LlmError::LanesPaused(format!(
                 "every lane's breaker is open ({}); retry after the cooldown",
@@ -475,6 +552,18 @@ impl FallbackProvider {
             ))
         }))
     }
+}
+
+/// The request's user-side text, bounded, for the value gate.
+fn evidence_of(request: &ChatRequest) -> String {
+    let joined: String = request
+        .messages
+        .iter()
+        .filter(|m| m.role == crate::types::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    crate::metered_gate::bound_evidence(&joined).to_string()
 }
 
 #[async_trait]
@@ -488,7 +577,7 @@ impl LlmProvider for FallbackProvider {
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
-        self.route(|p| {
+        self.route(evidence_of(&request), |p| {
             let r = request.clone();
             async move { p.complete(r).await }
         })
@@ -500,7 +589,7 @@ impl LlmProvider for FallbackProvider {
         request: ChatRequest,
         operation_id: LlmOperationId,
     ) -> LlmResult<ChatResponse> {
-        self.route(|p| {
+        self.route(evidence_of(&request), |p| {
             let r = request.clone();
             async move { p.complete_with_operation_id(r, operation_id).await }
         })
@@ -512,7 +601,7 @@ impl LlmProvider for FallbackProvider {
         request: ChatRequest,
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
-        self.route(|p| {
+        self.route(evidence_of(&request), |p| {
             let (r, s) = (request.clone(), schema.clone());
             async move { p.complete_structured_raw(r, s).await }
         })
@@ -525,7 +614,7 @@ impl LlmProvider for FallbackProvider {
         schema: serde_json::Value,
         operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
-        self.route(|p| {
+        self.route(evidence_of(&request), |p| {
             let (r, s) = (request.clone(), schema.clone());
             async move {
                 p.complete_structured_raw_with_operation_id(r, s, operation_id)
@@ -1135,5 +1224,111 @@ mod tests {
         call(&f).await.0.unwrap(); // probe: one 500
         call(&f).await.0.unwrap();
         assert_eq!(a.calls(), 4, "one failed probe re-opened the circuit");
+    }
+
+    // ── Value gate (Jev) in front of the metered lane.
+
+    struct FakeGate {
+        admit: bool,
+        reason: &'static str,
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl MeteredGate for FakeGate {
+        async fn judge(&self, request: GateRequest<'_>) -> GateVerdict {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.provider, "gemini", "only the metered lane is gated");
+            GateVerdict {
+                admit: self.admit,
+                reason: self.reason.into(),
+                cost_usd: Some(0.0001),
+            }
+        }
+    }
+
+    fn gated(
+        a: &Arc<Scripted>,
+        b: &Arc<Scripted>,
+        g: &Arc<Scripted>,
+        admit: bool,
+        reason: &'static str,
+    ) -> (FallbackProvider, Arc<FakeGate>, Arc<Recorder>) {
+        let gate = Arc::new(FakeGate {
+            admit,
+            reason,
+            calls: AtomicUsize::new(0),
+        });
+        let (f, _, rec) = three_lanes(a, b, g);
+        let f = f.with_metered_gate(gate.clone(), vec!["auto_improve".into()]);
+        (f, gate, rec)
+    }
+
+    fn walled() -> (Arc<Scripted>, Arc<Scripted>) {
+        (laguna(vec![Some(status(429))]), laguna(vec![Some(status(429))]))
+    }
+
+    #[tokio::test]
+    async fn jev_yes_lets_the_request_reach_gemini() {
+        let (a, b) = walled();
+        let g = Scripted::ok("gemini", "gemini-2.5-flash");
+        let (f, gate, _) = gated(&a, &b, &g, true, "jev admitted");
+        let (out, who) = crate::usage::with_caller("auto_improve", call(&f)).await;
+        assert_eq!(out.unwrap()["answered_by"], "gemini");
+        assert_eq!(who.unwrap().lane, "gemini");
+        assert_eq!((gate.calls.load(Ordering::SeqCst), g.calls()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn jev_no_keeps_the_request_off_gemini_and_is_recorded() {
+        let (a, b) = walled();
+        let g = Scripted::ok("gemini", "gemini-2.5-flash");
+        let (f, gate, rec) = gated(&a, &b, &g, false, "jev declined: future_need=0.40 < 0.9");
+        let (out, _) = crate::usage::with_caller("auto_improve", call(&f)).await;
+        match out {
+            Err(LlmError::MeteredDeclined(reason)) => assert!(reason.contains("future_need")),
+            other => panic!("expected MeteredDeclined, got {other:?}"),
+        }
+        assert_eq!(g.calls(), 0, "a declined request is never paid for");
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+        let calls = rec.calls.lock().unwrap();
+        let gate_row = calls.iter().find(|c| c.provider == "jev").expect("gate recorded");
+        assert_eq!(gate_row.outcome, "gate_declined");
+        assert_eq!(gate_row.cost_usd_est, Some(0.0001), "Jev's own cost is recorded");
+    }
+
+    #[tokio::test]
+    async fn jev_unavailable_fails_closed() {
+        let (a, b) = walled();
+        let g = Scripted::ok("gemini", "gemini-2.5-flash");
+        let (f, _, _) = gated(&a, &b, &g, false, "jev unavailable on future_need: timed out (fail closed)");
+        let (out, _) = crate::usage::with_caller("auto_improve", call(&f)).await;
+        assert!(matches!(out, Err(LlmError::MeteredDeclined(_))), "{out:?}");
+        assert_eq!(g.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_free_laguna_path_never_asks_jev() {
+        let (a, b, g) = (
+            laguna(vec![Some(status(429))]),
+            laguna(vec![]),
+            Scripted::ok("gemini", "gemini-2.5-flash"),
+        );
+        let (f, gate, _) = gated(&a, &b, &g, false, "would decline");
+        for _ in 0..2 {
+            let (out, who) = crate::usage::with_caller("auto_improve", call(&f)).await;
+            assert!(out.is_ok());
+            assert_eq!(who.unwrap().lane, "key-b");
+        }
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_ungated_caller_reaches_gemini_without_asking_jev() {
+        let (a, b) = walled();
+        let g = Scripted::ok("gemini", "gemini-2.5-flash");
+        let (f, gate, _) = gated(&a, &b, &g, false, "would decline");
+        let (out, _) = crate::usage::with_caller("consolidate", call(&f)).await;
+        assert!(out.is_ok());
+        assert_eq!((gate.calls.load(Ordering::SeqCst), g.calls()), (0, 1));
     }
 }

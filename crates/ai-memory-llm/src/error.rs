@@ -49,6 +49,12 @@ pub enum LlmError {
     #[error("empty response: {0}")]
     EmptyResponse(String),
 
+    /// The value gate (Jev) declined — or could not judge — a request bound
+    /// for a metered lane, and no free lane answered. Nothing was paid for;
+    /// the request waits for a free lane.
+    #[error("metered lane declined by value gate: {0}")]
+    MeteredDeclined(String),
+
     /// Every configured LLM lane is paused by its circuit breaker. No
     /// request was sent; the lane, not the request, is unavailable.
     #[error("all LLM lanes paused: {0}")]

@@ -1987,8 +1987,17 @@ fn with_runtime_fallback(
                 .with_key_fp(config.fallback_key_fingerprint()),
         );
     }
-    let chain = ai_memory_llm::FallbackProvider::chain(first, rest)
+    let mut chain = ai_memory_llm::FallbackProvider::chain(first, rest)
         .with_observer(Arc::new(config.llm_ledger()));
+    if let Some((gate, callers)) = config.metered_gate() {
+        info!(
+            callers = ?callers,
+            threshold = ai_memory_llm::MONEY_THRESHOLD,
+            "Jev value gate armed: metered lanes need every atomic judgement at or above the \
+             threshold; a decline or an unavailable judge keeps the request off the metered lane",
+        );
+        chain = chain.with_metered_gate(Arc::new(gate), callers);
+    }
     info!(
         lanes = ?chain.lane_labels(),
         cooldown_secs = ai_memory_llm::DEFAULT_COOLDOWN.as_secs(),

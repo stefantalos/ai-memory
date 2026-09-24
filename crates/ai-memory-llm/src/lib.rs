@@ -44,6 +44,7 @@ pub mod error;
 pub mod factory;
 pub mod fallback;
 pub mod ledger;
+pub mod metered_gate;
 pub mod usage;
 pub mod gemini;
 pub mod google;
@@ -86,6 +87,7 @@ pub use fallback::{
 pub use ledger::{
     BreakerEvent, CallRecord, JsonlLedger, LaneObserver, METERED_FUNDING_TYPE, key_fingerprint,
 };
+pub use metered_gate::{GateRequest, GateVerdict, JevCliGate, MONEY_THRESHOLD, MeteredGate};
 pub use usage::{ReportedUsage, capture_usage, current_caller, with_caller};
 pub use gemini::{GEMINI_25_FLASH_MAX_OUTPUT_TOKENS, GeminiProvider, model_max_output_tokens};
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
