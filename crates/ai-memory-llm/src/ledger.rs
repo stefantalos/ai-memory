@@ -138,6 +138,15 @@ pub struct BreakerEvent {
     pub consecutive: u32,
     /// Seconds the lane stays paused before a half-open probe.
     pub cooldown_secs: u64,
+    /// Fingerprint of the lane's key (never the key).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_fp: Option<String>,
+    /// Daily quota wall: the estimated reset instant (RFC 3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+    /// Daily quota wall: where `resets_at` comes from (`learned` / `default`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 
 /// Receives call records and breaker events.
@@ -256,7 +265,7 @@ impl LaneObserver for JsonlLedger {
             self.append(path, &serde_json::json!(event));
         }
         if let Some(path) = &self.alarm_path {
-            let row = serde_json::json!({
+            let mut row = serde_json::json!({
                 "ts": event.ts,
                 "actionable": true,
                 "source": "ai-memory-llm",
@@ -269,6 +278,23 @@ impl LaneObserver for JsonlLedger {
                     event.consecutive, event.reason
                 ),
             });
+            if let Some(resets_at) = &event.resets_at {
+                row["resets_at"] = serde_json::json!(resets_at);
+                row["source"] = serde_json::json!(event.source);
+                row["key_fp"] = serde_json::json!(event.key_fp);
+                row["recommended_action"] = serde_json::json!(format!(
+                    "ai-memory paused LLM lane {} (key {}, {}/{}): daily quota exhausted \
+                     (429 usage limit exceeded). Requests go to the next lane; one probe \
+                     after {}s, reset estimated at {} (source: {}).",
+                    event.lane,
+                    event.key_fp.as_deref().unwrap_or("-"),
+                    event.provider,
+                    event.model,
+                    event.cooldown_secs,
+                    resets_at,
+                    event.source.unwrap_or("default"),
+                ));
+            }
             self.append(path, &row);
         }
     }
@@ -335,5 +361,49 @@ mod tests {
         assert_eq!(row["fundingType"], METERED_FUNDING_TYPE);
         assert_eq!(row["entity"], "Personal");
         assert_eq!(row["taskId"], "ai-memory:auto_improve");
+    }
+
+    fn breaker(resets_at: Option<&str>) -> BreakerEvent {
+        BreakerEvent {
+            ts: "2026-09-24T21:23:22Z".into(),
+            kind: "breaker_open",
+            lane: "key-b".into(),
+            provider: "openai-compat".into(),
+            model: "poolside/laguna-s-2.1".into(),
+            reason: "quota",
+            consecutive: 1,
+            cooldown_secs: 9_700,
+            key_fp: Some("f6656650".into()),
+            resets_at: resets_at.map(str::to_string),
+            source: resets_at.map(|_| "default"),
+        }
+    }
+
+    #[test]
+    fn a_daily_quota_alarm_carries_resets_at_source_and_key_fp() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = dir.path().join("bus.jsonl");
+        let ledger = JsonlLedger::new(None).with_alarm(Some(bus.clone()));
+        ledger.on_breaker_open(&breaker(Some("2026-09-25T00:00:00Z")));
+        ledger.on_breaker_open(&breaker(None));
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&bus)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows[0]["reason"], "llm-lane-paused:key-b:quota");
+        assert_eq!(rows[0]["resets_at"], "2026-09-25T00:00:00Z");
+        assert_eq!(rows[0]["source"], "default");
+        assert_eq!(rows[0]["key_fp"], "f6656650");
+        assert!(
+            rows[0]["recommended_action"]
+                .as_str()
+                .unwrap()
+                .contains("2026-09-25T00:00:00Z")
+        );
+        assert!(
+            rows[1].get("resets_at").is_none(),
+            "a plain breaker alarm is unchanged"
+        );
     }
 }

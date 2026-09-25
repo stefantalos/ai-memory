@@ -1995,7 +1995,10 @@ fn with_runtime_fallback(
         .with_key_fp(config.primary_key_fingerprint(primary_cfg.provider));
     let mut rest = Vec::new();
     for (i, (cfg, fp)) in extras.into_iter().enumerate() {
-        let label = format!("key-{}", char::from(b'b' + u8::try_from(i.min(24)).unwrap_or(24)));
+        let label = format!(
+            "key-{}",
+            char::from(b'b' + u8::try_from(i.min(24)).unwrap_or(24))
+        );
         let provider =
             build_provider(cfg).context("building extra-key LLM provider from config")?;
         rest.push(ai_memory_llm::Lane::new(provider, label).with_key_fp(Some(fp)));
@@ -2009,8 +2012,15 @@ fn with_runtime_fallback(
                 .with_key_fp(config.fallback_key_fingerprint()),
         );
     }
+    let quota = Arc::new(config.llm_quota_book());
+    info!(
+        path = ?quota.path(),
+        "LLM daily-quota walls kept per key fingerprint (429 usage limit exceeded waits for the \
+         key's estimated reset, default 00:00Z, instead of the fixed cooldown)",
+    );
     let mut chain = ai_memory_llm::FallbackProvider::chain(first, rest)
-        .with_observer(Arc::new(config.llm_ledger()));
+        .with_observer(Arc::new(config.llm_ledger()))
+        .with_quota_book(quota);
     if let Some((gate, callers)) = config.metered_gate() {
         info!(
             callers = ?callers,

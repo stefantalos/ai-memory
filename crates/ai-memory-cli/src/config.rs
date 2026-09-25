@@ -347,6 +347,7 @@ pub struct RuntimeEnv {
     llm_fallback_api_key_file: Option<PathBuf>,
     llm_extra_api_key_files: Vec<PathBuf>,
     llm_ledger_path: Option<PathBuf>,
+    llm_quota_state_path: Option<PathBuf>,
     finops_presence_path: Option<PathBuf>,
     metered_entity: Option<String>,
     llm_alarm_path: Option<PathBuf>,
@@ -428,6 +429,10 @@ impl RuntimeEnv {
             // Call ledger (every lane call, key named by fingerprint only);
             // default `<data_dir>/llm-calls.jsonl`, `off` disables it.
             llm_ledger_path: env_path("AI_MEMORY_LLM_LEDGER_PATH"),
+            // Per-key daily-quota walls (key fingerprint -> resets_at, learned
+            // reset samples); default `<data_dir>/llm-quota-state.json`, `off`
+            // keeps them in memory only. serve.sh reads the same file at boot.
+            llm_quota_state_path: env_path("AI_MEMORY_LLM_QUOTA_STATE_PATH"),
             // floo `state/finops/harness-presence.jsonl`: metered calls are
             // copied there so the charter's FinOps ledger sees them.
             finops_presence_path: env_path("AI_MEMORY_FINOPS_PRESENCE_PATH"),
@@ -1207,7 +1212,10 @@ impl Config {
     /// skipped with a warning naming the path only. Only providers
     /// authenticated by an API key can have extra lanes.
     #[must_use]
-    pub fn llm_extra_primary_configs(&self, primary: &ProviderConfig) -> Vec<(ProviderConfig, String)> {
+    pub fn llm_extra_primary_configs(
+        &self,
+        primary: &ProviderConfig,
+    ) -> Vec<(ProviderConfig, String)> {
         let primary_fp = self.primary_key_fingerprint(primary.provider);
         let mut seen: Vec<String> = primary_fp.into_iter().collect();
         let mut out = Vec::new();
@@ -1271,6 +1279,18 @@ impl Config {
             .map(str::to_string)
             .collect();
         Some((ai_memory_llm::JevCliGate::new(node, script), callers))
+    }
+
+    /// Per-key daily-quota walls (`AI_MEMORY_LLM_QUOTA_STATE_PATH`, default
+    /// `<data_dir>/llm-quota-state.json`, `off` = memory only). See
+    /// [`ai_memory_llm::quota`].
+    #[must_use]
+    pub fn llm_quota_book(&self) -> ai_memory_llm::QuotaBook {
+        match self.runtime_env.llm_quota_state_path.as_deref() {
+            Some(p) if p.as_os_str() == "off" => ai_memory_llm::QuotaBook::in_memory(),
+            Some(p) => ai_memory_llm::QuotaBook::load(p),
+            None => ai_memory_llm::QuotaBook::load(self.data_dir.join("llm-quota-state.json")),
+        }
     }
 
     /// The LLM call ledger configured by the environment. See

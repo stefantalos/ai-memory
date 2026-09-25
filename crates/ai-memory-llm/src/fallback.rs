@@ -38,7 +38,14 @@
 //!
 //! `Retry-After` is not honoured: [`LlmError::Provider`] carries only the
 //! status and body, so the header never reaches this layer. The cooldown is
-//! the fixed [`DEFAULT_COOLDOWN`] (or whatever the caller configures).
+//! the fixed [`DEFAULT_COOLDOWN`] (or whatever the caller configures) —
+//! except for a **daily-quota** `429` (body `usage limit exceeded`), which
+//! Poolside sends with no reset header at all. That wall is kept per key
+//! fingerprint in a [`QuotaBook`] until the key's estimated daily reset
+//! (learned from its own `429 → 200` brackets, else the 00:00Z rule Poolside's
+//! client assumes), survives restarts when the book has a file, and never
+//! touches the circuit: 5xx and zero-yield behave exactly as before. See
+//! [`crate::quota`].
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -53,6 +60,7 @@ use crate::ledger::{
 };
 use crate::metered_gate::{GateRequest, GateVerdict, MeteredGate};
 use crate::provider::LlmProvider;
+use crate::quota::{QuotaBlock, QuotaBook, is_daily_quota};
 use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 use crate::usage::{ReportedUsage, capture_usage, current_caller};
 
@@ -111,6 +119,14 @@ fn record_responder(lane: &Lane) {
 pub trait Clock: Send + Sync {
     /// Current instant.
     fn now(&self) -> Instant;
+
+    /// Wall-clock Unix seconds, for walls that must survive a restart and be
+    /// placed at a time of day (daily quota resets).
+    fn unix_now(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    }
 }
 
 /// The real clock.
@@ -154,6 +170,14 @@ impl Lane {
     pub fn label(&self) -> &str {
         &self.label
     }
+
+    /// Identity of the key behind this lane in the [`QuotaBook`]: the key
+    /// fingerprint — never the label, which follows boot order.
+    fn quota_key(&self) -> String {
+        self.key_fp
+            .clone()
+            .unwrap_or_else(|| format!("label:{}", self.label))
+    }
 }
 
 /// How a lane failure is treated.
@@ -161,6 +185,9 @@ impl Lane {
 enum FailureClass {
     /// `429`: quota / rate wall. Next lane, open this lane's circuit now.
     Quota,
+    /// `429` with `usage limit exceeded`: the key's daily quota. Next lane;
+    /// the key is walled until its estimated reset ([`crate::quota`]).
+    DailyQuota,
     /// `5xx` or transport timeout / connect: next lane, count toward the circuit.
     Server,
     /// Paid for, nothing usable (truncated or empty): next lane, count toward
@@ -172,6 +199,9 @@ enum FailureClass {
 
 fn classify(err: &LlmError) -> FailureClass {
     match err {
+        LlmError::Provider { status: 429, body } if is_daily_quota(body) => {
+            FailureClass::DailyQuota
+        }
         LlmError::Provider { status: 429, .. } => FailureClass::Quota,
         LlmError::Provider { status, .. } if (500..=599).contains(status) => FailureClass::Server,
         LlmError::Http(e) if e.is_timeout() || e.is_connect() => FailureClass::Server,
@@ -241,6 +271,7 @@ impl YieldCheck for serde_json::Value {
 /// Ordered lane chain with a breaker per lane. See module docs.
 pub struct FallbackProvider {
     lanes: Vec<LaneState>,
+    quota: Arc<QuotaBook>,
     cooldown: Duration,
     zero_yield_threshold: u32,
     clock: Arc<dyn Clock>,
@@ -271,6 +302,7 @@ impl FallbackProvider {
             .collect();
         Self {
             lanes,
+            quota: Arc::new(QuotaBook::in_memory()),
             cooldown: DEFAULT_COOLDOWN,
             zero_yield_threshold: ZERO_YIELD_THRESHOLD,
             clock: Arc::new(SystemClock),
@@ -287,6 +319,14 @@ impl FallbackProvider {
     pub fn with_metered_gate(mut self, gate: Arc<dyn MeteredGate>, callers: Vec<String>) -> Self {
         self.gate = Some(gate);
         self.gated_callers = callers;
+        self
+    }
+
+    /// Keep each key's daily-quota wall in `book` (load it from a file with
+    /// [`QuotaBook::load`] so the wall survives a restart).
+    #[must_use]
+    pub fn with_quota_book(mut self, book: Arc<QuotaBook>) -> Self {
+        self.quota = book;
         self
     }
 
@@ -335,6 +375,13 @@ impl FallbackProvider {
 
     /// Whether this lane should be skipped for this request.
     fn skipped(&self, state: &LaneState) -> bool {
+        let wall = self.clock.unix_now();
+        let walled = self
+            .quota
+            .with_key(&state.lane.quota_key(), |q| q.admit(wall));
+        if walled {
+            return true;
+        }
         let now = self.clock.now();
         let mut c = Self::lock(state);
         match c.open_until {
@@ -350,12 +397,64 @@ impl FallbackProvider {
         }
     }
 
-    fn on_success(state: &LaneState) {
-        let mut c = Self::lock(state);
-        *c = Circuit::default();
+    fn on_success(&self, state: &LaneState) {
+        {
+            let mut c = Self::lock(state);
+            *c = Circuit::default();
+        }
+        let wall = self.clock.unix_now();
+        self.quota
+            .with_key(&state.lane.quota_key(), |q| ((), q.on_success(wall)));
+    }
+
+    /// A daily-quota `429`: wall the key until its estimated reset. The
+    /// circuit is not touched.
+    fn on_daily_quota(&self, state: &LaneState) {
+        let wall = self.clock.unix_now();
+        let block: Option<QuotaBlock> = self.quota.with_key(&state.lane.quota_key(), |q| {
+            let b = q.on_quota(wall);
+            (b, b.is_some())
+        });
+        let Some(block) = block else {
+            return; // a straggler behind an existing wall
+        };
+        let lane = &state.lane;
+        let resets_at = unix_rfc3339(block.resets_at);
+        let cooldown_secs = u64::try_from(block.until - wall).unwrap_or(0);
+        tracing::warn!(
+            lane = %lane.label,
+            key_fp = lane.key_fp.as_deref().unwrap_or("-"),
+            provider = lane.provider.name(),
+            model = lane.provider.model(),
+            reason = "quota",
+            resets_at = %resets_at,
+            source = block.source.as_str(),
+            wall = ?block.kind,
+            cooldown_secs,
+            "ALARM: LLM lane paused until its daily quota resets",
+        );
+        if let Some(observer) = &self.observer {
+            observer.on_breaker_open(&BreakerEvent {
+                ts: now_rfc3339(),
+                kind: "breaker_open",
+                lane: lane.label.clone(),
+                provider: lane.provider.name().to_string(),
+                model: lane.provider.model().to_string(),
+                reason: "quota",
+                consecutive: 1,
+                cooldown_secs,
+                key_fp: lane.key_fp.clone(),
+                resets_at: Some(resets_at),
+                source: Some(block.source.as_str()),
+            });
+        }
     }
 
     fn on_failure(&self, state: &LaneState, class: FailureClass, input_fp: u64) {
+        if class == FailureClass::DailyQuota {
+            self.on_daily_quota(state);
+            return;
+        }
         let now = self.clock.now();
         let tripped: Option<(&'static str, u32)> = {
             let mut c = Self::lock(state);
@@ -379,7 +478,7 @@ impl FallbackProvider {
                     (was_half_open || c.consecutive_zero_yield >= self.zero_yield_threshold)
                         .then_some(("zero_yield", c.consecutive_zero_yield))
                 }
-                FailureClass::Fatal => None,
+                FailureClass::Fatal | FailureClass::DailyQuota => None,
             };
             if trip.is_some() {
                 c.open_until = Some(now + self.cooldown);
@@ -410,6 +509,9 @@ impl FallbackProvider {
                     reason,
                     consecutive,
                     cooldown_secs: self.cooldown.as_secs(),
+                    key_fp: lane.key_fp.clone(),
+                    resets_at: None,
+                    source: None,
                 });
             }
         }
@@ -535,7 +637,7 @@ impl FallbackProvider {
                     let empty = value.is_empty_yield();
                     self.observe_call(lane, outcome_label(&Ok(empty)), usage);
                     if !empty {
-                        Self::on_success(state);
+                        self.on_success(state);
                         return Ok(value);
                     }
                     self.on_failure(state, FailureClass::ZeroYield, input_fp);
@@ -595,6 +697,10 @@ impl FallbackProvider {
             ))
         }))
     }
+}
+
+fn unix_rfc3339(secs: i64) -> String {
+    jiff::Timestamp::from_second(secs).map_or_else(|_| secs.to_string(), |t| t.to_string())
 }
 
 /// Identity of a request for the zero-yield streak: system prompt and every
@@ -753,15 +859,33 @@ mod tests {
         }
     }
 
-    struct FakeClock(Mutex<Instant>);
+    /// 2026-09-24T00:00:00Z.
+    const MIDNIGHT: i64 = 1_790_208_000;
+
+    /// Monotonic and wall time, moved together.
+    struct FakeClock(Mutex<Instant>, Mutex<i64>);
     impl FakeClock {
+        fn new() -> Self {
+            Self::at(MIDNIGHT + 21 * 3600 + 23 * 60)
+        }
+        fn at(unix: i64) -> Self {
+            Self(Mutex::new(Instant::now()), Mutex::new(unix))
+        }
         fn advance(&self, d: Duration) {
             *self.0.lock().unwrap() += d;
+            *self.1.lock().unwrap() += i64::try_from(d.as_secs()).unwrap();
+        }
+        fn advance_to(&self, unix: i64) {
+            let now = *self.1.lock().unwrap();
+            self.advance(Duration::from_secs(u64::try_from(unix - now).unwrap()));
         }
     }
     impl Clock for FakeClock {
         fn now(&self) -> Instant {
             *self.0.lock().unwrap()
+        }
+        fn unix_now(&self) -> i64 {
+            *self.1.lock().unwrap()
         }
     }
 
@@ -785,7 +909,7 @@ mod tests {
         primary: &Arc<Scripted>,
         secondary: &Arc<Scripted>,
     ) -> (FallbackProvider, Arc<FakeClock>) {
-        let clock = Arc::new(FakeClock(Mutex::new(Instant::now())));
+        let clock = Arc::new(FakeClock::new());
         let p: Arc<dyn LlmProvider> = primary.clone();
         let s: Arc<dyn LlmProvider> = secondary.clone();
         let f = FallbackProvider::new(p, s)
@@ -1073,7 +1197,7 @@ mod tests {
         b: &Arc<Scripted>,
         g: &Arc<Scripted>,
     ) -> (FallbackProvider, Arc<FakeClock>, Arc<Recorder>) {
-        let clock = Arc::new(FakeClock(Mutex::new(Instant::now())));
+        let clock = Arc::new(FakeClock::new());
         let rec = Arc::new(Recorder::default());
         let (a, b, g): (
             Arc<dyn LlmProvider>,
@@ -1168,7 +1292,7 @@ mod tests {
             vec![Some(truncated()), Some(truncated()), Some(truncated())],
         );
         let (a, b) = (laguna(vec![]), laguna(vec![]));
-        let clock = Arc::new(FakeClock(Mutex::new(Instant::now())));
+        let clock = Arc::new(FakeClock::new());
         let rec = Arc::new(Recorder::default());
         let gd: Arc<dyn LlmProvider> = g.clone();
         let f = FallbackProvider::chain(Lane::new(gd, "gemini"), vec![])
@@ -1569,5 +1693,220 @@ mod tests {
         let (out, _) = crate::usage::with_caller("consolidate", call(&f)).await;
         assert!(out.is_ok());
         assert_eq!((gate.calls.load(Ordering::SeqCst), g.calls()), (0, 1));
+    }
+
+    // ── Daily quota: `429 usage limit exceeded` walls the KEY (by fingerprint)
+    // ── until its estimated reset, across restarts; nothing else changes.
+
+    fn daily_quota() -> LlmError {
+        LlmError::Provider {
+            status: 429,
+            body: r#"{"error":"usage limit exceeded"}"#.into(),
+        }
+    }
+
+    const H: i64 = 3600;
+    const MIN: i64 = 60;
+
+    fn two_keys(
+        order: &[(&Arc<Scripted>, &str, &str)],
+        clock: &Arc<FakeClock>,
+        book: Arc<crate::quota::QuotaBook>,
+        rec: &Arc<Recorder>,
+    ) -> FallbackProvider {
+        let mut lanes = order.iter().map(|(p, label, fp)| {
+            let p: Arc<dyn LlmProvider> = (*p).clone();
+            Lane::new(p, *label).with_key_fp(Some((*fp).to_string()))
+        });
+        let first = lanes.next().unwrap();
+        FallbackProvider::chain(first, lanes.collect())
+            .with_cooldown(Duration::from_secs(900))
+            .with_clock(clock.clone())
+            .with_observer(rec.clone())
+            .with_quota_book(book)
+    }
+
+    #[tokio::test]
+    async fn daily_quota_walls_the_key_until_the_reset_not_for_the_cooldown() {
+        // Key walled at 21:23Z, key answered earlier the same day.
+        let a = laguna(vec![None, Some(daily_quota())]);
+        let b = laguna(vec![]);
+        let clock = Arc::new(FakeClock::at(MIDNIGHT + 12 * H));
+        let rec = Arc::new(Recorder::default());
+        let book = Arc::new(crate::quota::QuotaBook::in_memory());
+        let f = two_keys(
+            &[(&a, "key-a", "aaaa0000"), (&b, "key-b", "bbbb1111")],
+            &clock,
+            book,
+            &rec,
+        );
+        call(&f).await.0.unwrap(); // key A answers at 12:00
+        clock.advance_to(MIDNIGHT + 21 * H + 23 * MIN);
+        let (out, who) = call(&f).await;
+        assert!(out.is_ok());
+        assert_eq!(who.unwrap().lane, "key-b");
+        assert_eq!(a.calls(), 2);
+        // Well past the 900 s cooldown, and at 23:59: still walled.
+        for t in [MIDNIGHT + 21 * H + 40 * MIN, MIDNIGHT + 23 * H + 59 * MIN] {
+            clock.advance_to(t);
+            call(&f).await.0.unwrap();
+            assert_eq!(a.calls(), 2, "walled key probed at {t}");
+        }
+        // Next boundary (00:00Z default) + margin: exactly one probe.
+        clock.advance_to(MIDNIGHT + 24 * H + crate::quota::RESET_MARGIN_SECS);
+        call(&f).await.0.unwrap();
+        assert_eq!(a.calls(), 3, "probed once after the reset");
+        let ev = rec.breakers.lock().unwrap();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].reason, "quota");
+        assert_eq!(ev[0].key_fp.as_deref(), Some("aaaa0000"));
+        assert_eq!(ev[0].source, Some("default"));
+        assert_eq!(ev[0].resets_at.as_deref(), Some("2026-09-25T00:00:00Z"));
+        assert_eq!(
+            ev[0].cooldown_secs,
+            u64::try_from(2 * H + 37 * MIN + crate::quota::RESET_MARGIN_SECS).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generic_429_keeps_the_fixed_cooldown() {
+        let a = laguna(vec![Some(status(429))]);
+        let b = laguna(vec![]);
+        let clock = Arc::new(FakeClock::new());
+        let rec = Arc::new(Recorder::default());
+        let book = Arc::new(crate::quota::QuotaBook::in_memory());
+        let f = two_keys(
+            &[(&a, "key-a", "aaaa0000"), (&b, "key-b", "bbbb1111")],
+            &clock,
+            book.clone(),
+            &rec,
+        );
+        call(&f).await.0.unwrap();
+        clock.advance(Duration::from_secs(901));
+        call(&f).await.0.unwrap();
+        assert_eq!(a.calls(), 2, "900 s later the key is probed again");
+        assert!(
+            book.get("aaaa0000")
+                .is_none_or(|q| q.blocked_until.is_none())
+        );
+        assert!(rec.breakers.lock().unwrap()[0].resets_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_boundary_probe_waits_a_short_window_not_fifteen_minutes() {
+        let a = laguna(vec![Some(daily_quota()), Some(daily_quota()), None]);
+        let b = laguna(vec![]);
+        let clock = Arc::new(FakeClock::at(MIDNIGHT - 50 * MIN)); // 23:10Z
+        let rec = Arc::new(Recorder::default());
+        let book = Arc::new(crate::quota::QuotaBook::in_memory());
+        let f = two_keys(
+            &[(&a, "key-a", "aaaa0000"), (&b, "key-b", "bbbb1111")],
+            &clock,
+            book.clone(),
+            &rec,
+        );
+        call(&f).await.0.unwrap(); // wall at 23:10
+        clock.advance_to(MIDNIGHT + crate::quota::RESET_MARGIN_SECS);
+        call(&f).await.0.unwrap(); // probe at 00:05 fails
+        assert_eq!(a.calls(), 2);
+        // 15 and 29 minutes later: no blind poll.
+        for m in [15, 29] {
+            clock.advance_to(MIDNIGHT + crate::quota::RESET_MARGIN_SECS + m * MIN);
+            call(&f).await.0.unwrap();
+            assert_eq!(a.calls(), 2, "polled {m} min after a failed boundary probe");
+        }
+        clock.advance_to(MIDNIGHT + crate::quota::RESET_MARGIN_SECS + 30 * MIN);
+        call(&f).await.0.unwrap(); // ladder probe answers
+        assert_eq!(a.calls(), 3);
+        let q = book.get("aaaa0000").unwrap();
+        assert_eq!(q.blocked_until, None, "the answer lifts the wall");
+        // (00:05, 00:35] brackets the reset: learned 00:20.
+        assert_eq!(q.reset_samples, vec![20 * MIN]);
+        let ev = rec.breakers.lock().unwrap();
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1].cooldown_secs, 30 * 60);
+    }
+
+    #[tokio::test]
+    async fn the_wall_survives_a_restart_and_follows_the_fingerprint_not_the_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("llm-quota-state.json");
+        let clock = Arc::new(FakeClock::new()); // 21:23Z
+        let x = laguna(vec![Some(daily_quota())]);
+        let y = laguna(vec![]);
+        {
+            let rec = Arc::new(Recorder::default());
+            let book = Arc::new(crate::quota::QuotaBook::load(&path));
+            let f = two_keys(
+                &[(&x, "key-a", "f6656650"), (&y, "key-b", "153b1d4d")],
+                &clock,
+                book,
+                &rec,
+            );
+            call(&f).await.0.unwrap();
+            assert_eq!((x.calls(), y.calls()), (1, 1));
+        }
+        // Restart an hour later; boot binds the OTHER key first, so labels swap.
+        clock.advance(Duration::from_secs(3600));
+        let rec = Arc::new(Recorder::default());
+        let book = Arc::new(crate::quota::QuotaBook::load(&path));
+        let f = two_keys(
+            &[(&y, "key-a", "153b1d4d"), (&x, "key-b", "f6656650")],
+            &clock,
+            book,
+            &rec,
+        );
+        let x_before = x.calls();
+        let (_, who) = call(&f).await;
+        assert_eq!(who.unwrap().lane, "key-a");
+        // Make key Y fail over so the walled key X would be next in line.
+        let y2 = laguna(vec![Some(status(500))]);
+        let f2 = two_keys(
+            &[(&y2, "key-a", "153b1d4d"), (&x, "key-b", "f6656650")],
+            &clock,
+            Arc::new(crate::quota::QuotaBook::load(&path)),
+            &rec,
+        );
+        let out = call(&f2).await.0;
+        assert!(matches!(out, Err(LlmError::Provider { status: 500, .. })));
+        assert_eq!(
+            x.calls(),
+            x_before,
+            "walled key X sent nothing after the restart"
+        );
+        let q = crate::quota::QuotaBook::load(&path).get("153b1d4d");
+        assert!(
+            q.is_none_or(|q| q.blocked_until.is_none()),
+            "key Y untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_daily_wall_on_one_key_leaves_the_other_key_and_the_circuit_alone() {
+        let a = laguna(vec![Some(daily_quota())]);
+        let b = laguna(vec![]);
+        let clock = Arc::new(FakeClock::new());
+        let rec = Arc::new(Recorder::default());
+        let book = Arc::new(crate::quota::QuotaBook::in_memory());
+        let f = two_keys(
+            &[(&a, "key-a", "aaaa0000"), (&b, "key-b", "bbbb1111")],
+            &clock,
+            book.clone(),
+            &rec,
+        );
+        call(&f).await.0.unwrap();
+        for _ in 0..3 {
+            call(&f).await.0.unwrap();
+        }
+        assert_eq!((a.calls(), b.calls()), (1, 4));
+        assert!(
+            book.get("bbbb1111")
+                .is_none_or(|q| q.blocked_until.is_none())
+        );
+        assert!(circuit_closed(&f, 0));
+    }
+
+    fn circuit_closed(f: &FallbackProvider, lane: usize) -> bool {
+        FallbackProvider::lock(&f.lanes[lane]).open_until.is_none()
     }
 }

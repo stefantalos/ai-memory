@@ -43,22 +43,23 @@ pub mod embedding;
 pub mod error;
 pub mod factory;
 pub mod fallback;
-pub mod ledger;
-pub mod metered_gate;
-pub mod usage;
 pub mod gemini;
 pub mod google;
 pub mod health;
+pub mod ledger;
 #[cfg(feature = "local-embeddings")]
 pub mod local;
+pub mod metered_gate;
 pub mod oidc;
 pub mod openai;
 pub mod openai_compat;
 pub mod openai_oauth;
 pub mod opencode;
 pub mod provider;
+pub mod quota;
 pub mod reranker;
 pub mod types;
+pub mod usage;
 
 mod auth_file;
 mod response;
@@ -81,21 +82,20 @@ pub use factory::{
     default_embedding_dim, try_default_embedding_dim,
 };
 pub use fallback::{
-    CIRCUIT_5XX_THRESHOLD, Clock, DEFAULT_COOLDOWN, FallbackProvider, Lane, Responder,
-    SystemClock, ZERO_YIELD_THRESHOLD, capture_responder,
+    CIRCUIT_5XX_THRESHOLD, Clock, DEFAULT_COOLDOWN, FallbackProvider, Lane, Responder, SystemClock,
+    ZERO_YIELD_THRESHOLD, capture_responder,
 };
-pub use ledger::{
-    BreakerEvent, CallRecord, JsonlLedger, LaneObserver, METERED_FUNDING_TYPE, key_fingerprint,
-};
-pub use metered_gate::{GateRequest, GateVerdict, JevCliGate, MONEY_THRESHOLD, MeteredGate};
-pub use usage::{ReportedUsage, capture_usage, current_caller, with_caller};
 pub use gemini::{GEMINI_25_FLASH_MAX_OUTPUT_TOKENS, GeminiProvider, model_max_output_tokens};
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{
     ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot,
 };
+pub use ledger::{
+    BreakerEvent, CallRecord, JsonlLedger, LaneObserver, METERED_FUNDING_TYPE, key_fingerprint,
+};
 #[cfg(feature = "local-embeddings")]
 pub use local::{LOCAL_DIM, LOCAL_MODEL, LocalEmbedder, fetch_model, model_present};
+pub use metered_gate::{GateRequest, GateVerdict, JevCliGate, MONEY_THRESHOLD, MeteredGate};
 pub use oidc::{
     DeviceAuthorizationResponse, OIDC_DEFAULT_SCOPE, OidcDiscovery, OidcExtras, OidcToken,
     OidcTokenResponse, PollOutcome, discover, poll_token_once, refresh_access_token,
@@ -110,8 +110,10 @@ pub use openai_oauth::{
 };
 pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
 pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
+pub use quota::{QuotaBook, QuotaSource, is_daily_quota};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
 pub use stored_token::StoredOAuthToken;
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, LlmOperationId, ReasoningEffort, Role, Usage,
 };
+pub use usage::{ReportedUsage, capture_usage, current_caller, with_caller};
