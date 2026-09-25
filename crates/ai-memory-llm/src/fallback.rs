@@ -402,6 +402,13 @@ impl FallbackProvider {
             let mut c = Self::lock(state);
             *c = Circuit::default();
         }
+        self.quota_answered(state);
+    }
+
+    /// The key answered with a `200` (even a truncated, empty or unparsable
+    /// one): its daily quota is back. Tells the quota book only — the
+    /// circuit keeps judging the answer itself.
+    fn quota_answered(&self, state: &LaneState) {
         let wall = self.clock.unix_now();
         self.quota
             .with_key(&state.lane.quota_key(), |q| ((), q.on_success(wall)));
@@ -640,6 +647,7 @@ impl FallbackProvider {
                         self.on_success(state);
                         return Ok(value);
                     }
+                    self.quota_answered(state);
                     self.on_failure(state, FailureClass::ZeroYield, input_fp);
                     if is_last {
                         return Ok(value);
@@ -649,6 +657,14 @@ impl FallbackProvider {
                 Err(err) => {
                     self.observe_call(lane, outcome_label(&Err(&err)), usage);
                     let class = classify(&err);
+                    // Truncated / empty / schema / serde: the provider
+                    // answered 200, so the key has quota again.
+                    if class == FailureClass::ZeroYield
+                        || (class == FailureClass::Fatal
+                            && !matches!(err, LlmError::Provider { .. } | LlmError::Http(_)))
+                    {
+                        self.quota_answered(state);
+                    }
                     self.on_failure(state, class, input_fp);
                     if class == FailureClass::Fatal {
                         return Err(err);
@@ -792,6 +808,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    const EMPTY_OK: &str = "__empty_ok__";
+
     /// A fake whose structured answer is scripted per call; `None` = success.
     struct Scripted {
         name: &'static str,
@@ -829,6 +847,8 @@ mod tests {
                 errs.remove(0)
             };
             match e {
+                // Sentinel: a 200 whose structured answer is empty.
+                Some(LlmError::EmptyResponse(m)) if m == EMPTY_OK => Ok(serde_json::json!({})),
                 Some(e) => Err(e),
                 None => Ok(serde_json::json!({ "answered_by": self.name })),
             }
@@ -1912,5 +1932,51 @@ mod tests {
 
     fn circuit_closed(f: &FallbackProvider, lane: usize) -> bool {
         FallbackProvider::lock(&f.lanes[lane]).open_until.is_none()
+    }
+
+    #[tokio::test]
+    async fn a_truncated_probe_answer_still_lifts_the_daily_wall() {
+        let a = laguna(vec![Some(daily_quota()), Some(truncated()), None]);
+        let b = laguna(vec![]);
+        let clock = Arc::new(FakeClock::at(MIDNIGHT - 2 * H));
+        let rec = Arc::new(Recorder::default());
+        let book = Arc::new(crate::quota::QuotaBook::in_memory());
+        let f = two_keys(
+            &[(&a, "key-a", "aaaa0000"), (&b, "key-b", "bbbb1111")],
+            &clock,
+            book.clone(),
+            &rec,
+        );
+        call(&f).await.0.unwrap(); // wall
+        clock.advance_to(MIDNIGHT + crate::quota::RESET_MARGIN_SECS);
+        call(&f).await.0.unwrap(); // probe answers 200 but truncated
+        assert_eq!(a.calls(), 2);
+        clock.advance(Duration::from_secs(10));
+        call(&f).await.0.unwrap();
+        assert_eq!(a.calls(), 3, "a 200 of any shape ends the quota wall");
+        assert_eq!(book.get("aaaa0000").unwrap().blocked_until, None);
+    }
+
+    #[tokio::test]
+    async fn an_empty_probe_answer_still_lifts_the_daily_wall() {
+        let empty = LlmError::EmptyResponse(EMPTY_OK.into());
+        let a = laguna(vec![Some(daily_quota()), Some(empty), None]);
+        let b = laguna(vec![]);
+        let clock = Arc::new(FakeClock::at(MIDNIGHT - 2 * H));
+        let rec = Arc::new(Recorder::default());
+        let book = Arc::new(crate::quota::QuotaBook::in_memory());
+        let f = two_keys(
+            &[(&a, "key-a", "aaaa0000"), (&b, "key-b", "bbbb1111")],
+            &clock,
+            book.clone(),
+            &rec,
+        );
+        call(&f).await.0.unwrap();
+        clock.advance_to(MIDNIGHT + crate::quota::RESET_MARGIN_SECS);
+        call(&f).await.0.unwrap(); // probe: 200 with an empty answer
+        assert_eq!(a.calls(), 2);
+        clock.advance(Duration::from_secs(10));
+        call(&f).await.0.unwrap();
+        assert_eq!(a.calls(), 3, "an empty 200 ends the quota wall too");
     }
 }
