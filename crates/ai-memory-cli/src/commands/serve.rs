@@ -2016,7 +2016,7 @@ fn with_runtime_fallback(
     info!(
         path = ?quota.path(),
         "LLM daily-quota walls kept per key fingerprint (429 usage limit exceeded waits for the \
-         key's estimated reset, default 00:00Z, instead of the fixed cooldown)",
+         key's estimated reset, default 00:45Z, instead of the fixed cooldown)",
     );
     let mut chain = ai_memory_llm::FallbackProvider::chain(first, rest)
         .with_observer(Arc::new(config.llm_ledger()))

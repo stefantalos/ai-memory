@@ -10,10 +10,14 @@
 //! limit resets in %d hour%s` from a function (0x100bb4650 in the 2026-08-22
 //! build) that matches the body on `usage limit exceeded` and computes
 //! `24 - (unix_seconds mod 86400) / 3600` in UTC: it *assumes* a reset at
-//! 00:00Z. That assumption is the [`QuotaSource::Default`] here, and it is
-//! only an assumption — the only evidence is what a key does around it. Every
-//! time a walled key answers again shortly after a quota `429`, the pair brackets
-//! the real reset; those brackets are the [`QuotaSource::Learned`] estimate.
+//! 00:00Z. That assumption is wrong. Measured on one key (fp f6656650):
+//! 2026-09-24 it was still walled at 00:11Z and answered by 01:05Z;
+//! 2026-09-25 it was walled at 23:57, 00:00:41, 00:20 and 00:35Z and answered
+//! at 00:50Z. So the reset lies in (00:35Z, 00:50Z] — N=2 nights, one key —
+//! and [`DEFAULT_RESET_SECOND_OF_DAY`] is 00:45Z, the
+//! [`QuotaSource::Default`]. It stays an estimate: every time a walled key
+//! answers again shortly after a quota `429`, the pair brackets the real
+//! reset, and those brackets are the per-key [`QuotaSource::Learned`] estimate.
 //!
 //! The policy, per key:
 //!
@@ -44,9 +48,10 @@ use serde::{Deserialize, Serialize};
 pub const DAY_SECS: i64 = 86_400;
 
 /// The reset second-of-day (UTC) assumed until a key has learned its own:
-/// 00:00Z, the rule Poolside's own client computes its "resets in N hours"
-/// message from. See the module docs.
-pub const DEFAULT_RESET_SECOND_OF_DAY: i64 = 0;
+/// 00:45Z, inside the measured bracket (00:35Z, 00:50Z] (N=2, see the module
+/// docs). Not 00:00Z: that is only what Poolside's client assumes, and four
+/// probes after midnight were still walled.
+pub const DEFAULT_RESET_SECOND_OF_DAY: i64 = 45 * 60;
 
 /// Waited past an estimated boundary before the probe, so the probe does not
 /// land a moment before the reset.
@@ -375,13 +380,17 @@ mod tests {
     use super::*;
 
     /// 2026-09-24T00:00:00Z.
-    const MIDNIGHT: i64 = 1_790_208_000;
+    const DAY0: i64 = 1_790_208_000;
+    /// 2026-09-24's default reset instant (00:45Z). The tests below are
+    /// written relative to it, so they hold for any default.
+    const MIDNIGHT: i64 = DAY0 + DEFAULT_RESET_SECOND_OF_DAY;
     const H: i64 = 3600;
     const M: i64 = 60;
 
     #[test]
     fn midnight_constant_is_a_utc_midnight() {
-        assert_eq!(MIDNIGHT.rem_euclid(DAY_SECS), 0);
+        assert_eq!(DAY0.rem_euclid(DAY_SECS), 0);
+        assert_eq!(MIDNIGHT.rem_euclid(DAY_SECS), DEFAULT_RESET_SECOND_OF_DAY);
     }
 
     #[test]
@@ -479,8 +488,11 @@ mod tests {
         q.blocked_until = Some(MIDNIGHT + 3 * M);
         assert_eq!(q.admit(MIDNIGHT + 3 * M), (false, true));
         assert!(q.on_success(MIDNIGHT + 3 * M));
-        assert_eq!(q.reset_samples, vec![0]);
-        assert_eq!(q.estimate(), (0, QuotaSource::Learned));
+        assert_eq!(q.reset_samples, vec![DEFAULT_RESET_SECOND_OF_DAY]);
+        assert_eq!(
+            q.estimate(),
+            (DEFAULT_RESET_SECOND_OF_DAY, QuotaSource::Learned)
+        );
         assert_eq!(q.blocked_until, None);
     }
 
@@ -504,7 +516,7 @@ mod tests {
         };
         let b = q.on_quota(MIDNIGHT + 22 * H).unwrap();
         assert_eq!(b.source, QuotaSource::Learned);
-        assert_eq!(b.resets_at, MIDNIGHT + DAY_SECS + 25 * M);
+        assert_eq!(b.resets_at, DAY0 + DAY_SECS + 25 * M);
     }
 
     #[test]

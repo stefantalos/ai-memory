@@ -859,8 +859,9 @@ mod tests {
         }
     }
 
-    /// 2026-09-24T00:00:00Z.
-    const MIDNIGHT: i64 = 1_790_208_000;
+    /// 2026-09-24's default daily-quota reset instant (00:45Z); the quota
+    /// tests are written relative to it.
+    const MIDNIGHT: i64 = 1_790_208_000 + crate::quota::DEFAULT_RESET_SECOND_OF_DAY;
 
     /// Monotonic and wall time, moved together.
     struct FakeClock(Mutex<Instant>, Mutex<i64>);
@@ -1761,7 +1762,7 @@ mod tests {
         assert_eq!(ev[0].reason, "quota");
         assert_eq!(ev[0].key_fp.as_deref(), Some("aaaa0000"));
         assert_eq!(ev[0].source, Some("default"));
-        assert_eq!(ev[0].resets_at.as_deref(), Some("2026-09-25T00:00:00Z"));
+        assert_eq!(ev[0].resets_at.as_deref(), Some("2026-09-25T00:45:00Z"));
         assert_eq!(
             ev[0].cooldown_secs,
             u64::try_from(2 * H + 37 * MIN + crate::quota::RESET_MARGIN_SECS).unwrap()
@@ -1820,8 +1821,11 @@ mod tests {
         assert_eq!(a.calls(), 3);
         let q = book.get("aaaa0000").unwrap();
         assert_eq!(q.blocked_until, None, "the answer lifts the wall");
-        // (00:05, 00:35] brackets the reset: learned 00:20.
-        assert_eq!(q.reset_samples, vec![20 * MIN]);
+        // (boundary+5, boundary+35] brackets the reset: learned boundary+20.
+        assert_eq!(
+            q.reset_samples,
+            vec![crate::quota::DEFAULT_RESET_SECOND_OF_DAY + 20 * MIN]
+        );
         let ev = rec.breakers.lock().unwrap();
         assert_eq!(ev.len(), 2);
         assert_eq!(ev[1].cooldown_secs, 30 * 60);
