@@ -81,7 +81,7 @@ pub struct OpenAiCompatProvider {
     /// 4 misses (21:14Z, 9,798 output) and was cut in the other 3 (~16.6k
     /// output each). The trade: the next attempt is a forced call at 0.7
     /// (0 of 4 cut on the same input), and a rescue still cost up to 14k.
-    stricter_retry_on_shape_fault: bool,
+    tool_text_fallback: bool,
 }
 
 /// Output ceiling for Poolside/Laguna (operator ruling 2026-09-23). Laguna S 2.1
@@ -143,7 +143,7 @@ impl OpenAiCompatProvider {
             structured_via_tool,
             max_output_cap: structured_via_tool.then_some(POOLSIDE_MAX_OUTPUT_TOKENS),
             temperature_override: structured_via_tool.then_some(POOLSIDE_TEMPERATURE),
-            stricter_retry_on_shape_fault: true,
+            tool_text_fallback: !structured_via_tool,
         })
     }
 
@@ -180,8 +180,8 @@ impl OpenAiCompatProvider {
     /// Whether a forced-tool reply without a usable call is retried as a
     /// plain text call (default: off for `poolside/*`, on otherwise).
     #[must_use]
-    pub fn with_stricter_retry_on_shape_fault(mut self, fallback: bool) -> Self {
-        self.stricter_retry_on_shape_fault = fallback;
+    pub fn with_tool_text_fallback(mut self, fallback: bool) -> Self {
+        self.tool_text_fallback = fallback;
         self
     }
 
@@ -315,15 +315,8 @@ impl OpenAiCompatProvider {
                 .await
             {
                 Ok(v) => return Ok(v),
-                Err(err) if is_parse_shape_error(&err) && self.stricter_retry_on_shape_fault => {
-                    debug!(error = %err, "compat forced-tool: no usable tool call, retrying with stricter instruction");
-                    let mut strict_request = request.clone();
-                    let old_sys = strict_request.system.unwrap_or_default();
-                    strict_request.system = Some(format!("{old_sys}\n\nCRITICAL: You MUST call the provided tool to submit your answer. Do NOT return prose."));
-                    return self
-                        .inner
-                        .complete_structured_via_tool(&strict_request, schema, operation_id)
-                        .await;
+                Err(err) if is_parse_shape_error(&err) && self.tool_text_fallback => {
+                    debug!(error = %err, "compat forced-tool: no usable tool call, falling back to tolerant parser");
                 }
                 Err(err) => return Err(err),
             }
@@ -449,7 +442,7 @@ fn is_response_format_rejection(err: &LlmError) -> bool {
 /// either truncates the object early or never closes it. This
 /// version tracks whether we're inside a `"..."` literal and
 /// honours backslash escapes the JSON spec defines.
-pub(crate) fn first_json_object(s: &str) -> Option<&str> {
+fn first_json_object(s: &str) -> Option<&str> {
     let start = s.find('{')?;
     let mut depth = 0_i32;
     let mut in_string = false;
@@ -594,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn first_json_object_finds_balanced_object() {
+    fn first_json_object_finds_balanced_object() {
         assert_eq!(first_json_object("noise {\"k\":1} more"), Some("{\"k\":1}"));
         assert_eq!(
             first_json_object("text {\"a\":{\"b\":2}} trailing"),
