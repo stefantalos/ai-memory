@@ -60,9 +60,56 @@ pub fn published_price(provider: &str, model: &str) -> Option<Price> {
 }
 
 /// Whether calls to this provider are billed per token.
+///
+/// Every provider that authenticates with a pay-per-token API key is metered.
+/// `openai-compat` is judged per lane by [`lane_kind`], since the same wire
+/// format reaches both a free Laguna key and a metered gateway.
 #[must_use]
 pub fn is_metered(provider: &str) -> bool {
-    provider == "gemini"
+    matches!(provider, "gemini" | "openai" | "anthropic" | "opencode")
+}
+
+/// What a lane costs, judged from its provider, model and endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneKind {
+    /// `poolside/*` on inference.poolside.ai: the two Laguna keys. No
+    /// per-token charge is made by ai-memory's calls (funding model of the
+    /// developer preview itself is unverified, CLAUDE.md §2.5).
+    Laguna,
+    /// `openai-oauth`: the ChatGPT Business seat through the Codex backend.
+    /// Subscription flat — allocation, not money.
+    CodexSeat,
+    /// Anything else: metered or unknown. Not allowed in the zero-metered
+    /// chain.
+    Other,
+}
+
+impl LaneKind {
+    /// Whether this lane may sit in the zero-metered chain.
+    #[must_use]
+    pub const fn is_zero_metered(self) -> bool {
+        matches!(self, Self::Laguna | Self::CodexSeat)
+    }
+}
+
+/// Classify a lane. `endpoint` is the provider's base URL when it has one.
+#[must_use]
+pub fn lane_kind(provider: &str, model: &str, endpoint: Option<&str>) -> LaneKind {
+    let model = model.to_ascii_lowercase();
+    match provider {
+        "openai-oauth" => LaneKind::CodexSeat,
+        "openai-compat"
+            if model.starts_with("poolside/")
+                && endpoint.is_some_and(|e| {
+                    let e = e.to_ascii_lowercase();
+                    e.starts_with("https://inference.poolside.ai/")
+                        || e == "https://inference.poolside.ai"
+                }) =>
+        {
+            LaneKind::Laguna
+        }
+        _ => LaneKind::Other,
+    }
 }
 
 /// Funding label for a provider/model, as recorded in the ledger.
@@ -70,12 +117,24 @@ pub fn is_metered(provider: &str) -> bool {
 pub fn funding_for(provider: &str, model: &str) -> &'static str {
     if is_metered(provider) {
         METERED_FUNDING_TYPE
+    } else if provider == "openai-oauth" {
+        "ChatGPT Business seat (subscription flat; allocation, not money)"
     } else if model.to_ascii_lowercase().starts_with("poolside/") {
         // CLAUDE.md §2.5: Poolside's funding model is UNVERIFIED.
         "Poolside developer preview (funding unverified)"
     } else {
         "unclassified"
     }
+}
+
+/// Cost to book for one call: the list-price estimate for a metered model,
+/// `0.0` for a lane with no per-token charge, `None` when unknown.
+#[must_use]
+pub fn call_cost(provider: &str, model: &str, endpoint: Option<&str>, input: u32, output: u32) -> Option<f64> {
+    if lane_kind(provider, model, endpoint).is_zero_metered() {
+        return Some(0.0);
+    }
+    estimate_cost(provider, model, input, output)
 }
 
 /// `sha256(key)[..8]` in hex — how a key is named in any record.
@@ -138,15 +197,6 @@ pub struct BreakerEvent {
     pub consecutive: u32,
     /// Seconds the lane stays paused before a half-open probe.
     pub cooldown_secs: u64,
-    /// Fingerprint of the lane's key (never the key).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key_fp: Option<String>,
-    /// Daily quota wall: the estimated reset instant (RFC 3339).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resets_at: Option<String>,
-    /// Daily quota wall: where `resets_at` comes from (`learned` / `default`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<&'static str>,
 }
 
 /// Receives call records and breaker events.
@@ -171,6 +221,41 @@ pub fn now_rfc3339() -> String {
     jiff::Timestamp::now().to_string()
 }
 
+/// Call rows booked for `lane` in the JSONL ledger at `path` whose timestamp
+/// is at or after `since_unix`, excluding requests a cap refused (`capped`:
+/// nothing was sent). A missing or unreadable ledger counts zero.
+#[must_use]
+pub fn count_lane_calls_since(path: &std::path::Path, lane: &str, since_unix: i64) -> u32 {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let mut n = 0_u32;
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        if !line.contains(lane) {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if row.get("kind").and_then(|v| v.as_str()) != Some("call")
+            || row.get("lane").and_then(|v| v.as_str()) != Some(lane)
+            || row.get("outcome").and_then(|v| v.as_str()) == Some("capped")
+        {
+            continue;
+        }
+        let at = row
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .and_then(|ts| ts.parse::<jiff::Timestamp>().ok())
+            .map(jiff::Timestamp::as_second);
+        if at.is_some_and(|at| at >= since_unix) {
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
 /// Appends records as JSON lines. See module docs.
 #[derive(Debug, Default)]
 pub struct JsonlLedger {
@@ -189,6 +274,12 @@ impl JsonlLedger {
             calls_path,
             ..Self::default()
         }
+    }
+
+    /// Where every call row is appended, when enabled.
+    #[must_use]
+    pub fn calls_path(&self) -> Option<&std::path::Path> {
+        self.calls_path.as_deref()
     }
 
     /// Also copy metered calls into a floo `harness-presence.jsonl`, booked
@@ -265,7 +356,7 @@ impl LaneObserver for JsonlLedger {
             self.append(path, &serde_json::json!(event));
         }
         if let Some(path) = &self.alarm_path {
-            let mut row = serde_json::json!({
+            let row = serde_json::json!({
                 "ts": event.ts,
                 "actionable": true,
                 "source": "ai-memory-llm",
@@ -278,23 +369,6 @@ impl LaneObserver for JsonlLedger {
                     event.consecutive, event.reason
                 ),
             });
-            if let Some(resets_at) = &event.resets_at {
-                row["resets_at"] = serde_json::json!(resets_at);
-                row["source"] = serde_json::json!(event.source);
-                row["key_fp"] = serde_json::json!(event.key_fp);
-                row["recommended_action"] = serde_json::json!(format!(
-                    "ai-memory paused LLM lane {} (key {}, {}/{}): daily quota exhausted \
-                     (429 usage limit exceeded). Requests go to the next lane; one probe \
-                     after {}s, reset estimated at {} (source: {}).",
-                    event.lane,
-                    event.key_fp.as_deref().unwrap_or("-"),
-                    event.provider,
-                    event.model,
-                    event.cooldown_secs,
-                    resets_at,
-                    event.source.unwrap_or("default"),
-                ));
-            }
             self.append(path, &row);
         }
     }
@@ -361,49 +435,5 @@ mod tests {
         assert_eq!(row["fundingType"], METERED_FUNDING_TYPE);
         assert_eq!(row["entity"], "Personal");
         assert_eq!(row["taskId"], "ai-memory:auto_improve");
-    }
-
-    fn breaker(resets_at: Option<&str>) -> BreakerEvent {
-        BreakerEvent {
-            ts: "2026-09-24T21:23:22Z".into(),
-            kind: "breaker_open",
-            lane: "key-b".into(),
-            provider: "openai-compat".into(),
-            model: "poolside/laguna-s-2.1".into(),
-            reason: "quota",
-            consecutive: 1,
-            cooldown_secs: 9_700,
-            key_fp: Some("f6656650".into()),
-            resets_at: resets_at.map(str::to_string),
-            source: resets_at.map(|_| "default"),
-        }
-    }
-
-    #[test]
-    fn a_daily_quota_alarm_carries_resets_at_source_and_key_fp() {
-        let dir = tempfile::tempdir().unwrap();
-        let bus = dir.path().join("bus.jsonl");
-        let ledger = JsonlLedger::new(None).with_alarm(Some(bus.clone()));
-        ledger.on_breaker_open(&breaker(Some("2026-09-25T00:00:00Z")));
-        ledger.on_breaker_open(&breaker(None));
-        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&bus)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-        assert_eq!(rows[0]["reason"], "llm-lane-paused:key-b:quota");
-        assert_eq!(rows[0]["resets_at"], "2026-09-25T00:00:00Z");
-        assert_eq!(rows[0]["source"], "default");
-        assert_eq!(rows[0]["key_fp"], "f6656650");
-        assert!(
-            rows[0]["recommended_action"]
-                .as_str()
-                .unwrap()
-                .contains("2026-09-25T00:00:00Z")
-        );
-        assert!(
-            rows[1].get("resets_at").is_none(),
-            "a plain breaker alarm is unchanged"
-        );
     }
 }

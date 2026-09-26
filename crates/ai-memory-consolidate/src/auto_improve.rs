@@ -1124,14 +1124,15 @@ fn build_prompt_input(
     let projected_observations = project_observations(
         observations,
         &ObservationProjectionConfig::new(
-            observation_budget,
+            observation_budget.saturating_sub(ai_memory_llm::CHUNKABLE_MARKER_CHARS),
             selected_limit,
             MAX_OBSERVATION_BODY_CHARS,
         )
         .with_context_label("auto-improve"),
     );
     warnings.extend(projected_observations.warnings.iter().cloned());
-    let rendered_observations = projected_observations.text;
+    // Marked so a small-budget lane may map-reduce it (Laguna contract).
+    let rendered_observations = ai_memory_llm::mark_chunkable(&projected_observations.text);
     let selected_count = projected_observations.selected_count;
     let patchable_text = &patchable.text;
 

@@ -49,11 +49,21 @@ pub enum LlmError {
     #[error("empty response: {0}")]
     EmptyResponse(String),
 
-    /// The value gate (Jev) declined — or could not judge — a request bound
-    /// for a metered lane, and no free lane answered. Nothing was paid for;
-    /// the request waits for a free lane.
-    #[error("metered lane declined by value gate: {0}")]
-    MeteredDeclined(String),
+    /// A flat-rate lane's per-day allocation is used up and no lane before it
+    /// answered. Nothing was sent; the request waits for the allocation to
+    /// reset. Not a session failure: callers defer the work to `resets_at_unix`
+    /// without spending a retry attempt.
+    #[error("flat lane {lane} daily allocation used ({used}/{cap}); resets at unix {resets_at_unix}")]
+    AllocationExhausted {
+        /// Lane label (`codex-oauth`).
+        lane: String,
+        /// Requests admitted today.
+        used: u32,
+        /// Requests allowed per UTC day.
+        cap: u32,
+        /// Unix second of the next reset (00:00 UTC).
+        resets_at_unix: i64,
+    },
 
     /// Every configured LLM lane is paused by its circuit breaker. No
     /// request was sent; the lane, not the request, is unavailable.

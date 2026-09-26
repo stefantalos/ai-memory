@@ -937,14 +937,16 @@ fn build_batch_request_with_slots(
     let projected = project_observations(
         observations,
         &ObservationProjectionConfig::new(
-            observation_chars,
+            observation_chars.saturating_sub(ai_memory_llm::CHUNKABLE_MARKER_CHARS),
             MAX_PROJECTED_OBSERVATIONS,
             MAX_PROJECTED_OBSERVATION_BODY_CHARS,
         )
         .with_context_label("batch consolidation"),
     );
     let mut buf = prefix;
-    buf.push_str(&projected.text);
+    // The observation log is the part a small-budget lane may read in
+    // pieces (the Laguna contract map-reduces it above 12k tokens).
+    buf.push_str(&ai_memory_llm::mark_chunkable(&projected.text));
     buf.push_str(&suffix);
 
     ChatRequest {
@@ -1014,14 +1016,16 @@ fn build_request(
     let projected = project_observations(
         observations,
         &ObservationProjectionConfig::new(
-            observation_chars,
+            observation_chars.saturating_sub(ai_memory_llm::CHUNKABLE_MARKER_CHARS),
             MAX_PROJECTED_OBSERVATIONS,
             MAX_PROJECTED_OBSERVATION_BODY_CHARS,
         )
         .with_context_label("single-page consolidation"),
     );
     let mut buf = prefix;
-    buf.push_str(&projected.text);
+    // The observation log is the part a small-budget lane may read in
+    // pieces (the Laguna contract map-reduces it above 12k tokens).
+    buf.push_str(&ai_memory_llm::mark_chunkable(&projected.text));
     buf.push_str(&suffix);
 
     ChatRequest {

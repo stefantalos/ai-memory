@@ -39,6 +39,26 @@ pub const DEFAULT_WORKSPACE: &str = ai_memory_core::DEFAULT_WORKSPACE_NAME;
 /// Defensive project fallback used only when no cwd/project is available.
 pub const DEFAULT_PROJECT: &str = ai_memory_core::DEFAULT_PROJECT_NAME;
 
+/// Model the flat fallback lane asks for unless
+/// `AI_MEMORY_FLAT_FALLBACK_MODEL` names another: the Codex CLI's own default
+/// on the Floor No 8 SRL seat (`~/.codex/config.toml`, read 2026-09-26).
+pub const FLAT_FALLBACK_DEFAULT_MODEL: &str = "gpt-6-astra";
+
+/// Resolved settings of the flat fallback lane ([`Config::flat_fallback_settings`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlatFallbackSettings {
+    /// The Codex CLI's `auth.json` (read-only).
+    pub auth_file: PathBuf,
+    /// Model id sent to the Codex Responses backend.
+    pub model: String,
+    /// Requests admitted per UTC day.
+    pub daily_max_requests: u32,
+    /// Reasoning effort for this lane: modest, never the CLI's own setting.
+    pub reasoning_effort: ai_memory_llm::ReasoningEffort,
+    /// Per-request timeout.
+    pub timeout_secs: u64,
+}
+
 /// Config-file representation of retention settings.
 ///
 /// The breadth coefficient lives here rather than expanding the public
@@ -341,19 +361,15 @@ pub struct RuntimeEnv {
     gemini_api_key: Option<SecretString>,
     llm_api_key: Option<SecretString>,
     llm_base_url: Option<String>,
-    llm_fallback_provider: Option<String>,
-    llm_fallback_model: Option<String>,
-    llm_fallback_base_url: Option<String>,
-    llm_fallback_api_key_file: Option<PathBuf>,
+    flat_fallback: Option<String>,
+    flat_fallback_auth_file: Option<PathBuf>,
+    flat_fallback_model: Option<String>,
+    flat_fallback_daily_max_requests: Option<String>,
     llm_extra_api_key_files: Vec<PathBuf>,
     llm_ledger_path: Option<PathBuf>,
-    llm_quota_state_path: Option<PathBuf>,
     finops_presence_path: Option<PathBuf>,
     metered_entity: Option<String>,
     llm_alarm_path: Option<PathBuf>,
-    metered_gate_jev_script: Option<PathBuf>,
-    metered_gate_node: Option<PathBuf>,
-    metered_gate_callers: Option<String>,
     embedding_api_key: Option<SecretString>,
     copilot_github_token: Option<SecretString>,
     github_copilot_api_token: Option<SecretString>,
@@ -377,6 +393,11 @@ impl RuntimeEnv {
             llm_ledger_path: Some(ledger),
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_home_for_test(&mut self, home: &std::path::Path) {
+        self.home_dir = Some(home.display().to_string());
     }
 
     fn from_process() -> Self {
@@ -407,13 +428,16 @@ impl RuntimeEnv {
             gemini_api_key: env_secret("GEMINI_API_KEY").or_else(|| env_secret("GOOGLE_API_KEY")),
             llm_api_key: env_secret("LLM_API_KEY"),
             llm_base_url: env_string("LLM_BASE_URL"),
-            // Runtime fallback lane (FN8-8120). Deliberately its own names:
-            // the fallback never inherits the primary's LLM_BASE_URL or
-            // LLM_API_KEY, and its key is read from a file, not the env.
-            llm_fallback_provider: env_string("AI_MEMORY_LLM_FALLBACK_PROVIDER"),
-            llm_fallback_model: env_string("AI_MEMORY_LLM_FALLBACK_MODEL"),
-            llm_fallback_base_url: env_string("AI_MEMORY_LLM_FALLBACK_BASE_URL"),
-            llm_fallback_api_key_file: env_path("AI_MEMORY_LLM_FALLBACK_API_KEY_FILE"),
+            // The flat fallback lane (FN8-9336): the ChatGPT seat the Codex
+            // CLI is signed in with, read-only from its auth.json. On by
+            // default when that file exists; `AI_MEMORY_FLAT_FALLBACK=off`
+            // removes it. Capped per UTC day in requests.
+            flat_fallback: env_string("AI_MEMORY_FLAT_FALLBACK"),
+            flat_fallback_auth_file: env_path("AI_MEMORY_FLAT_FALLBACK_AUTH_FILE"),
+            flat_fallback_model: env_string("AI_MEMORY_FLAT_FALLBACK_MODEL"),
+            flat_fallback_daily_max_requests: env_string(
+                "AI_MEMORY_FLAT_FALLBACK_DAILY_MAX_REQUESTS",
+            ),
             // Further keys for the PRIMARY provider (e.g. a second Poolside
             // account), colon-separated FILE PATHS: each becomes its own lane
             // ahead of the fallback, with its own breaker.
@@ -429,22 +453,12 @@ impl RuntimeEnv {
             // Call ledger (every lane call, key named by fingerprint only);
             // default `<data_dir>/llm-calls.jsonl`, `off` disables it.
             llm_ledger_path: env_path("AI_MEMORY_LLM_LEDGER_PATH"),
-            // Per-key daily-quota walls (key fingerprint -> resets_at, learned
-            // reset samples); default `<data_dir>/llm-quota-state.json`, `off`
-            // keeps them in memory only. serve.sh reads the same file at boot.
-            llm_quota_state_path: env_path("AI_MEMORY_LLM_QUOTA_STATE_PATH"),
             // floo `state/finops/harness-presence.jsonl`: metered calls are
             // copied there so the charter's FinOps ledger sees them.
             finops_presence_path: env_path("AI_MEMORY_FINOPS_PRESENCE_PATH"),
             metered_entity: env_string("AI_MEMORY_METERED_ENTITY"),
             // Actionable bus for breaker alarms (chyros shape).
             llm_alarm_path: env_path("AI_MEMORY_LLM_ALARM_PATH"),
-            // Jev value gate in front of metered lanes (operator decision
-            // 2026-09-24): the floo Jev CLI, the node that runs it, and the
-            // callers it gates (default auto_improve,experience).
-            metered_gate_jev_script: env_path("AI_MEMORY_METERED_GATE_JEV_SCRIPT"),
-            metered_gate_node: env_path("AI_MEMORY_METERED_GATE_NODE"),
-            metered_gate_callers: env_string("AI_MEMORY_METERED_GATE_CALLERS"),
             // The embedding counterpart of LLM_API_KEY: it credentials the
             // embedding role alone, so the embedder can target a different
             // provider than the chat model instead of borrowing its key.
@@ -1142,66 +1156,60 @@ impl Config {
         }))
     }
 
-    /// Build the runtime fallback LLM provider settings (FN8-8120), if one is
-    /// configured via `AI_MEMORY_LLM_FALLBACK_PROVIDER`.
+    /// The flat fallback lane (FN8-9336): the ChatGPT seat through the Codex
+    /// CLI's own sign-in, or `None` when it is switched off
+    /// (`AI_MEMORY_FLAT_FALLBACK=off`) or the CLI's `auth.json` is absent.
     ///
-    /// The fallback is resolved in isolation from the primary: its base URL
-    /// comes only from `AI_MEMORY_LLM_FALLBACK_BASE_URL` (never `LLM_BASE_URL`),
-    /// and its key from `AI_MEMORY_LLM_FALLBACK_API_KEY_FILE` when set — so an
-    /// openai-compat fallback cannot silently borrow the primary's key. Without
-    /// a key file the provider's standard env var is used.
-    ///
-    /// A key file that cannot be read disables the fallback with a warning
-    /// instead of failing startup: an optional secondary must never take down
-    /// the primary lane. A misspelt provider or a missing openai-compat model
-    /// is an operator error and still fails loudly.
-    ///
-    /// # Errors
-    /// Returns [`LlmError::NotConfigured`] for an unknown provider or a
-    /// provider that needs an explicit model.
-    pub fn llm_fallback_provider_config(&self) -> LlmResult<Option<ProviderConfig>> {
+    /// Defaults, used whenever the env is unset: auth file
+    /// `$HOME/.codex/auth.json`, model [`FLAT_FALLBACK_DEFAULT_MODEL`], cap
+    /// [`ai_memory_llm::DEFAULT_FLAT_DAILY_MAX_REQUESTS`] requests per UTC day.
+    /// A cap that does not parse keeps the default: a typo never raises it.
+    #[must_use]
+    pub fn flat_fallback_settings(&self) -> Option<FlatFallbackSettings> {
         let env = &self.runtime_env;
-        let Some(provider_raw) = non_empty(env.llm_fallback_provider.as_deref()) else {
-            return Ok(None);
+        match non_empty(env.flat_fallback.as_deref()).map(str::to_ascii_lowercase) {
+            None => {}
+            Some(v) if v == "codex-oauth" || v == "on" || v == "1" || v == "true" => {}
+            Some(v) if v == "off" || v == "0" || v == "false" || v == "none" => return None,
+            Some(other) => {
+                tracing::warn!(
+                    value = %other,
+                    "AI_MEMORY_FLAT_FALLBACK not recognised (codex-oauth|off); flat lane disabled"
+                );
+                return None;
+            }
+        }
+        let auth_file = env.flat_fallback_auth_file.clone().or_else(|| {
+            non_empty(env.home_dir.as_deref()).map(|h| PathBuf::from(h).join(".codex/auth.json"))
+        })?;
+        if !auth_file.is_file() {
+            tracing::info!(
+                path = %auth_file.display(),
+                "no Codex CLI sign-in found; flat fallback lane not configured"
+            );
+            return None;
+        }
+        let default_cap = ai_memory_llm::DEFAULT_FLAT_DAILY_MAX_REQUESTS;
+        let daily_max_requests = match non_empty(env.flat_fallback_daily_max_requests.as_deref()) {
+            None => default_cap,
+            Some(raw) => raw.trim().parse::<u32>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    value = raw,
+                    default = default_cap,
+                    "AI_MEMORY_FLAT_FALLBACK_DAILY_MAX_REQUESTS is not a number; default kept"
+                );
+                default_cap
+            }),
         };
-        let provider = parse_provider_choice(provider_raw, "AI_MEMORY_LLM_FALLBACK_PROVIDER")?;
-        let model = resolve_llm_model(
-            provider,
-            env.llm_fallback_model.as_deref(),
-            "AI_MEMORY_LLM_FALLBACK_MODEL",
-        )?;
-        let key_override = match env.llm_fallback_api_key_file.as_deref() {
-            None => None,
-            Some(path) => match std::fs::read_to_string(path) {
-                Ok(raw) if !raw.trim().is_empty() => {
-                    Some(SecretString::from(raw.trim().to_string()))
-                }
-                Ok(_) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "AI_MEMORY_LLM_FALLBACK_API_KEY_FILE is empty; runtime LLM fallback disabled"
-                    );
-                    return Ok(None);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "AI_MEMORY_LLM_FALLBACK_API_KEY_FILE unreadable; runtime LLM fallback disabled"
-                    );
-                    return Ok(None);
-                }
-            },
-        };
-        Ok(Some(ProviderConfig {
-            provider,
-            model,
-            auth: self.provider_auth(provider, key_override),
-            base_url: env.llm_fallback_base_url.clone(),
-            compat_strict: self.llm_compat_strict,
-            request_timeout_secs: self.llm_timeout_secs,
-            reasoning_effort: self.llm_reasoning_effort,
-        }))
+        Some(FlatFallbackSettings {
+            auth_file,
+            model: non_empty(env.flat_fallback_model.as_deref())
+                .unwrap_or(FLAT_FALLBACK_DEFAULT_MODEL)
+                .to_string(),
+            daily_max_requests,
+            reasoning_effort: ai_memory_llm::ReasoningEffort::Low,
+            timeout_secs: self.llm_timeout_secs,
+        })
     }
 
     /// Extra lanes for the PRIMARY provider: one [`ProviderConfig`] per
@@ -1212,10 +1220,7 @@ impl Config {
     /// skipped with a warning naming the path only. Only providers
     /// authenticated by an API key can have extra lanes.
     #[must_use]
-    pub fn llm_extra_primary_configs(
-        &self,
-        primary: &ProviderConfig,
-    ) -> Vec<(ProviderConfig, String)> {
+    pub fn llm_extra_primary_configs(&self, primary: &ProviderConfig) -> Vec<(ProviderConfig, String)> {
         let primary_fp = self.primary_key_fingerprint(primary.provider);
         let mut seen: Vec<String> = primary_fp.into_iter().collect();
         let mut out = Vec::new();
@@ -1249,48 +1254,6 @@ impl Config {
     pub fn primary_key_fingerprint(&self, provider: ProviderChoice) -> Option<String> {
         self.provider_api_key(provider)
             .map(|k| ai_memory_llm::key_fingerprint(k.expose_secret()))
-    }
-
-    /// Fingerprint of the fallback lane's key file, if one is configured.
-    #[must_use]
-    pub fn fallback_key_fingerprint(&self) -> Option<String> {
-        let path = self.runtime_env.llm_fallback_api_key_file.as_deref()?;
-        let raw = std::fs::read_to_string(path).ok()?;
-        (!raw.trim().is_empty()).then(|| ai_memory_llm::key_fingerprint(&raw))
-    }
-
-    /// The Jev value gate for metered lanes, when configured, with the
-    /// callers it applies to.
-    #[must_use]
-    pub fn metered_gate(&self) -> Option<(ai_memory_llm::JevCliGate, Vec<String>)> {
-        let env = &self.runtime_env;
-        let script = env.metered_gate_jev_script.clone()?;
-        let node = env
-            .metered_gate_node
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("/usr/local/bin/node"));
-        let callers = env
-            .metered_gate_callers
-            .as_deref()
-            .unwrap_or("auto_improve,experience")
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
-        Some((ai_memory_llm::JevCliGate::new(node, script), callers))
-    }
-
-    /// Per-key daily-quota walls (`AI_MEMORY_LLM_QUOTA_STATE_PATH`, default
-    /// `<data_dir>/llm-quota-state.json`, `off` = memory only). See
-    /// [`ai_memory_llm::quota`].
-    #[must_use]
-    pub fn llm_quota_book(&self) -> ai_memory_llm::QuotaBook {
-        match self.runtime_env.llm_quota_state_path.as_deref() {
-            Some(p) if p.as_os_str() == "off" => ai_memory_llm::QuotaBook::in_memory(),
-            Some(p) => ai_memory_llm::QuotaBook::load(p),
-            None => ai_memory_llm::QuotaBook::load(self.data_dir.join("llm-quota-state.json")),
-        }
     }
 
     /// The LLM call ledger configured by the environment. See
@@ -2676,76 +2639,59 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_fallback_provider_means_no_fallback() {
-        let cfg = primary_poolside(RuntimeEnv::default());
-        assert!(cfg.llm_fallback_provider_config().unwrap().is_none());
+    fn codex_home(tmp: &TempDir) -> String {
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::fs::write(tmp.path().join(".codex/auth.json"), "{\"tokens\":{}}").unwrap();
+        tmp.path().display().to_string()
     }
 
+    /// (g) With no flat-fallback env at all, the lane is the Codex CLI's own
+    /// sign-in under $HOME, capped at 40 requests a day.
     #[test]
-    fn fallback_reads_key_file_and_never_inherits_the_primary_base_url() {
-        let tmp = TempDir::new().unwrap();
-        let key_file = tmp.path().join("gemini-api-key");
-        std::fs::write(&key_file, "fallback-key\n").unwrap();
-        let cfg = primary_poolside(RuntimeEnv {
-            llm_fallback_provider: Some("gemini".into()),
-            llm_fallback_model: Some("gemini-2.5-flash".into()),
-            llm_fallback_api_key_file: Some(key_file),
-            ..RuntimeEnv::default()
-        });
-        let fb = cfg.llm_fallback_provider_config().unwrap().unwrap();
-        assert_eq!(fb.provider, ProviderChoice::Gemini);
-        assert_eq!(fb.model, "gemini-2.5-flash");
-        assert_eq!(fb.base_url, None, "LLM_BASE_URL belongs to the primary");
-        assert_eq!(
-            fb.auth.require_api_key().unwrap().expose_secret(),
-            "fallback-key"
-        );
-    }
-
-    #[test]
-    fn openai_compat_fallback_does_not_borrow_the_primary_key() {
-        let tmp = TempDir::new().unwrap();
-        let key_file = tmp.path().join("k");
-        std::fs::write(&key_file, "own-key").unwrap();
-        let cfg = primary_poolside(RuntimeEnv {
-            llm_fallback_provider: Some("openai-compat".into()),
-            llm_fallback_model: Some("other".into()),
-            llm_fallback_base_url: Some("https://example.invalid/v1".into()),
-            llm_fallback_api_key_file: Some(key_file),
-            ..RuntimeEnv::default()
-        });
-        let fb = cfg.llm_fallback_provider_config().unwrap().unwrap();
-        assert_eq!(fb.base_url.as_deref(), Some("https://example.invalid/v1"));
-        assert_eq!(
-            fb.auth.optional_api_key().unwrap().expose_secret(),
-            "own-key"
-        );
-    }
-
-    #[test]
-    fn unreadable_fallback_key_file_disables_only_the_fallback() {
+    fn flat_fallback_defaults_apply_when_the_env_is_unset() {
         let tmp = TempDir::new().unwrap();
         let cfg = primary_poolside(RuntimeEnv {
-            llm_fallback_provider: Some("gemini".into()),
-            llm_fallback_api_key_file: Some(tmp.path().join("missing")),
+            home_dir: Some(codex_home(&tmp)),
             ..RuntimeEnv::default()
         });
-        assert!(cfg.llm_fallback_provider_config().unwrap().is_none());
-        assert!(cfg.llm_provider_config().unwrap().is_some());
+        let flat = cfg.flat_fallback_settings().expect("on by default");
+        assert_eq!(flat.auth_file, tmp.path().join(".codex/auth.json"));
+        assert_eq!(flat.daily_max_requests, 40);
+        assert_eq!(flat.model, FLAT_FALLBACK_DEFAULT_MODEL);
+        assert_eq!(flat.reasoning_effort, ai_memory_llm::ReasoningEffort::Low);
     }
 
     #[test]
-    fn unknown_fallback_provider_fails_loudly() {
+    fn flat_fallback_is_absent_without_a_codex_sign_in_or_when_off() {
+        let tmp = TempDir::new().unwrap();
         let cfg = primary_poolside(RuntimeEnv {
-            llm_fallback_provider: Some("gemnii".into()),
+            home_dir: Some(tmp.path().display().to_string()),
             ..RuntimeEnv::default()
         });
-        let err = cfg.llm_fallback_provider_config().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("AI_MEMORY_LLM_FALLBACK_PROVIDER=gemnii")
-        );
+        assert!(cfg.flat_fallback_settings().is_none(), "no auth.json");
+        let cfg = primary_poolside(RuntimeEnv {
+            home_dir: Some(codex_home(&tmp)),
+            flat_fallback: Some("off".into()),
+            ..RuntimeEnv::default()
+        });
+        assert!(cfg.flat_fallback_settings().is_none(), "switched off");
+    }
+
+    #[test]
+    fn a_cap_that_does_not_parse_keeps_the_default() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = primary_poolside(RuntimeEnv {
+            home_dir: Some(codex_home(&tmp)),
+            flat_fallback_daily_max_requests: Some("forty".into()),
+            ..RuntimeEnv::default()
+        });
+        assert_eq!(cfg.flat_fallback_settings().unwrap().daily_max_requests, 40);
+        let cfg = primary_poolside(RuntimeEnv {
+            home_dir: Some(codex_home(&tmp)),
+            flat_fallback_daily_max_requests: Some("12".into()),
+            ..RuntimeEnv::default()
+        });
+        assert_eq!(cfg.flat_fallback_settings().unwrap().daily_max_requests, 12);
     }
 
     #[test]

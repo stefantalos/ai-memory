@@ -587,6 +587,20 @@ fn session_consolidation_retry_delay(attempt: u32) -> Duration {
 /// the heuristic page stays.
 const SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS: u32 = 2;
 
+/// When a failure is "no lane could take it" rather than a session failure:
+/// the flat lane's daily allocation is used and nothing before it answered.
+/// Returns the Unix-microsecond time to try again (the reset), or `None`.
+fn session_consolidation_deferral(
+    error: &ai_memory_consolidate::ConsolidatorError,
+) -> Option<i64> {
+    match error {
+        ai_memory_consolidate::ConsolidatorError::Llm(
+            ai_memory_llm::LlmError::AllocationExhausted { resets_at_unix, .. },
+        ) => Some(resets_at_unix.saturating_mul(1_000_000)),
+        _ => None,
+    }
+}
+
 /// When to retry a failed SessionEnd consolidation, or `None` to park it.
 fn session_consolidation_retry_at(
     attempts: u32,
@@ -684,6 +698,27 @@ async fn run_session_consolidation_worker(
                     "SessionEnd consolidation succeeded but queue completion failed",
                 ),
             },
+            Err(error) if session_consolidation_deferral(&error).is_some() => {
+                let until = session_consolidation_deferral(&error).unwrap_or_default();
+                match writer
+                    .defer_session_consolidation(job, until, error.to_string())
+                    .await
+                {
+                    Ok(()) => tracing::warn!(
+                        %error,
+                        session = %session_id,
+                        generation,
+                        "SessionEnd LLM consolidation deferred to the flat lane's reset \
+                         (no-LLM page stays until then; no attempt spent)",
+                    ),
+                    Err(store_error) => tracing::warn!(
+                        error = %store_error,
+                        session = %session_id,
+                        generation,
+                        "failed to defer SessionEnd consolidation",
+                    ),
+                }
+            }
             Err(error) => {
                 let retry_at = session_consolidation_retry_at(
                     attempts,
@@ -1972,19 +2007,72 @@ fn start_watcher(args: &ServeArgs, wiki: &Wiki) -> Result<Option<WatcherHandle>>
     Ok(Some(WatcherHandle::start(wiki.clone())?))
 }
 
-/// Build the runtime lane chain around the primary LLM (FN8-8120).
+/// The flat ChatGPT-seat lane (FN8-9336), when configured: the Codex CLI's
+/// own sign-in, read-only, capped per UTC day. The cap is seeded from today's
+/// rows in the call ledger so a restart does not hand out a fresh allocation.
+fn flat_fallback_lane(config: &Config) -> Option<ai_memory_llm::Lane> {
+    let flat = config.flat_fallback_settings()?;
+    let provider = match ai_memory_llm::OpenAiOAuthProvider::from_codex_cli_auth(
+        flat.auth_file.clone(),
+        flat.model.clone(),
+    ) {
+        Ok(p) => p
+            .with_timeout_secs(flat.timeout_secs)
+            .with_reasoning_effort(Some(flat.reasoning_effort)),
+        Err(error) => {
+            tracing::warn!(%error, "flat fallback lane unavailable; chain continues without it");
+            return None;
+        }
+    };
+    let label = "codex-oauth";
+    let used_today = config.llm_ledger().calls_path().map_or(0, |path| {
+        ai_memory_llm::count_lane_calls_since(
+            path,
+            label,
+            ai_memory_llm::utc_day_start(jiff::Timestamp::now().as_second()),
+        )
+    });
+    info!(
+        lane = label,
+        model = %flat.model,
+        daily_max_requests = flat.daily_max_requests,
+        used_today,
+        "flat fallback lane: ChatGPT seat via the Codex CLI sign-in (read-only), capped per UTC day",
+    );
+    Some(
+        ai_memory_llm::Lane::new(Arc::new(provider), label).with_daily_cap(
+            ai_memory_llm::DailyCap::with_wall_clock(
+                flat.daily_max_requests,
+                Arc::new(ai_memory_llm::SystemWallClock),
+                used_today,
+            ),
+        ),
+    )
+}
+
+/// Build the zero-metered lane chain (FN8-9336) around the primary LLM.
 ///
-/// Lanes, in order: the primary (key A), one lane per extra primary key
-/// (`AI_MEMORY_LLM_EXTRA_API_KEY_FILES`, e.g. Poolside key B), then the
-/// fallback provider (`AI_MEMORY_LLM_FALLBACK_PROVIDER`, e.g. Gemini). The
-/// chain is built even for a single lane so every call reaches the ledger and
-/// every lane — the last one included — has a breaker that a run of
-/// truncated/empty answers can open.
+/// Lanes, in order: the primary (key A); one lane per extra primary key
+/// (`AI_MEMORY_LLM_EXTRA_API_KEY_FILES`, e.g. Laguna key B), tried only after a
+/// *transport* failure of the lanes before it; then the flat ChatGPT-seat lane
+/// ([`flat_fallback_lane`]); then nothing — the caller's no-LLM path. No
+/// pay-per-token provider is added here, and a lane that is not zero-metered
+/// raises an alarm at start. The chain is built even for a single lane so
+/// every call reaches the ledger.
 fn with_runtime_fallback(
     config: &Config,
     primary_cfg: &ai_memory_llm::ProviderConfig,
     primary: Arc<dyn ai_memory_llm::LlmProvider>,
 ) -> Result<Arc<dyn ai_memory_llm::LlmProvider>> {
+    Ok(finish_chain(config, lane_chain(config, primary_cfg, primary)?))
+}
+
+/// The lanes of [`with_runtime_fallback`], before the ledger is attached.
+fn lane_chain(
+    config: &Config,
+    primary_cfg: &ai_memory_llm::ProviderConfig,
+    primary: Arc<dyn ai_memory_llm::LlmProvider>,
+) -> Result<ai_memory_llm::FallbackProvider> {
     let extras = config.llm_extra_primary_configs(primary_cfg);
     let primary_label = if extras.is_empty() {
         primary.name().to_string()
@@ -1995,54 +2083,43 @@ fn with_runtime_fallback(
         .with_key_fp(config.primary_key_fingerprint(primary_cfg.provider));
     let mut rest = Vec::new();
     for (i, (cfg, fp)) in extras.into_iter().enumerate() {
-        let label = format!(
-            "key-{}",
-            char::from(b'b' + u8::try_from(i.min(24)).unwrap_or(24))
-        );
+        let label = format!("key-{}", char::from(b'b' + u8::try_from(i.min(24)).unwrap_or(24)));
         let provider =
             build_provider(cfg).context("building extra-key LLM provider from config")?;
-        rest.push(ai_memory_llm::Lane::new(provider, label).with_key_fp(Some(fp)));
-    }
-    if let Some(fallback_cfg) = config.llm_fallback_provider_config()? {
-        let secondary =
-            build_provider(fallback_cfg).context("building fallback LLM provider from config")?;
-        let label = secondary.name().to_string();
         rest.push(
-            ai_memory_llm::Lane::new(secondary, label)
-                .with_key_fp(config.fallback_key_fingerprint()),
+            ai_memory_llm::Lane::new(provider, label)
+                .with_key_fp(Some(fp))
+                .transport_only(),
         );
     }
-    let quota = Arc::new(config.llm_quota_book());
-    info!(
-        path = ?quota.path(),
-        "LLM daily-quota walls kept per key fingerprint (429 usage limit exceeded waits for the \
-         key's estimated reset, default 00:45Z, instead of the fixed cooldown)",
-    );
-    let mut chain = ai_memory_llm::FallbackProvider::chain(first, rest)
-        .with_observer(Arc::new(config.llm_ledger()))
-        .with_quota_book(quota);
-    if let Some((gate, callers)) = config.metered_gate() {
-        info!(
-            callers = ?callers,
-            threshold = ai_memory_llm::MONEY_THRESHOLD,
-            "Jev value gate armed: metered lanes need every atomic judgement at or above the \
-             threshold; a decline or an unavailable judge keeps the request off the metered lane",
+    rest.extend(flat_fallback_lane(config));
+    Ok(ai_memory_llm::FallbackProvider::chain(first, rest))
+}
+
+fn finish_chain(
+    config: &Config,
+    chain: ai_memory_llm::FallbackProvider,
+) -> Arc<dyn ai_memory_llm::LlmProvider> {
+    let chain = chain.with_observer(Arc::new(config.llm_ledger()));
+    let not_zero_metered = chain.non_zero_metered_lanes();
+    if !not_zero_metered.is_empty() {
+        tracing::error!(
+            lanes = ?not_zero_metered,
+            "ALARM: LLM lane chain holds lanes that are not zero-metered (FN8-9336)",
         );
-        chain = chain.with_metered_gate(Arc::new(gate), callers);
     }
     info!(
         lanes = ?chain.lane_labels(),
         cooldown_secs = ai_memory_llm::DEFAULT_COOLDOWN.as_secs(),
-        zero_yield_threshold = ai_memory_llm::ZERO_YIELD_THRESHOLD,
-        "LLM lane chain: 429/5xx/timeout/truncated/empty on a lane retries on the next; \
-         each lane has its own breaker",
+        "LLM lane chain: 429/5xx/timeout moves to the next lane; a loop, cut or bad answer skips \
+         transport-only lanes; the flat lane is capped per UTC day; each lane has its own breaker",
     );
-    Ok(Arc::new(chain))
+    Arc::new(chain)
 }
 
 fn configure_consolidator(
     config: &Config,
-    mut server: AiMemoryServer,
+    server: AiMemoryServer,
     store: &Store,
     wiki: &Wiki,
     workspace_id: WorkspaceId,
@@ -2058,6 +2135,30 @@ fn configure_consolidator(
     // the hook router (for PreCompact checkpointing), and the admin
     // router (for `POST /admin/bootstrap`).
     let Some(cfg) = config.llm_provider_config()? else {
+        // No Laguna key bound (both withheld by the provider gate at boot, or
+        // none configured): the flat seat alone still consolidates.
+        if let Some(lane) = flat_fallback_lane(config) {
+            info!("AI_MEMORY_LLM_PROVIDER unset; the flat ChatGPT-seat lane is the only LLM lane");
+            let llm = finish_chain(config, ai_memory_llm::FallbackProvider::chain(lane, Vec::new()));
+            let llm = provider_health.wrap_llm_provider(
+                llm,
+                "openai-oauth".to_string(),
+                config
+                    .flat_fallback_settings()
+                    .map_or_else(String::new, |f| f.model),
+                None,
+            );
+            return Ok(finish_consolidator_setup(
+                config,
+                server,
+                store,
+                wiki,
+                workspace_id,
+                project_id,
+                llm,
+                want_reranker,
+            ));
+        }
         info!(
             "AI_MEMORY_LLM_PROVIDER unset; memory_consolidate disabled, PreCompact \
              falls back to rule-based checkpoint, lint runs rule-based only"
@@ -2084,6 +2185,29 @@ fn configure_consolidator(
     // Health wraps the composite: ProviderHealth has one LLM role, and the
     // configured label stays the primary's.
     let llm = provider_health.wrap_llm_provider(llm, provider_name, model, Some(retry_hint));
+    Ok(finish_consolidator_setup(
+        config,
+        server,
+        store,
+        wiki,
+        workspace_id,
+        project_id,
+        llm,
+        want_reranker,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_consolidator_setup(
+    config: &Config,
+    mut server: AiMemoryServer,
+    store: &Store,
+    wiki: &Wiki,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    llm: Arc<dyn ai_memory_llm::LlmProvider>,
+    want_reranker: bool,
+) -> ConsolidatorSetup {
     info!(
         provider = llm.name(),
         model = llm.model(),
@@ -2119,11 +2243,11 @@ fn configure_consolidator(
         );
         server = server.with_reranker(Arc::new(ai_memory_llm::LlmReranker::new(llm.clone())));
     }
-    Ok(ConsolidatorSetup {
+    ConsolidatorSetup {
         server,
         consolidator: Some(consolidator),
         admin_llm: Some(llm),
-    })
+    }
 }
 
 /// Validate a list of CORS origins before the server binds.
@@ -2246,6 +2370,29 @@ fn host_without_port(host: &str) -> &str {
 mod tests {
     use super::*;
 
+    /// (e) An exhausted flat allocation defers the job to the reset instead of
+    /// spending the retry budget; any other failure does not.
+    #[test]
+    fn an_exhausted_allocation_defers_to_the_reset() {
+        let exhausted = ai_memory_consolidate::ConsolidatorError::Llm(
+            ai_memory_llm::LlmError::AllocationExhausted {
+                lane: "codex-oauth".into(),
+                used: 40,
+                cap: 40,
+                resets_at_unix: 1_790_467_200,
+            },
+        );
+        assert_eq!(
+            session_consolidation_deferral(&exhausted),
+            Some(1_790_467_200_000_000)
+        );
+        let cut = ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Truncated {
+            finish_reason: "repetition".into(),
+            partial: None,
+        });
+        assert_eq!(session_consolidation_deferral(&cut), None);
+    }
+
     /// A persistent cut is parked after SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS;
     /// any other failure keeps the full budget and backoff.
     #[test]
@@ -2291,44 +2438,6 @@ mod tests {
                 now
             ),
             None
-        );
-    }
-
-    /// Measured 2026-09-24: SessionEnd consolidation of c6ce4735 was cut at
-    /// the output ceiling at 21:23, 21:29 and 21:35 and paused the only live
-    /// Laguna key. A session must be parked before its own cuts could reach
-    /// the lane's zero-yield threshold, and the lane chain now counts one
-    /// input once and reports a cut (not MeteredDeclined) when the metered
-    /// lane declines after it (ai-memory-llm fallback tests).
-    #[test]
-    fn a_session_is_parked_before_its_cuts_could_pause_a_lane() {
-        const {
-            assert!(
-                SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS < ai_memory_llm::ZERO_YIELD_THRESHOLD
-            );
-        }
-        let cut =
-            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Truncated {
-                finish_reason: "length".into(),
-                partial: None,
-            });
-        let now = 0_i64;
-        let mut attempts = 0;
-        while session_consolidation_retry_at(attempts + 1, &cut, now).is_some() {
-            attempts += 1;
-        }
-        assert_eq!(attempts + 1, SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS);
-        let declined = ai_memory_consolidate::ConsolidatorError::Llm(
-            ai_memory_llm::LlmError::MeteredDeclined("future_need 0.77 < 0.9".into()),
-        );
-        assert!(
-            session_consolidation_retry_at(
-                SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS,
-                &declined,
-                now
-            )
-            .is_some(),
-            "a decline with no cut behind it (quota wall) keeps waiting for a free lane"
         );
     }
 
@@ -4281,5 +4390,44 @@ mod tests {
         assert!(ledger.contains(&ai_memory_llm::key_fingerprint(KEY_A)));
         assert!(ledger.contains(&ai_memory_llm::key_fingerprint(KEY_B)));
         assert!(!ledger.contains(KEY_A) && !ledger.contains(KEY_B));
+    }
+
+    /// (f) The chain the default configuration builds — Laguna key A, key B,
+    /// the Codex CLI seat — holds no lane that is not zero-metered, and the
+    /// same builder pointed at a metered gateway is flagged.
+    #[test]
+    fn the_default_chain_holds_only_zero_metered_lanes() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::fs::write(
+            tmp.path().join(".codex/auth.json"),
+            r#"{"tokens":{"access_token":"a.e30.s","refresh_token":"r","account_id":"x"}}"#,
+        )
+        .unwrap();
+        let key_b = tmp.path().join("key-b");
+        std::fs::write(&key_b, "second-key\n").unwrap();
+        let build = |base: &str| {
+            let mut env = crate::config::RuntimeEnv::for_lane_test(
+                "first-key",
+                vec![key_b.clone()],
+                tmp.path().join("calls.jsonl"),
+            );
+            env.set_home_for_test(tmp.path());
+            let config = Config {
+                llm_provider: Some("openai-compat".into()),
+                llm_model: Some("poolside/laguna-s-2.1".into()),
+                llm_base_url: Some(base.into()),
+                runtime_env: env,
+                ..Config::default()
+            };
+            let cfg = config.llm_provider_config().unwrap().unwrap();
+            let primary = build_provider(cfg.clone()).unwrap();
+            lane_chain(&config, &cfg, primary).unwrap()
+        };
+        let chain = build("https://inference.poolside.ai/v1");
+        assert_eq!(chain.lane_labels(), vec!["key-a", "key-b", "codex-oauth"]);
+        assert!(chain.non_zero_metered_lanes().is_empty(), "{:?}", chain.lane_kinds());
+        let chain = build("https://openrouter.ai/api/v1");
+        assert_eq!(chain.non_zero_metered_lanes(), vec!["key-a", "key-b"]);
     }
 }

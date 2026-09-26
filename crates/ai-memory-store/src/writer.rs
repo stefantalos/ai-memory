@@ -190,6 +190,12 @@ pub(crate) enum WriteCmd {
         job: SessionConsolidationJob,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    DeferSessionConsolidation {
+        job: SessionConsolidationJob,
+        until: i64,
+        reason: String,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     InsertHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
@@ -1048,6 +1054,30 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ReleaseSessionConsolidation { job, reply: tx })
             .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Put an in-flight SessionEnd consolidation back in the queue until
+    /// `until` (Unix microseconds) without spending an attempt: the LLM lanes
+    /// were unavailable (a flat lane's daily allocation used), which says
+    /// nothing about the session.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn defer_session_consolidation(
+        &self,
+        job: SessionConsolidationJob,
+        until: i64,
+        reason: String,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::DeferSessionConsolidation {
+            job,
+            until,
+            reason,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -2675,6 +2705,16 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::ReleaseSessionConsolidation { job, reply } => {
                 let result = crate::session_consolidation::release(&mut conn, &job);
                 send_or_warn(reply, result, "release_session_consolidation");
+            }
+            WriteCmd::DeferSessionConsolidation {
+                job,
+                until,
+                reason,
+                reply,
+            } => {
+                let result =
+                    crate::session_consolidation::defer(&mut conn, &job, until, &reason);
+                send_or_warn(reply, result, "defer_session_consolidation");
             }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);

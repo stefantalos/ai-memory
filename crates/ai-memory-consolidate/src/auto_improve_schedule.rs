@@ -459,7 +459,7 @@ fn classify_scheduled_failure(e: &anyhow::Error) -> SchedulerFailureKind {
     match llm {
         Some(LlmError::Provider { status: 429, .. })
         | Some(LlmError::LanesPaused(_))
-        | Some(LlmError::MeteredDeclined(_))
+        | Some(LlmError::AllocationExhausted { .. })
         | Some(LlmError::Auth(_))
         | Some(LlmError::NotConfigured(_)) => SchedulerFailureKind::LaneUnavailable,
         Some(LlmError::Http(http)) if http.is_connect() && !http.is_timeout() => {
@@ -1703,10 +1703,15 @@ mod tests {
             classify_scheduled_failure(&wrapped(LlmError::LanesPaused("gemini".into()))),
             lane
         );
-        // Jev declined the metered lane: the session waits for a free lane
-        // and is not charged an attempt.
+        // The flat lane's daily allocation is used: the session waits for the
+        // reset and is not charged an attempt.
         assert_eq!(
-            classify_scheduled_failure(&wrapped(LlmError::MeteredDeclined("jev".into()))),
+            classify_scheduled_failure(&wrapped(LlmError::AllocationExhausted {
+                lane: "codex-oauth".into(),
+                used: 40,
+                cap: 40,
+                resets_at_unix: 0,
+            })),
             lane
         );
         for e in [

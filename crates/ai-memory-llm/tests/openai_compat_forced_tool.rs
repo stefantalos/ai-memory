@@ -6,7 +6,10 @@
 //! ignored 4 of 4 times, while one forced function call with
 //! `chat_template_kwargs.enable_thinking=false` returned a schema-conformant
 //! object 9 of 11 times; the other two carried a nested array as a
-//! JSON-encoded string. These tests pin the request shape and the parsing.
+//! JSON-encoded string. These tests pin the request shape and the parsing of
+//! the Laguna contract (FN8-9336, `crates/ai-memory-llm/src/laguna.rs`) when
+//! the host answers with one JSON body instead of a stream; the streamed path
+//! is in `zero_metered_chain.rs`.
 
 use ai_memory_llm::types::ChatRequest;
 use ai_memory_llm::{LlmProvider, OpenAiCompatProvider};
@@ -116,6 +119,8 @@ async fn poolside_model_forces_one_tool_call_without_response_format() {
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1, "one call, no fallback");
     let body = &seen[0];
+    assert_eq!(body["stream"], json!(true), "the contract streams the forced call");
+    assert_eq!(body["temperature"], json!(0.7));
     assert!(
         body.get("response_format").is_none(),
         "response_format is ignored upstream; not sent"
@@ -189,25 +194,47 @@ async fn a_string_field_that_looks_like_json_is_left_alone() {
     );
 }
 
+/// No call, no JSON: one more sample of the SAME forced request at 0.9 —
+/// never a plain text call with thinking at the template default (cut 4 of 4
+/// in the A/B). The second sample's answer text holds a valid object, which
+/// the contract salvages.
 #[tokio::test]
-async fn no_tool_call_falls_back_to_the_tolerant_text_parser_when_opted_in() {
+async fn no_tool_call_retries_the_forced_call_once_and_salvages_valid_json() {
     let (server, seen) = serve(vec![
         text_body("I'll propose two pages."),
         text_body("here: {\"summary\": \"s\", \"proposals\": []}"),
     ])
     .await;
     let out = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
-        .with_tool_text_fallback(true)
+        .with_disable_thinking(true)
         .complete_structured_raw(request(), schema())
         .await
-        .expect("fallback result");
+        .expect("salvaged result");
     assert_eq!(out, json!({ "summary": "s", "proposals": [] }));
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
-    assert!(
-        seen[1].get("tools").is_none(),
-        "the fallback is a plain text call"
-    );
+    for body in seen.iter() {
+        assert_eq!(body["tool_choice"]["function"]["name"], json!("submit_structured_output"));
+        assert_eq!(body["chat_template_kwargs"], json!({ "enable_thinking": false }));
+    }
+    assert_eq!((seen[0]["temperature"].clone(), seen[1]["temperature"].clone()), (json!(0.7), json!(0.9)));
+}
+
+/// Salvage is strict: an object in the text that fails the schema is not an
+/// answer.
+#[tokio::test]
+async fn an_invalid_object_in_the_text_is_not_salvaged() {
+    let (server, seen) = serve(vec![
+        text_body("{\"summary\": 3}"),
+        text_body("{\"proposals\": []}"),
+    ])
+    .await;
+    let err = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
+        .complete_structured_raw(request(), schema())
+        .await
+        .expect_err("nothing valid");
+    assert!(matches!(err, ai_memory_llm::LlmError::UnexpectedShape(_)), "{err:?}");
+    assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -223,7 +250,7 @@ async fn other_models_keep_response_format() {
 }
 
 #[tokio::test]
-async fn poolside_output_is_capped_at_14k_on_every_call() {
+async fn poolside_structured_output_is_capped_at_4k_and_text_at_14k() {
     let (server, seen) = serve(vec![
         tool_call_body(json!({ "summary": "s", "proposals": [] })),
         text_body("plain"),
@@ -243,11 +270,7 @@ async fn poolside_output_is_capped_at_14k_on_every_call() {
         .await
         .unwrap();
     let seen = seen.lock().unwrap();
-    assert_eq!(
-        seen[0]["max_tokens"],
-        json!(14_000),
-        "structured call capped"
-    );
+    assert_eq!(seen[0]["max_tokens"], json!(4_000), "structured call: the Laguna contract ceiling");
     assert_eq!(seen[1]["max_tokens"], json!(14_000), "text call capped");
     assert_eq!(
         seen[2]["max_tokens"],
@@ -272,12 +295,14 @@ fn overthought_body(prompt: u32, completion: u32) -> serde_json::Value {
 }
 
 /// Measured 2026-09-24 (consolidate, session d3345285): 14,000 output tokens,
-/// no call. Before the fix this was a shape error, so the SAME prompt was sent
-/// again as a text call with thinking on and its failure masked the cut.
+/// no call. A cut is sampled once more on the same key (the forced shape at
+/// 0.9) and then handed back as `Truncated` for the lane chain to route; the
+/// thinking is never offered for salvage and no text request follows.
 #[tokio::test]
-async fn no_tool_call_cut_at_the_limit_is_truncated_and_sends_nothing_else() {
+async fn no_tool_call_cut_at_the_limit_is_retried_once_then_truncated() {
     let (server, seen) = serve(vec![
-        overthought_body(6_646, 14_000),
+        overthought_body(6_646, 4_000),
+        overthought_body(6_646, 4_000),
         text_body("{\"summary\": \"s\", \"proposals\": []}"),
     ])
     .await;
@@ -298,42 +323,15 @@ async fn no_tool_call_cut_at_the_limit_is_truncated_and_sends_nothing_else() {
         }
         other => panic!("expected Truncated, got {other:?}"),
     }
-    assert_eq!(
-        seen.lock().unwrap().len(),
-        1,
-        "no text fallback on the same lane after a cut"
-    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "one same-key retry, no text fallback");
+    assert!(seen.iter().all(|b| b.get("tools").is_some()));
 }
 
-/// The text fallback still runs when the forced call ended for another
-/// reason — but if THAT call is cut at the limit with no JSON, the caller must
-/// see `Truncated` (routable to the next lane), not a fatal shape error.
+/// Prose twice stays a shape error after exactly two forced requests.
 #[tokio::test]
-async fn a_text_fallback_cut_at_the_limit_is_truncated_not_a_shape_error() {
-    let cut_text = json!({
-        "id": "id", "object": "chat.completion", "created": 0, "model": "poolside/laguna-s-2.1",
-        "choices": [{ "index": 0,
-            "message": { "role": "assistant", "content": "<think>first I will list every" },
-            "finish_reason": "length" }]
-    });
-    let (server, seen) = serve(vec![text_body("I'll propose two pages."), cut_text]).await;
-    let err = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
-        .with_tool_text_fallback(true)
-        .complete_structured_raw(request(), schema())
-        .await
-        .expect_err("a cut is not a result");
-    assert!(
-        matches!(err, ai_memory_llm::LlmError::Truncated { .. }),
-        "expected Truncated, got {err:?}"
-    );
-    assert_eq!(seen.lock().unwrap().len(), 2);
-}
-
-/// Same prose without the cut stays a shape error: the classification rides
-/// on `finish_reason`, not on the absence of JSON alone.
-#[tokio::test]
-async fn a_text_fallback_without_json_that_stopped_normally_stays_a_shape_error() {
-    let (server, _) = serve(vec![text_body("prose"), text_body("still prose")]).await;
+async fn prose_twice_is_a_shape_error_after_two_forced_requests() {
+    let (server, seen) = serve(vec![text_body("prose"), text_body("still prose")]).await;
     let err = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
         .complete_structured_raw(request(), schema())
         .await
@@ -342,82 +340,7 @@ async fn a_text_fallback_without_json_that_stopped_normally_stays_a_shape_error(
         matches!(err, ai_memory_llm::LlmError::UnexpectedShape(_)),
         "{err:?}"
     );
-}
-
-/// Measured 2026-09-24 on b50cd18b: three consolidate calls each booked
-/// http_calls=2 and ~16.6k output tokens: a forced call that ended in prose
-/// without the function, then this fallback as a plain text call with
-/// thinking at the template default, cut at 14,000 every time. For Poolside
-/// the prose reply is the answer: a shape error, and nothing else is sent.
-#[tokio::test]
-async fn poolside_prose_instead_of_the_call_is_one_request_and_a_shape_error() {
-    let (server, seen) = serve(vec![
-        text_body("Let me analyze this session carefully. Actually, I want to reconsider"),
-        text_body("{\"summary\": \"s\", \"proposals\": []}"),
-    ])
-    .await;
-    let err = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
-        .complete_structured_raw(request(), schema())
-        .await
-        .expect_err("prose is not a result");
-    assert!(
-        matches!(err, ai_memory_llm::LlmError::UnexpectedShape(_)),
-        "{err:?}"
-    );
-    assert_eq!(seen.lock().unwrap().len(), 1, "no second (text) request");
-}
-
-#[tokio::test]
-async fn other_models_on_the_forced_tool_path_keep_the_text_fallback() {
-    let (server, seen) = serve(vec![
-        text_body("prose"),
-        text_body("{\"summary\": \"s\", \"proposals\": []}"),
-    ])
-    .await;
-    let out = provider(&format!("{}/v1", server.uri()), "mistral-nemo")
-        .with_structured_via_tool(true)
-        .complete_structured_raw(request(), schema())
-        .await
-        .expect("fallback result");
-    assert_eq!(out, json!({ "summary": "s", "proposals": [] }));
-    assert_eq!(seen.lock().unwrap().len(), 2);
-}
-
-/// A/B 2026-09-25 (docs/research/laguna-loop-ab-2026-09-25.md): at the
-/// callers' 0.1 Laguna was cut or lost 5 of 7 times on the looping inputs, at
-/// 0.7 2 of 8. Every Poolside request carries 0.7, whatever the caller set.
-#[tokio::test]
-async fn poolside_requests_carry_the_poolside_temperature_on_every_path() {
-    let (server, seen) = serve(vec![
-        tool_call_body(json!({ "summary": "s", "proposals": [] })),
-        text_body("plain"),
-    ])
-    .await;
-    let p = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1");
-    let mut r = request();
-    r.temperature = Some(0.1);
-    p.complete_structured_raw(r.clone(), schema())
-        .await
-        .unwrap();
-    p.complete(r).await.unwrap();
     let seen = seen.lock().unwrap();
-    let t0 = seen[0]["temperature"].as_f64().expect("temperature sent");
-    let t1 = seen[1]["temperature"].as_f64().expect("temperature sent");
-    assert!((t0 - 0.7).abs() < 1e-6, "forced call: {t0}");
-    assert!((t1 - 0.7).abs() < 1e-6, "text call: {t1}");
-}
-
-#[tokio::test]
-async fn other_models_keep_the_callers_temperature() {
-    let (server, seen) = serve(vec![text_body("{\"summary\": \"s\", \"proposals\": []}")]).await;
-    let mut r = request();
-    r.temperature = Some(0.1);
-    provider(&format!("{}/v1", server.uri()), "mistral-nemo")
-        .complete_structured_raw(r, schema())
-        .await
-        .unwrap();
-    let t = seen.lock().unwrap()[0]["temperature"]
-        .as_f64()
-        .expect("temperature sent");
-    assert!((t - 0.1).abs() < 1e-6, "{t}");
+    assert_eq!(seen.len(), 2);
+    assert!(seen.iter().all(|b| b.get("tools").is_some()));
 }

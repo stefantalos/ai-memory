@@ -141,6 +141,11 @@ impl OpenAiProvider {
         self
     }
 
+    /// The configured base URL.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Currently configured per-request timeout. Test-visible so
     /// wrapper tests (`OpenAiCompatProvider`, `OpenCodeProvider`)
     /// can assert the delegation without exposing the field.
@@ -210,6 +215,10 @@ struct OpenAiRequest<'a> {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -299,6 +308,10 @@ impl LlmProvider for OpenAiProvider {
 
     fn model(&self) -> &str {
         &self.model
+    }
+
+    fn endpoint(&self) -> Option<&str> {
+        Some(&self.base_url)
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
@@ -425,23 +438,27 @@ impl OpenAiProvider {
             tools: None,
             tool_choice: None,
             chat_template_kwargs: None,
+            stream: None,
+            stream_options: None,
         }
     }
 
-    /// Structured output through ONE forced function call instead of
-    /// `response_format`. Measured live 2026-09-23 against
-    /// `poolside/laguna-s-2.1` on inference.poolside.ai: `response_format`
-    /// with a strict json_schema was ignored 4 of 4 times (a list, prose, or
-    /// an unrelated key set), while a forced `tool_choice` with thinking off
-    /// returned a schema-conformant object 9 of 11 times — the other two
-    /// carried a nested array as a JSON-encoded string, which
-    /// [`decode_stringified_containers`] repairs.
-    pub(crate) async fn complete_structured_via_tool(
+    /// The forced-tool request as a stream, read chunk by chunk so `guard` can
+    /// abort a looping answer the moment it shows (the Laguna contract,
+    /// [`crate::laguna`]). `temperature` and `max_tokens` are taken from
+    /// `request` as given. A host that ignores `stream` and answers with one
+    /// JSON body is accepted too.
+    ///
+    /// Usage is reported to [`crate::usage`] once per HTTP request: the
+    /// provider's own counts when it sends them, otherwise an estimate from
+    /// the characters sent and received (an aborted stream carries none).
+    pub(crate) async fn stream_forced_tool(
         &self,
         request: &ChatRequest,
-        schema: serde_json::Value,
+        schema: &serde_json::Value,
         operation_id: LlmOperationId,
-    ) -> LlmResult<serde_json::Value> {
+        guard: &crate::laguna::RepetitionGuard,
+    ) -> LlmResult<StreamOutcome> {
         let mut body = self.build_request(request, None);
         body.tools = Some(vec![serde_json::json!({
             "type": "function",
@@ -458,8 +475,87 @@ impl OpenAiProvider {
             "type": "function",
             "function": { "name": STRUCTURED_OUTPUT_TOOL_NAME }
         }));
-        let response = self.post(&body, operation_id).await?;
-        parse_tool_call_response(response, &schema)
+        body.stream = Some(true);
+        body.stream_options = Some(serde_json::json!({ "include_usage": true }));
+        let prompt_chars: usize = request.system.as_deref().map_or(0, str::len)
+            + request.messages.iter().map(|m| m.content.len()).sum::<usize>();
+
+        let url = normalize_openai_base(&self.base_url, "chat/completions");
+        debug!(url, "POST openai (stream)");
+        let mut http = self
+            .client
+            .post(&url)
+            .timeout(self.timeout)
+            .bearer_auth(self.api_key.expose_secret())
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(&body);
+        if let Some(headers) = self.client_headers {
+            http = http.header(reqwest::header::USER_AGENT, headers.user_agent);
+            http = http.header(headers.operation_id, operation_id.to_string());
+        }
+        let mut resp = http.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = provider_error_body(resp).await;
+            return Err(LlmError::Provider {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let is_sse = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("text/event-stream"));
+        let mut sse = SseReader::default();
+        if !is_sse {
+            // A host that ignored `stream` answers with one JSON body; one that
+            // streams without the header is recognised by its first bytes.
+            let bytes = crate::response::response_bytes_limited(
+                resp,
+                crate::response::MAX_PROVIDER_RESPONSE_BYTES,
+            )
+            .await?;
+            let text = String::from_utf8_lossy(&bytes);
+            let head = text.trim_start();
+            if !(head.starts_with("data:") || head.starts_with("event:")) {
+                let response: OpenAiResponse = serde_json::from_slice(&bytes)?;
+                let usage = response.usage.as_ref().map(|u| (u.prompt_tokens, u.completion_tokens));
+                let out = StreamOutcome::from_response(response);
+                report_stream_usage(usage, prompt_chars, &out);
+                return Ok(out);
+            }
+            for line in text.lines() {
+                if sse.feed(line, guard) {
+                    break;
+                }
+            }
+            report_stream_usage(sse.usage, prompt_chars, &sse.out);
+            return Ok(sse.out);
+        }
+
+        let mut pending: Vec<u8> = Vec::new();
+        let mut received = 0_usize;
+        'read: while let Some(chunk) = resp.chunk().await? {
+            received = received.saturating_add(chunk.len());
+            if received > crate::response::MAX_PROVIDER_RESPONSE_BYTES {
+                return Err(LlmError::Provider {
+                    status: status.as_u16(),
+                    body: "provider stream exceeded the response size limit".into(),
+                });
+            }
+            pending.extend_from_slice(&chunk);
+            while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=pos).collect();
+                if sse.feed(&String::from_utf8_lossy(&line), guard) {
+                    break 'read;
+                }
+            }
+        }
+        drop(resp);
+        report_stream_usage(sse.usage, prompt_chars, &sse.out);
+        Ok(sse.out)
     }
 
     /// A plain text completion plus the provider's `finish_reason`, so a
@@ -544,6 +640,155 @@ impl OpenAiProvider {
     }
 }
 
+/// What one streamed forced-tool request produced.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct StreamOutcome {
+    /// Answer text (`delta.content`).
+    pub content: String,
+    /// Model thinking (`delta.reasoning_content` / `delta.reasoning`).
+    pub reasoning: String,
+    /// The forced function's arguments, concatenated from the deltas.
+    pub arguments: String,
+    /// Whether the forced function was called at all.
+    pub tool_called: bool,
+    /// The provider's `finish_reason`, when it sent one.
+    pub finish_reason: Option<String>,
+    /// The repetition guard stopped reading.
+    pub aborted: bool,
+}
+
+impl StreamOutcome {
+    fn absorb(&mut self, event: &serde_json::Value) {
+        let Some(choice) = event
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+        else {
+            return;
+        };
+        if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+            self.finish_reason = Some(reason.to_string());
+        }
+        let Some(delta) = choice.get("delta") else {
+            return;
+        };
+        if let Some(t) = delta.get("content").and_then(|t| t.as_str()) {
+            self.content.push_str(t);
+        }
+        for key in ["reasoning_content", "reasoning"] {
+            if let Some(t) = delta.get(key).and_then(|t| t.as_str()) {
+                self.reasoning.push_str(t);
+            }
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(|c| c.as_array()) {
+            for call in calls {
+                let Some(function) = call.get("function") else {
+                    continue;
+                };
+                let name = function.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                if !name.is_empty() && name != STRUCTURED_OUTPUT_TOOL_NAME {
+                    continue;
+                }
+                self.tool_called = true;
+                match function.get("arguments") {
+                    Some(serde_json::Value::String(t)) => self.arguments.push_str(t),
+                    Some(v) if v.is_object() => self.arguments.push_str(&v.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn from_response(response: OpenAiResponse) -> Self {
+        let mut out = Self::default();
+        let Some(choice) = response.choices.into_iter().next() else {
+            return out;
+        };
+        out.finish_reason = choice.finish_reason;
+        out.content = choice.message.content.unwrap_or_default();
+        if let Some(call) = choice
+            .message
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.function.name.is_empty() || c.function.name == STRUCTURED_OUTPUT_TOOL_NAME)
+        {
+            out.tool_called = true;
+            out.arguments = match call.function.arguments {
+                serde_json::Value::String(t) => t,
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+        }
+        out
+    }
+}
+
+/// Line-by-line state of one Chat Completions SSE stream.
+#[derive(Default)]
+struct SseReader {
+    out: StreamOutcome,
+    usage: Option<(u32, u32)>,
+    checked_at: usize,
+}
+
+impl SseReader {
+    /// Feed one line; `true` when reading should stop (`[DONE]`, or the
+    /// guard judged the answer a loop). Judged per event, not per network
+    /// chunk, so the abort lands within the guard window however the bytes
+    /// are packetised.
+    fn feed(&mut self, line: &str, guard: &crate::laguna::RepetitionGuard) -> bool {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            return false;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            return true;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+            return false;
+        };
+        if let Some(u) = event.get("usage").filter(|u| u.is_object()) {
+            let get = |k: &str| {
+                u.get(k)
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+            };
+            if let (Some(p), Some(c)) = (get("prompt_tokens"), get("completion_tokens")) {
+                self.usage = Some((p, c));
+            }
+        }
+        self.out.absorb(&event);
+        let seen = self.out.content.len() + self.out.reasoning.len();
+        if seen >= self.checked_at + crate::laguna::GUARD_CHECK_EVERY_CHARS {
+            self.checked_at = seen;
+            if guard.is_looping(&self.out.content) || guard.is_looping(&self.out.reasoning) {
+                self.out.aborted = true;
+                tracing::warn!(
+                    content_chars = self.out.content.len(),
+                    reasoning_chars = self.out.reasoning.len(),
+                    "Laguna contract: repetition guard aborted a looping answer",
+                );
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Book one streamed request: the provider's counts, or an estimate
+/// (3 characters per prompt token, 4 per output token) when it sent none.
+fn report_stream_usage(usage: Option<(u32, u32)>, prompt_chars: usize, out: &StreamOutcome) {
+    let (input, output) = usage.unwrap_or_else(|| {
+        let produced = out.content.len() + out.reasoning.len() + out.arguments.len();
+        (
+            u32::try_from(prompt_chars / 3).unwrap_or(u32::MAX),
+            u32::try_from(produced / 4).unwrap_or(u32::MAX),
+        )
+    });
+    crate::usage::report(input, output);
+}
+
 /// Extract and parse the structured-output JSON from a chat-completion
 /// response, distinguishing "truncated before it could be valid JSON" from
 /// any other parse-shape failure.
@@ -579,82 +824,6 @@ pub(crate) fn parse_structured_response(response: OpenAiResponse) -> LlmResult<s
             }
         }
     }
-}
-
-/// Extract the forced function call's arguments as the structured object.
-/// No tool call at all is a parse-shape error (the caller may fall back to
-/// parsing text); a truncated call is [`LlmError::Truncated`].
-pub(crate) fn parse_tool_call_response(
-    response: OpenAiResponse,
-    schema: &serde_json::Value,
-) -> LlmResult<serde_json::Value> {
-    let Some(choice) = response.choices.into_iter().next() else {
-        return Err(LlmError::UnexpectedShape("no choices in response".into()));
-    };
-    let finish_reason = choice.finish_reason.clone();
-    let cut_at_limit = finish_reason.as_deref() == Some("length");
-    let message = choice.message;
-    let call = message
-        .tool_calls
-        .unwrap_or_default()
-        .into_iter()
-        .find(|c| c.function.name.is_empty() || c.function.name == STRUCTURED_OUTPUT_TOOL_NAME);
-    let Some(call) = call else {
-        // No call AND the output ceiling was hit: the model spent the whole
-        // budget (typically overthinking) before it could call the function.
-        // That is a paid-for zero yield, not a shape mismatch — a shape error
-        // would send the same prompt again as a text call on the same lane
-        // (measured 2026-09-24: 14,000 output tokens, twice per attempt).
-        if cut_at_limit {
-            return Err(LlmError::Truncated {
-                finish_reason: "length".into(),
-                partial: partial_of(message.content),
-            });
-        }
-        return Err(LlmError::UnexpectedShape(
-            "model did not call the forced structured-output function".into(),
-        ));
-    };
-    if cut_at_limit && call.function.arguments.is_null() {
-        return Err(LlmError::Truncated {
-            finish_reason: "length".into(),
-            partial: partial_of(message.content),
-        });
-    }
-    let parsed = match call.function.arguments {
-        serde_json::Value::String(text) => match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(v) => v,
-            Err(err) if finish_reason.as_deref() == Some("length") => {
-                let _ = err;
-                return Err(LlmError::Truncated {
-                    finish_reason: "length".into(),
-                    partial: Some(crate::error::PartialText(text)),
-                });
-            }
-            Err(err) => return Err(LlmError::from(err)),
-        },
-        other => other,
-    };
-    if !parsed.is_object() {
-        return Err(LlmError::UnexpectedShape(
-            "structured-output function arguments are not an object".into(),
-        ));
-    }
-    let mut value = parsed;
-    decode_stringified_containers(&mut value, schema);
-    Ok(value)
-}
-
-/// The answer text a cut response did emit, if any.
-///
-/// Deliberately NOT `reasoning_content`: a partial is what callers salvage
-/// complete items from (auto_improve recovers whole proposals from a valid
-/// prefix), and a draft object inside the model's thinking is not output —
-/// promoting it would turn an unfinished thought into a proposal.
-fn partial_of(content: Option<String>) -> Option<crate::error::PartialText> {
-    content
-        .filter(|t| !t.trim().is_empty())
-        .map(crate::error::PartialText)
 }
 
 /// Where the schema declares an array or object but the model sent a string

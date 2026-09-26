@@ -302,6 +302,34 @@ pub fn release(conn: &mut Connection, job: &SessionConsolidationJob) -> StoreRes
     require_claim_update(changed)
 }
 
+/// Return a claimed job to the queue until `until` (Unix microseconds)
+/// without spending an attempt, recording `reason`. Used when no LLM lane
+/// could take the request (a flat lane's daily allocation is used up).
+pub fn defer(
+    conn: &mut Connection,
+    job: &SessionConsolidationJob,
+    until: i64,
+    reason: &str,
+) -> StoreResult<()> {
+    let changed = conn.execute(
+        "UPDATE session_consolidation_jobs \
+         SET state = 'pending', next_attempt_at = ?1, started_at = NULL, \
+             attempts = CASE WHEN ?2 = 1 AND attempts > 0 THEN attempts - 1 ELSE attempts END, \
+             claim_id = NULL, last_error = ?3 \
+         WHERE session_id = ?4 AND generation = ?5 \
+           AND state = 'running' AND claim_id = ?6",
+        params![
+            until,
+            i64::from(job.attempt_spent),
+            truncate_error(reason),
+            job.session_id.as_bytes(),
+            generation_i64(job),
+            job.claim_id.as_bytes(),
+        ],
+    )?;
+    require_claim_update(changed)
+}
+
 fn has_newer_generation(conn: &Connection, job: &SessionConsolidationJob) -> StoreResult<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_consolidation_jobs \
@@ -516,6 +544,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reclaimed.attempts(), 2);
+    }
+
+    /// A job deferred to the flat lane's reset waits until then and keeps its
+    /// attempt budget: an exhausted allocation says nothing about the session.
+    #[tokio::test]
+    async fn a_deferred_job_waits_for_its_time_and_spends_no_attempt() {
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let first = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.attempts(), 1);
+        let until = now + 3_600_000_000;
+        store
+            .writer
+            .defer_session_consolidation(first, until, "flat lane daily allocation used".into())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(until - 1, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "not before the reset"
+        );
+        let again = store
+            .writer
+            .claim_session_consolidation(until, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.attempts(), 1, "the deferral was refunded");
     }
 
     #[tokio::test]

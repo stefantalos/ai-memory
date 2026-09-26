@@ -140,6 +140,56 @@ pub struct OpenAiOAuthProvider {
     token: Mutex<OpenAiOAuthToken>,
     timeout: Duration,
     reasoning_effort: Option<ReasoningEffort>,
+    /// The token belongs to the Codex CLI (`~/.codex/auth.json`): read it
+    /// fresh on every request, never refresh it, never write the file.
+    /// Refreshing would rotate the refresh token out from under the CLI seat.
+    codex_cli: bool,
+    responses_url: String,
+}
+
+/// Read the Codex CLI's `auth.json` (`{"tokens": {"access_token", "refresh_token",
+/// "id_token", "account_id"}}`) into a token. Expiry comes from the access
+/// token's own `exp` claim.
+fn load_codex_cli_token(path: &Path) -> LlmResult<OpenAiOAuthToken> {
+    let raw = std::fs::read(path).map_err(|e| {
+        LlmError::NotConfigured(format!("codex CLI auth file {} unreadable: {e}", path.display()))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|_| {
+        LlmError::NotConfigured(format!("codex CLI auth file {} is not JSON", path.display()))
+    })?;
+    let tokens = value.get("tokens");
+    let field = |k: &str| {
+        tokens
+            .and_then(|t| t.get(k))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let access = field("access_token").ok_or_else(|| {
+        LlmError::NotConfigured(format!(
+            "codex CLI auth file {} holds no ChatGPT sign-in",
+            path.display()
+        ))
+    })?;
+    let expires_at_ms = jwt_exp_ms(&access).unwrap_or(0);
+    let account_id = field("account_id")
+        .or_else(|| field("id_token").as_deref().and_then(extract_account_id_from_jwt))
+        .or_else(|| extract_account_id_from_jwt(&access));
+    Ok(OpenAiOAuthToken {
+        access: SecretString::from(access),
+        refresh: SecretString::from(field("refresh_token").unwrap_or_default()),
+        expires_at_ms,
+        extra: OpenAiExtras { account_id },
+    })
+}
+
+/// The `exp` claim of a JWT, in milliseconds.
+fn jwt_exp_ms(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("exp")?.as_u64().map(|s| s.saturating_mul(1000))
 }
 
 impl OpenAiOAuthProvider {
@@ -162,7 +212,40 @@ impl OpenAiOAuthProvider {
             token: Mutex::new(token),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
             reasoning_effort: None,
+            codex_cli: false,
+            responses_url: CODEX_RESPONSES_URL.to_string(),
         })
+    }
+
+    /// The ChatGPT seat the Codex CLI is signed in with, read from its
+    /// `auth.json` (normally `~/.codex/auth.json`). Read-only: the file is
+    /// re-read on every request and never refreshed or written, so the CLI
+    /// keeps sole ownership of its refresh token. An expired access token is
+    /// [`LlmError::Auth`] without a request; running `codex` refreshes it.
+    ///
+    /// # Errors
+    /// [`LlmError::NotConfigured`] when the file is missing, unreadable, or
+    /// holds no ChatGPT sign-in.
+    pub fn from_codex_cli_auth(path: PathBuf, model: impl Into<String>) -> LlmResult<Self> {
+        let token = load_codex_cli_token(&path)?;
+        let client = reqwest::Client::builder().build().map_err(LlmError::from)?;
+        Ok(Self {
+            client,
+            model: model.into(),
+            token_path: path,
+            token: Mutex::new(token),
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
+            codex_cli: true,
+            responses_url: CODEX_RESPONSES_URL.to_string(),
+        })
+    }
+
+    /// Point the provider at another Responses endpoint (tests).
+    #[must_use]
+    pub fn with_responses_url(mut self, url: impl Into<String>) -> Self {
+        self.responses_url = url.into();
+        self
     }
 
     /// Override the per-request timeout (default
@@ -182,6 +265,17 @@ impl OpenAiOAuthProvider {
     }
 
     async fn current_token(&self) -> LlmResult<OpenAiOAuthToken> {
+        if self.codex_cli {
+            let token = load_codex_cli_token(&self.token_path)?;
+            if token.needs_refresh() {
+                return Err(LlmError::Auth(format!(
+                    "codex CLI sign-in at {} has expired; ai-memory never refreshes it — run `codex` to renew it",
+                    self.token_path.display()
+                )));
+            }
+            *self.token.lock().await = token.clone();
+            return Ok(token);
+        }
         let mut guard = self.token.lock().await;
         if guard.needs_refresh() {
             info!("openai-oauth token expired or near-expiry, refreshing");
@@ -195,12 +289,12 @@ impl OpenAiOAuthProvider {
     async fn post(&self, body: &CodexResponsesRequest<'_>) -> LlmResult<CodexResponsesResponse> {
         let token = self.current_token().await?;
         debug!(
-            url = CODEX_RESPONSES_URL,
+            url = %self.responses_url,
             "POST openai-oauth codex responses"
         );
         let mut request = self
             .client
-            .post(CODEX_RESPONSES_URL)
+            .post(&self.responses_url)
             .timeout(self.timeout)
             .bearer_auth(token.access.expose_secret())
             .header("content-type", "application/json")
@@ -228,11 +322,17 @@ impl OpenAiOAuthProvider {
                 body,
             });
         }
-        if body.stream {
-            parse_sse_response(&response_text_limited(resp).await?)
+        let response = if body.stream {
+            parse_sse_response(&response_text_limited(resp).await?)?
         } else {
-            response_json_limited::<CodexResponsesResponse>(resp).await
+            response_json_limited::<CodexResponsesResponse>(resp).await?
+        };
+        // Book the tokens on the call ledger (subscription flat: cost 0.00).
+        match &response.usage {
+            Some(u) => crate::usage::report(u.input_tokens, u.output_tokens),
+            None => crate::usage::report(0, 0),
         }
+        Ok(response)
     }
 }
 

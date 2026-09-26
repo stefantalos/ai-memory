@@ -25,6 +25,13 @@ pub trait LlmProvider: Send + Sync {
     /// The model identifier this provider will hit.
     fn model(&self) -> &str;
 
+    /// The base URL this provider sends to, when it is configurable. Used to
+    /// classify what a lane costs ([`crate::ledger::lane_kind`]); `None` for
+    /// providers with a fixed vendor endpoint.
+    fn endpoint(&self) -> Option<&str> {
+        None
+    }
+
     /// Plain text completion.
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse>;
 
