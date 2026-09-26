@@ -190,14 +190,14 @@ async fn a_string_field_that_looks_like_json_is_left_alone() {
 }
 
 #[tokio::test]
-async fn no_tool_call_falls_back_to_the_tolerant_text_parser_when_opted_in() {
+async fn no_tool_call_retries_with_stricter_instruction() {
     let (server, seen) = serve(vec![
         text_body("I'll propose two pages."),
         text_body("here: {\"summary\": \"s\", \"proposals\": []}"),
     ])
     .await;
     let out = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
-        .with_tool_text_fallback(true)
+        .with_stricter_retry_on_shape_fault(true)
         .complete_structured_raw(request(), schema())
         .await
         .expect("fallback result");
@@ -205,8 +205,8 @@ async fn no_tool_call_falls_back_to_the_tolerant_text_parser_when_opted_in() {
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
     assert!(
-        seen[1].get("tools").is_none(),
-        "the fallback is a plain text call"
+        seen[1].get("tools").is_some(),
+        "the retry is a structured call"
     );
 }
 
@@ -318,7 +318,7 @@ async fn a_text_fallback_cut_at_the_limit_is_truncated_not_a_shape_error() {
     });
     let (server, seen) = serve(vec![text_body("I'll propose two pages."), cut_text]).await;
     let err = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
-        .with_tool_text_fallback(true)
+        .with_stricter_retry_on_shape_fault(true)
         .complete_structured_raw(request(), schema())
         .await
         .expect_err("a cut is not a result");
@@ -350,21 +350,24 @@ async fn a_text_fallback_without_json_that_stopped_normally_stays_a_shape_error(
 /// thinking at the template default, cut at 14,000 every time. For Poolside
 /// the prose reply is the answer: a shape error, and nothing else is sent.
 #[tokio::test]
-async fn poolside_prose_instead_of_the_call_is_one_request_and_a_shape_error() {
+async fn poolside_prose_instead_of_the_call_retries_and_salvages_json() {
     let (server, seen) = serve(vec![
         text_body("Let me analyze this session carefully. Actually, I want to reconsider"),
         text_body("{\"summary\": \"s\", \"proposals\": []}"),
     ])
     .await;
-    let err = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
+    let out = provider(&format!("{}/v1", server.uri()), "poolside/laguna-s-2.1")
         .complete_structured_raw(request(), schema())
         .await
-        .expect_err("prose is not a result");
-    assert!(
-        matches!(err, ai_memory_llm::LlmError::UnexpectedShape(_)),
-        "{err:?}"
-    );
-    assert_eq!(seen.lock().unwrap().len(), 1, "no second (text) request");
+        .expect("prose with JSON on retry is salvaged");
+    assert_eq!(out, json!({ "summary": "s", "proposals": [] }));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "second strict retry request was made");
+    
+    // Check that the second request had the strict system instruction
+    let messages = seen[1]["messages"].as_array().unwrap();
+    let sys = messages[0]["content"].as_str().unwrap();
+    assert!(sys.contains("CRITICAL: You MUST call the provided tool to submit your answer. Do NOT return prose."));
 }
 
 #[tokio::test]

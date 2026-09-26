@@ -611,6 +611,19 @@ pub(crate) fn parse_tool_call_response(
                 partial: partial_of(message.content),
             });
         }
+        if let Some(ref content) = message.content {
+            let cleaned = crate::openai_compat::strip_reasoning_blocks(content);
+            let maybe_json = match serde_json::from_str::<serde_json::Value>(&cleaned) {
+                Ok(v) if v.is_object() => Some(v),
+                _ => crate::openai_compat::first_json_object(&cleaned)
+                    .and_then(|slice| serde_json::from_str::<serde_json::Value>(slice).ok())
+                    .filter(|v| v.is_object()),
+            };
+            if let Some(mut v) = maybe_json {
+                decode_stringified_containers(&mut v, schema);
+                return Ok(v);
+            }
+        }
         return Err(LlmError::UnexpectedShape(
             "model did not call the forced structured-output function".into(),
         ));
