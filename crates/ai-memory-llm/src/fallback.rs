@@ -205,7 +205,11 @@ fn classify(err: &LlmError) -> FailureClass {
         LlmError::Provider { status: 429, .. } => FailureClass::Quota,
         LlmError::Provider { status, .. } if (500..=599).contains(status) => FailureClass::Server,
         LlmError::Http(e) if e.is_timeout() || e.is_connect() => FailureClass::Server,
-        LlmError::Truncated { .. } | LlmError::EmptyResponse(_) => FailureClass::ZeroYield,
+        // Map UnexpectedShape to ZeroYield. A shape error means the model failed
+        // to call the tool or returned unparseable text. By classifying it as ZeroYield,
+        // it increments the breaker without being treated as a fatal/terminal error
+        // for the entire fallback chain, allowing graceful failover to the next lane.
+        LlmError::Truncated { .. } | LlmError::EmptyResponse(_) | LlmError::UnexpectedShape(_) => FailureClass::ZeroYield,
         _ => FailureClass::Fatal,
     }
 }
@@ -1034,15 +1038,53 @@ mod tests {
             vec![
                 Some(LlmError::Schema("bad".into())),
                 Some(LlmError::Serde("nope".into())),
+            ],
+        );
+        let secondary = Scripted::ok("gemini", "gemini-2.5-flash");
+        let (f, _) = build(&primary, &secondary);
+        for _ in 0..2 {
+            assert!(call(&f).await.0.is_err());
+        }
+        assert_eq!(secondary.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn unexpected_shape_trips_breaker_and_fails_over() {
+        let primary = Scripted::new(
+            "openai-compat",
+            "laguna",
+            vec![
+                Some(LlmError::UnexpectedShape("no tool".into())),
                 Some(LlmError::UnexpectedShape("no tool".into())),
             ],
         );
         let secondary = Scripted::ok("gemini", "gemini-2.5-flash");
         let (f, _) = build(&primary, &secondary);
-        for _ in 0..3 {
-            assert!(call(&f).await.0.is_err());
-        }
-        assert_eq!(secondary.calls(), 0);
+        let obs = Arc::new(Recorder::default());
+        let f = f.with_zero_yield_threshold(2).with_observer(obs.clone());
+
+        // First call fails over because UnexpectedShape is ZeroYield
+        let (out, who) = call(&f).await;
+        assert!(out.is_ok());
+        assert_eq!(who.unwrap().provider, "gemini");
+        
+        // Second call on DIFFERENT input hits primary, gets UnexpectedShape, fails over again
+        // AND trips the zero yield breaker!
+        let req2 = crate::types::ChatRequest::user_prompt("different");
+        let (out, who) = capture_responder(f.complete_structured_raw(req2, serde_json::json!({}))).await;
+        assert!(out.is_ok());
+        assert_eq!(who.unwrap().provider, "gemini");
+        
+        // Now breaker is open, primary is skipped
+        let req3 = crate::types::ChatRequest::user_prompt("yet again");
+        let (_, who) = capture_responder(f.complete_structured_raw(req3, serde_json::json!({}))).await;
+        assert_eq!(who.unwrap().provider, "gemini");
+        assert_eq!(primary.calls(), 2);
+        
+        // Verify breaker event
+        let ev = obs.breakers.lock().unwrap();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].reason, "zero_yield");
     }
 
     #[tokio::test]
