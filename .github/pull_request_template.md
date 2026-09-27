@@ -19,6 +19,17 @@
       any unintended identity before requesting merge. See
       [commit attribution guidance](https://github.com/akitaonrails/ai-memory/blob/main/CONTRIBUTING.md#commit-attribution).
 
+## Release impact
+
+<!-- Check exactly one. This drives which release your change ships in
+     (see CONTRIBUTING.md "Versioning and deprecation policy"). -->
+
+- [ ] **Patch** — bug fix, no new surface
+- [ ] **Minor** — additive: new flag/subcommand/MCP tool/config key,
+      new agent harness or provider
+- [ ] **Major (breaking)** — on-disk format, removed/renamed surface,
+      breaking MCP schema change — called out in "What changed" above
+
 ## CHANGELOG (merge gate)
 
 - [ ] I added a `CHANGELOG.md` `[Unreleased]` entry — **required** for any

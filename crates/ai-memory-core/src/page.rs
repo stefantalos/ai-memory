@@ -151,6 +151,33 @@ where
     out
 }
 
+/// Derive a page's indexed entity names from its frontmatter: the
+/// explicit `entities` list an LLM consolidator may emit, plus the
+/// `tags` list nearly every page carries. Both are arrays of strings
+/// meaning "what this page is about"; merging them populates the entity
+/// retrieval stream and `as_of` timelines deterministically, without
+/// depending on an LLM pass that a mature store's pages never received.
+///
+/// Explicit entities come first so they win the per-page cap. Lenient by
+/// design — a missing or non-array field simply contributes nothing, so
+/// this never fails on hand-edited frontmatter; the strict structural
+/// check for the write path lives in the wiki layer.
+#[must_use]
+pub fn frontmatter_entity_names(frontmatter: &serde_json::Value) -> Vec<String> {
+    fn strings(frontmatter: &serde_json::Value, key: &str) -> Vec<String> {
+        frontmatter
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    }
+    let mut merged = strings(frontmatter, "entities");
+    merged.extend(strings(frontmatter, "tags"));
+    normalize_entities(merged)
+}
+
 /// A link target discovered in a page body.
 ///
 /// A bare `[[path]]` / `[label](path)` resolves within the source page's
@@ -167,6 +194,50 @@ pub struct LinkTarget {
     pub project: Option<String>,
     /// Wiki path within the target project (root-relative).
     pub path: PagePath,
+    /// Typed relation carried by this edge; `None` = a plain reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<Relation>,
+}
+
+/// The closed typed-edge vocabulary (2.0 item 3). Declared in a page's
+/// `relations:` frontmatter; anything outside this set stays a plain
+/// reference. Closed on purpose: a free-text relation column becomes an
+/// unqueryable folksonomy, and `contradicts` feeds the lint pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Relation {
+    /// The source page describes a cause of the target.
+    Causes,
+    /// The source page fixes the problem the target describes.
+    Fixes,
+    /// The source page contradicts the target (lint surfaces these).
+    Contradicts,
+}
+
+impl Relation {
+    /// Stored `links.link_type` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Causes => "causes",
+            Self::Fixes => "fixes",
+            Self::Contradicts => "contradicts",
+        }
+    }
+
+    /// Parse a frontmatter `relations:` key. Unknown names → `None`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "causes" => Some(Self::Causes),
+            "fixes" => Some(Self::Fixes),
+            "contradicts" => Some(Self::Contradicts),
+            _ => None,
+        }
+    }
+
+    /// Every relation, for schema/docs enumeration.
+    pub const ALL: [Self; 3] = [Self::Causes, Self::Fixes, Self::Contradicts];
 }
 
 impl LinkTarget {
@@ -177,6 +248,7 @@ impl LinkTarget {
             workspace: None,
             project: None,
             path,
+            relation: None,
         }
     }
 
@@ -393,5 +465,28 @@ mod tests {
             .map(|i| format!("entity{i}"))
             .collect();
         assert_eq!(normalize_entities(&many).len(), MAX_ENTITIES_PER_PAGE);
+    }
+
+    #[test]
+    fn frontmatter_entity_names_merges_entities_and_tags_leniently() {
+        // Explicit entities first (they win the cap), then tags; dupes drop.
+        assert_eq!(
+            frontmatter_entity_names(&serde_json::json!({
+                "entities": ["FTS5"],
+                "tags": ["fts5", "Search"],
+            })),
+            vec!["fts5".to_string(), "search".to_string()],
+        );
+        // Tags alone are enough — the common case on a mature store.
+        assert_eq!(
+            frontmatter_entity_names(&serde_json::json!({"tags": ["Storage"]})),
+            vec!["storage".to_string()],
+        );
+        // Missing or malformed fields contribute nothing, never panic.
+        assert!(frontmatter_entity_names(&serde_json::json!({})).is_empty());
+        assert!(
+            frontmatter_entity_names(&serde_json::json!({"tags": "not-a-list", "entities": 7}))
+                .is_empty(),
+        );
     }
 }

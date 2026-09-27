@@ -68,6 +68,13 @@ When Claude Code or Codex compact their working context, the
 compaction, the agent can recover the summary via `memory_recent` even
 though its raw chat history was compacted away.
 
+Generated session pages carry `session_id` and `agent` in frontmatter. The
+`agent` value is the originating harness stored on the session (for example,
+`claude-code` or `codex`), not the client or operator that later requested a
+consolidation. Checkpoints and superseding versions therefore keep the same
+origin. Manual `memory_write_page` and `ai-memory write-page` calls do not
+infer an agent.
+
 ## Proactive memory queries
 
 Hooks handle capture without prompting. Proactive querying depends on
@@ -329,8 +336,8 @@ ai-memory auth status
 ```
 
 The login command stores only provider credentials in `<data_dir>/auth.json`.
-It is separate from `AI_MEMORY_AUTH_TOKEN`, which protects MCP, hooks, and the
-web UI.
+It is separate from `AI_MEMORY_AUTH_TOKEN`, the machine-root Bearer used by
+MCP, hooks, handoffs, workstreams, and machine calls to dual-auth APIs.
 
 For GitHub Copilot, use the matching provider login before starting the server
 with `AI_MEMORY_LLM_PROVIDER=copilot`:
@@ -368,10 +375,17 @@ current page's project unless the target carries its own scope).
 only by their own glyph), inline `` `…` `` code, and 4-space-indented
 code; external schemes inside the brackets (`http://`, `https://`,
 `mailto:`, `data:`, `javascript:`, `vbscript:`, `tel:`, `file:`)
-stay literal too. If the server has `AI_MEMORY_AUTH_TOKEN` set, the
-browser uses HTTP Basic auth: leave the username blank and paste the
-token as the password. MCP and hook clients continue to use
-`Authorization: Bearer <token>`.
+stay literal too.
+
+With no authority configured on loopback, the built-in wiki remains
+anonymous. For human-authenticated administration, serve the compiled admin SPA
+with `--web-ui-dir`: it signs in through `/auth/login` and uses an HttpOnly web
+session plus CSRF protection. Before human auth is active, deprecated GET-only
+browser compatibility accepts the root bearer through HTTP Basic and an
+HttpOnly `ai_memory_auth` cookie; it stops immediately after a human password or
+completed bootstrap exists. Browser-stored Bearers remain unsupported.
+`AI_MEMORY_AUTH_TOKEN` and `aim_` API keys remain machine-only credentials sent
+as `Authorization: Bearer <token>` by MCP, hook, handoff, and workstream clients.
 
 To host the web UI under a URL subpath behind a reverse proxy, the
 `--base-path` / `--web-slug` flags do the work — see

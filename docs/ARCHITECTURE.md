@@ -85,7 +85,10 @@ from hook paths.
    use `ai-memory finalize-session` for Codex, or
    `ai-memory finalize-session --agent antigravity-cli` for Antigravity CLI.
    The command selects the latest matching open session and enters the same
-   canonical SessionEnd path as a native hook.
+   canonical SessionEnd path as a native hook. Generated session-page
+   frontmatter records `session_id` plus the immutable `sessions.agent_kind`
+   as `agent`; it describes the page's harness origin, not the later writer.
+   Manual page writes do not receive inferred agent metadata.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation
@@ -143,7 +146,20 @@ from hook paths.
    version ancestry only within that sweep's resolved workspace/project,
    together with entity-index rows orphaned by the purge. A newer page recreated
    at the same path is preserved. Semantic / pinned / freshly-touched pages
-   survive.
+   survive. A fourth pass, disabled unless `[decay] observation_retention_days`
+   is positive, then deletes raw `observations` older than that age — but only
+   for sessions already consolidated into a summary page that is still live, so
+   raw capture is never removed while it is the last copy of that session's
+   work. It runs last so this run's own evictions and hard-deletes already
+   exclude their sessions, deletes in `observation_prune_batch` transactions so
+   a multi-million row prune cannot hold the write lock, and repairs
+   `sessions.ended_observation_count` downward in the same transaction. The
+   prune is irreversible in a specific sense: observations are the input to
+   consolidation, so a pruned session can never be re-consolidated — not with
+   a better model, a better prompt, or a fixed consolidator bug — and its
+   summary page becomes the only surviving account of that session. Freed
+   SQLite pages are reused, not returned to the OS: the `.db` file does not
+   shrink, the backup tarball does.
    Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks
    enumerate every existing workspace/project scope before doing per-project
    work, matching the auto-improvement scheduler's store-wide scope model. A
@@ -360,6 +376,13 @@ invariants below.
 | `memory_handoff_begin` | destructive | Open an owner-scoped handoff for the next agent; `shared=true` deliberately publishes it to the project. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_accept` | destructive | Fetch + ack the latest own/shared handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_cancel` | destructive | Mark an exact visible open handoff id expired when it was created by mistake; root-only `any_owner=true` recovers across operators. |
+
+`memory_handoff_cancel` needs an exact id. `ai-memory handoffs` lists the open
+handoffs for a project, oldest first, with their ids — read-only, and
+content-free (identity, provenance and age, never the summary body). Automatic
+expiry deliberately spares manual and sibling-directory handoffs, so a
+long-lived entry appearing there is that policy working rather than a fault.
+
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. Consolidation prompts append the target project's active reserved `_prompts/consolidation.md` body as sanitized, 2,000-character-capped, JSON-encoded, untrusted advisory preferences; TTL-expired pages are ignored and a per-call `instructions` argument overrides the page for one call. Both system prompts keep schema, evidence, disclosure, tool-use, and output rules authoritative. |
 | `memory_feedback` | write | Record a quality signal for one page by exact `path`: `helpful`/`not_helpful` step `pages.salience` for sweep-eligible episodic pages, while `stale`/`wrong` floor salience and surface any current page as a `feedback_flagged` lint finding. Never deletes; the path resolves to the current version in the transaction, so a later rewrite clears it. Retrieved content never authorizes feedback by itself. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Without a session ID, selects the newest completed session with no persisted auto-improvement run so repeated calls advance through preflight skips; an explicit ID remains rerunnable. The server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
@@ -415,11 +438,29 @@ keeps the same auth, scope resolver, and tool handlers as direct HTTP clients.
 The adapter fails closed without a Claude session id and is installed only by
 the explicit `install-mcp --client claude-code --session-aware` option.
 
+## HTTP authentication classes
+
+The process separates four active credential classes from one transitional
+browser compatibility path:
+
+| Class | Wire | Authorizes |
+|---|---|---|
+| Human password | `POST /auth/login` body | Session issuance only |
+| Web session | `ai_memory_session` cookie + CSRF | `/auth/me`, `/admin/*`, `/api/v1/*` by `AuthLevel`; never `/mcp` or hooks |
+| Recovery | `POST /auth/recovery` body | Root password reset; no session |
+| API key | `Authorization: Bearer` (`aim_`, root `AI_MEMORY_AUTH_TOKEN`, or external `amk_`) | Machine APIs; never a web session |
+| Deprecated browser compatibility | HTTP Basic root bearer, then HttpOnly `ai_memory_auth` cookie | GET-only browser routes until any human password or completed bootstrap exists; never machine routes |
+
+The deprecated Basic/cookie path stops immediately when human auth becomes
+active; restart is not required. `/web` SPA HTML is public static; the builtin
+wiki browser and JSON APIs stay behind the route class above.
+
 ## CLI subcommand surface
 
 ```
 init                 status               run
-show                 continue             workstream-search
+show                 continue             resume
+workstreams          rename-workstream    workstream-search
 audit-contamination  search               read-page
 write-page           delete-page          serve
 reset                backup               restore
@@ -433,6 +474,8 @@ bootstrap            install-instructions install-skills
 reorg                purge-project        rename-project
 move-project         move-session         uninstall
 auth                 user                 completions
+handoffs             purge-session        compact
+api-key              export-okf
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -468,8 +511,11 @@ that touch the relevant area.
 8. **`{provider, model, dim}` denormalised next to every embedding.**
    Warn and ignore stale vectors on mismatch until re-embedding completes.
    (agentmemory #469.)
-9. **Live-process check before destructive ops.** `ai-memory reset`,
-   `backup`, `restore` all consult `sysinfo`. (basic-memory #765.)
+9. **Live-process check before direct-disk lifecycle ops.** `ai-memory reset`,
+   `restore`, `reindex`, and `uninstall --purge-data` consult `sysinfo`; the
+   uninstall guard is conditional on `--purge-data`. `backup` is a thin HTTP
+   client instead: the server snapshots SQLite with its online backup API while
+   the writer remains live. (basic-memory #765.)
 10. **Atomic file writes** (tmp + rename + fsync). Watcher ignores
     own writes by filename prefix.
 11. **Absolute canonical data dir** default; logged loudly on
@@ -502,6 +548,8 @@ mu = 0.04                          # ↑ if recent hits should count more
 cold_threshold = 0.20              # below this → remove file + retain tombstone
 hard_delete_after_days = 180
 breadth_weight = 0.0               # opt-in reward for distinct operators
+observation_retention_days = 0     # 0 = never prune raw observations
+observation_prune_batch = 5000     # rows per prune transaction
 
 [slots]                           # optional shared-server injection boundary
 per_user = false                  # shared + own slots in agent context
@@ -550,6 +598,14 @@ ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
+AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
+                           (none|minimal|low|medium|high|xhigh|max|ultra|persistent)
+                           mapped per provider: OpenAI `reasoning_effort`,
+                           OpenRouter `reasoning.effort`, xAI Grok
+                           `reasoning_effort`, Anthropic `output_config.effort`,
+                           Codex `reasoning.effort`. Gemini and Copilot
+                           ignore the key. Host-unsupported values are
+                           clamped to each provider's published enum.
 AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
@@ -575,12 +631,23 @@ AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI), 1024 (Voyage), 768 (Google);
 OPENAI_API_KEY / VOYAGE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
 LLM_API_KEY                    accepted for openai with a custom base URL and as
                                optional bearer auth for openai-compat
+EMBEDDING_API_KEY              optional embedding-only key; checked before
+                               OPENAI_API_KEY and LLM_API_KEY for the openai and
+                               openai-compat embedders
 ```
+
+`EMBEDDING_API_KEY` credentials the embedding role alone, so the embedder can
+target a different provider than the chat model — `openai` on `api.openai.com`
+for the LLM, a cheaper or self-hosted OpenAI-compatible endpoint for vectors.
+Without it the `openai` embedder takes `OPENAI_API_KEY`, then `LLM_API_KEY`
+when a custom embedding base URL is set, exactly as before. `voyage` and
+`google`/`gemini` keep reading only their own `VOYAGE_API_KEY` and
+`GEMINI_API_KEY`/`GOOGLE_API_KEY`.
 
 `openai-compat` also requires an explicit model because self-hosted engines have
 no safe shared model or dimensionality default. It sends no authorization header
-when `LLM_API_KEY` is absent and stores vectors under the distinct
-`provider="openai-compat"` identity.
+when both `EMBEDDING_API_KEY` and `LLM_API_KEY` are absent and stores vectors
+under the distinct `provider="openai-compat"` identity.
 
 ## Future work
 
@@ -597,8 +664,13 @@ when `LLM_API_KEY` is absent and stores vectors under the distinct
 * **Richer curator actions.** The shipped curator stages only one report page;
   future work can add individual merge/supersession/link-fix proposals while
   keeping deletes and semantic rewrites review-gated.
-* **Multi-workspace UI / web dashboard.** Out of scope for v1; revisit
-  once the headless server has been load-tested.
+* **Richer read surfaces for the web UI.** The multi-workspace read-only
+  wiki browser shipped in `ai-memory-web` (`/web` — project list, page
+  tree, page view, search). It stays read-only by design: the wiki is a
+  machine-authored record, and a browser edit surface would break the
+  invariant the whole store rests on (#482). Better *reading* — richer
+  navigation, diff/history views, graph exploration — is open. See
+  [`docs/frontend-api.md`](frontend-api.md#10-known-gaps-and-deliberate-non-goals).
 * **Real LongMemEval-S harness.** The recall-eval framework exists
   ([`crates/ai-memory-consolidate/tests/recall_eval.rs`](../crates/ai-memory-consolidate/tests/recall_eval.rs));
   porting LongMemEval-S itself requires the dataset.
@@ -611,7 +683,10 @@ when `LLM_API_KEY` is absent and stores vectors under the distinct
  - what "Karpathy-faithful" means.
 * [`docs/research-agentmemory.md`](research-agentmemory.md),
   [`research-basic-memory.md`](research-basic-memory.md),
-  [`research-cognee.md`](research-cognee.md) - prior art studied.
+  [`research-cognee.md`](research-cognee.md),
+  [`research-ecc.md`](research-ecc.md),
+  [`research-codebase-memory-mcp.md`](research-codebase-memory-mcp.md) -
+  prior art studied.
 * [`docs/auto-improvement-loop.md`](auto-improvement-loop.md) -
   Hermes Agent-inspired learning-loop research and safety boundaries.
 * [`docs/issues-*.md`](.) - concrete failure modes we've designed to

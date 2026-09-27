@@ -238,6 +238,28 @@ pub fn fail(
             ],
         )?;
         require_claim_update(changed)
+    } else if has_newer_generation(conn, job)? {
+        // A newer generation was enqueued while this one ran (enqueue only
+        // supersedes PENDING rows; a running row keeps its lease). Retrying
+        // the older snapshot now would be a second consolidation of the same
+        // session — measured 2026-09-24: generations 4751 and 4781 of session
+        // d3345285 retried five times each on an identical prompt.
+        let changed = conn.execute(
+            "UPDATE session_consolidation_jobs \
+             SET state = 'superseded', completed_at = ?1, claim_id = NULL, last_error = ?2 \
+             WHERE session_id = ?3 AND generation = ?4 \
+               AND state = 'running' AND claim_id = ?5",
+            params![
+                now,
+                truncate_error(&format!(
+                    "{error} (superseded by a newer observation generation; not retried)"
+                )),
+                job.session_id.as_bytes(),
+                generation_i64(job),
+                job.claim_id.as_bytes(),
+            ],
+        )?;
+        require_claim_update(changed)
     } else {
         let retry_at = retry_at.unwrap_or(now);
         let changed = conn.execute(
@@ -278,6 +300,43 @@ pub fn release(conn: &mut Connection, job: &SessionConsolidationJob) -> StoreRes
         ],
     )?;
     require_claim_update(changed)
+}
+
+/// Return a claimed job to the queue until `until` (Unix microseconds)
+/// without spending an attempt, recording `reason`. Used when no LLM lane
+/// could take the request (a flat lane's daily allocation is used up).
+pub fn defer(
+    conn: &mut Connection,
+    job: &SessionConsolidationJob,
+    until: i64,
+    reason: &str,
+) -> StoreResult<()> {
+    let changed = conn.execute(
+        "UPDATE session_consolidation_jobs \
+         SET state = 'pending', next_attempt_at = ?1, started_at = NULL, \
+             attempts = CASE WHEN ?2 = 1 AND attempts > 0 THEN attempts - 1 ELSE attempts END, \
+             claim_id = NULL, last_error = ?3 \
+         WHERE session_id = ?4 AND generation = ?5 \
+           AND state = 'running' AND claim_id = ?6",
+        params![
+            until,
+            i64::from(job.attempt_spent),
+            truncate_error(reason),
+            job.session_id.as_bytes(),
+            generation_i64(job),
+            job.claim_id.as_bytes(),
+        ],
+    )?;
+    require_claim_update(changed)
+}
+
+fn has_newer_generation(conn: &Connection, job: &SessionConsolidationJob) -> StoreResult<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_consolidation_jobs \
+                       WHERE session_id = ?1 AND generation > ?2)",
+        params![job.session_id.as_bytes(), generation_i64(job)],
+        |row| row.get::<_, bool>(0),
+    )?)
 }
 
 fn require_claim_update(changed: usize) -> StoreResult<()> {
@@ -487,6 +546,48 @@ mod tests {
         assert_eq!(reclaimed.attempts(), 2);
     }
 
+    /// A job deferred to the flat lane's reset waits until then and keeps its
+    /// attempt budget: an exhausted allocation says nothing about the session.
+    #[tokio::test]
+    async fn a_deferred_job_waits_for_its_time_and_spends_no_attempt() {
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let first = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.attempts(), 1);
+        let until = now + 3_600_000_000;
+        store
+            .writer
+            .defer_session_consolidation(first, until, "flat lane daily allocation used".into())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(until - 1, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "not before the reset"
+        );
+        let again = store
+            .writer
+            .claim_session_consolidation(until, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.attempts(), 1, "the deferral was refunded");
+    }
+
     #[tokio::test]
     async fn newer_generation_supersedes_older_pending_work() {
         let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
@@ -623,5 +724,100 @@ mod tests {
             .fail_session_consolidation(recovered, "terminal".into(), None)
             .await
             .unwrap();
+    }
+
+    /// Measured 2026-09-24: generation 4751 of session d3345285 was RUNNING
+    /// when 4781 was enqueued, so enqueue could not supersede it; each failure
+    /// then put it back to pending and both generations spent all five
+    /// attempts on an identical prompt. A failure of an older generation must
+    /// not be retried once a newer one exists.
+    #[tokio::test]
+    async fn a_failed_older_generation_is_superseded_not_retried_when_a_newer_one_exists() {
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let older = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(older.generation(), 1);
+
+        // New work arrives while generation 1 is running.
+        insert_observation(&store, workspace_id, project_id, session_id).await;
+        store.writer.end_session(session_id, None).await.unwrap();
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(workspace_id, project_id, session_id)
+                .await
+                .unwrap()
+        );
+
+        // Generation 1 fails with a retry scheduled for right now.
+        store
+            .writer
+            .fail_session_consolidation(older, "truncated".into(), Some(now))
+            .await
+            .unwrap();
+
+        let later = Timestamp::now().as_microsecond() + 1;
+        let next = store
+            .writer
+            .claim_session_consolidation(later, later - 1)
+            .await
+            .unwrap()
+            .expect("the newer generation runs");
+        assert_eq!(next.generation(), 2, "the older snapshot is not retried");
+        store
+            .writer
+            .complete_session_consolidation(next)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(later, later - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "generation 1 must be terminal, not pending"
+        );
+    }
+
+    /// Without a newer generation the ordinary retry still happens.
+    #[tokio::test]
+    async fn a_failed_generation_without_a_newer_one_is_still_retried() {
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let job = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .writer
+            .fail_session_consolidation(job, "transient".into(), Some(now))
+            .await
+            .unwrap();
+        let later = Timestamp::now().as_microsecond() + 1;
+        let retry = store
+            .writer
+            .claim_session_consolidation(later, later - 1)
+            .await
+            .unwrap()
+            .expect("retried");
+        assert_eq!((retry.generation(), retry.attempts()), (1, 2));
     }
 }

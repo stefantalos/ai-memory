@@ -19,6 +19,11 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 tempfile.workspace = true
 jiff.workspace = true
+tar.workspace = true
+flate2.workspace = true
+dirs.workspace = true
+# Destination-filesystem free space for the pre-migration backup receipt.
+fs2.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 notify.workspace = true
@@ -36,6 +41,8 @@ winapi-util = { workspace = true }
 # Mock HTTP server for admission chain integration tests.
 axum.workspace = true
 tower.workspace = true
+# Direct DB access to fabricate legacy (pre-OKF) stores in migration tests.
+rusqlite.workspace = true
 
 [lints]
 workspace = true

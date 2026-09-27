@@ -1,8 +1,13 @@
-# `evals/` — live A/B harness
+# `evals/` — evaluation harnesses
 
-A small Rust binary that runs the EXACT consolidation prompt
-ai-memory uses in production against two LLM providers side by side,
-and saves both outputs to disk for human comparison.
+One Rust binary (`ai-memory-eval`) with two subcommands:
+
+- **`ab`** — runs the EXACT consolidation prompt ai-memory uses in
+  production against two LLM providers side by side, and saves both
+  outputs to disk for human comparison.
+- **`retrieval`** — the LongMemEval retrieval benchmark, driven end to
+  end through a real `ai-memory serve` subprocess. Published baselines
+  live in `docs/benchmarks/`.
 
 **This is not part of the shipped binary.** It's a workspace member
 purely so it shares deps + builds with the rest. `cargo build` from
@@ -53,7 +58,7 @@ judge faithfulness, scoping, hallucination, etc.
 # string for the candidate (Ollama doesn't validate).
 export OPENROUTER_API_KEY="sk-or-v1-..."
 
-cargo run -p ai-memory-eval -- \
+cargo run -p ai-memory-eval -- ab \
     --baseline-provider openai-compat \
     --baseline-base-url https://openrouter.ai/api/v1 \
     --baseline-model moonshotai/kimi-k2.6 \
@@ -67,7 +72,7 @@ cargo run -p ai-memory-eval -- \
 ### Two Ollama models against each other
 
 ```bash
-cargo run -p ai-memory-eval -- \
+cargo run -p ai-memory-eval -- ab \
     --baseline-provider openai-compat \
     --baseline-base-url http://192.168.0.90:11434/v1 \
     --baseline-model qwen3:32b \
@@ -84,7 +89,7 @@ Run `ai-memory auth login openai-oauth` first, then point the eval harness at
 the same token file:
 
 ```bash
-cargo run -p ai-memory-eval -- \
+cargo run -p ai-memory-eval -- ab \
     --baseline-provider openai-oauth \
     --baseline-token-file ~/.local/share/ai-memory/auth.json \
     --baseline-model gpt-5.5 \
@@ -100,7 +105,7 @@ Run `ai-memory auth login copilot` first, then point the eval harness at the
 same auth file:
 
 ```bash
-cargo run -p ai-memory-eval -- \
+cargo run -p ai-memory-eval -- ab \
     --baseline-provider copilot \
     --baseline-token-file ~/.local/share/ai-memory/auth.json \
     --baseline-model gpt-5.5 \
@@ -164,3 +169,52 @@ for the next human who opens the file.
 ## Cleanup
 
 `evals/runs/` is in `.gitignore`. Drop it whenever it gets large.
+
+## `retrieval` — LongMemEval benchmark
+
+Measures the real retrieval stack against
+[LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval)
+(v1, S variant, MIT license, 500 questions over ~50-session chat
+haystacks). Nothing is mocked:
+
+1. a real `ai-memory serve` subprocess starts on a fresh temp data dir
+   (zero-LLM: no consolidation LLM, no embedder, no reranker — fully
+   deterministic and offline);
+2. each question's haystack replays through `POST /hook/batch` at the
+   production hook cadence (`session-start`, `user-prompt-submit` per
+   user turn, `stop` with the opt-in assistant excerpt per assistant
+   turn, `session-end`), one project per question;
+3. the question runs through MCP `tools/call memory_query` with
+   explicit workspace/project scoping;
+4. results are scored session-level: `hit@k` (any evidence session in
+   the top k — the "Recall@k" most systems publish) and `recall@k`
+   (fraction of evidence sessions found). The 30 abstention questions
+   are excluded and reported separately.
+
+The dataset (278 MB) is NOT committed; it downloads to
+`evals/datasets/` (gitignored) with a pinned sha256 that fails loudly
+on upstream drift.
+
+```bash
+cargo build --release -p ai-memory-cli   # the server under test
+cargo run --release -p ai-memory-eval -- retrieval --fetch   # full 500
+cargo run -p ai-memory-eval -- retrieval --sample 10         # smoke
+```
+
+Output: a per-category table on stdout plus
+`evals/runs/<timestamp>-retrieval/report.{json,md}` with full
+provenance (commit, dataset sha, hardware, per-question scores).
+When publishing a baseline, copy the markdown into `docs/benchmarks/`.
+
+Honest-numbers notes:
+
+- capture is production-shaped: excerpts are bounded at the 2 KB
+  privacy boundary, so evidence buried deep inside one long turn is
+  genuinely out of reach — that is the system being measured, not a
+  harness artifact;
+- each session's original date is prepended to its turn text, since a
+  replayed history must carry its own timestamps (the official
+  harness exposes the same information to retrievers);
+- competitors' published numbers (e.g. agentmemory 0.967 R@5,
+  mcp-memory-service 0.804 R@5) are answer-evidence Recall@5 on this
+  same v1 dataset, comparable to our `hit@5`.

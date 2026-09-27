@@ -10,14 +10,14 @@ use std::path::{Path, PathBuf};
 
 use ai_memory_llm::{
     AuthRequirement, EmbedderChoice, EmbedderConfig, LlmError, LlmResult, OPENCODE_DEFAULT_MODEL,
-    ProviderAuth, ProviderChoice, ProviderConfig,
+    ProviderAuth, ProviderChoice, ProviderConfig, ReasoningEffort,
 };
 use anyhow::{Context, Result};
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 /// Default HTTP bind address for the local single-user server.
@@ -38,6 +38,26 @@ pub const DEFAULT_WORKSPACE: &str = ai_memory_core::DEFAULT_WORKSPACE_NAME;
 
 /// Defensive project fallback used only when no cwd/project is available.
 pub const DEFAULT_PROJECT: &str = ai_memory_core::DEFAULT_PROJECT_NAME;
+
+/// Model the flat fallback lane asks for unless
+/// `AI_MEMORY_FLAT_FALLBACK_MODEL` names another: the Codex CLI's own default
+/// on the Floor No 8 SRL seat (`~/.codex/config.toml`, read 2026-09-26).
+pub const FLAT_FALLBACK_DEFAULT_MODEL: &str = "gpt-6-astra";
+
+/// Resolved settings of the flat fallback lane ([`Config::flat_fallback_settings`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlatFallbackSettings {
+    /// The Codex CLI's `auth.json` (read-only).
+    pub auth_file: PathBuf,
+    /// Model id sent to the Codex Responses backend.
+    pub model: String,
+    /// Requests admitted per UTC day.
+    pub daily_max_requests: u32,
+    /// Reasoning effort for this lane: modest, never the CLI's own setting.
+    pub reasoning_effort: ai_memory_llm::ReasoningEffort,
+    /// Per-request timeout.
+    pub timeout_secs: u64,
+}
 
 /// Config-file representation of retention settings.
 ///
@@ -61,6 +81,11 @@ pub struct DecaySettings {
     pub hard_delete_after_days: i64,
     /// Optional weight for the number of distinct authenticated readers.
     pub breadth_weight: f64,
+    /// Age past which a consolidated session's raw observations may be pruned.
+    /// `0` disables the pass; nothing is deleted until an operator opts in.
+    pub observation_retention_days: i64,
+    /// Observation rows deleted per prune transaction.
+    pub observation_prune_batch: usize,
 }
 
 impl Default for DecaySettings {
@@ -74,6 +99,8 @@ impl Default for DecaySettings {
             cold_threshold: base.cold_threshold,
             hard_delete_after_days: base.hard_delete_after_days,
             breadth_weight: 0.0,
+            observation_retention_days: 0,
+            observation_prune_batch: ai_memory_consolidate::DEFAULT_OBSERVATION_PRUNE_BATCH,
         }
     }
 }
@@ -89,6 +116,19 @@ impl DecaySettings {
             salience_default: self.salience_default,
             cold_threshold: self.cold_threshold,
             hard_delete_after_days: self.hard_delete_after_days,
+        }
+    }
+
+    /// Opt-in observation prune bound consumed by the M8 sweep.
+    ///
+    /// Deliberately separate from [`Self::decay_params`]: keeping it out of the
+    /// public `DecayParams` struct is what lets every downstream Rust caller
+    /// that builds one directly keep compiling — and keep today's behaviour.
+    #[must_use]
+    pub fn observation_retention(self) -> ai_memory_consolidate::ObservationRetention {
+        ai_memory_consolidate::ObservationRetention {
+            days: self.observation_retention_days,
+            batch: self.observation_prune_batch,
         }
     }
 }
@@ -150,6 +190,14 @@ pub struct Config {
     /// ceiling (observed with free aggregator tiers). Set with
     /// `AI_MEMORY_LLM_TIMEOUT_SECS`.
     pub llm_timeout_secs: u64,
+    /// Optional reasoning / thinking effort. Omitted when unset so the
+    /// model default applies. Env: `AI_MEMORY_LLM_REASONING_EFFORT`.
+    /// Values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+    /// `max`, `ultra`, `persistent`. Each provider maps this to its
+    /// native request field (OpenAI `reasoning_effort`, OpenRouter
+    /// `reasoning`, xAI Grok `reasoning_effort`, Anthropic
+    /// `output_config.effort`, Codex `reasoning.effort`).
+    pub llm_reasoning_effort: Option<ReasoningEffort>,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default. Provider work is durably queued after the
@@ -313,6 +361,16 @@ pub struct RuntimeEnv {
     gemini_api_key: Option<SecretString>,
     llm_api_key: Option<SecretString>,
     llm_base_url: Option<String>,
+    flat_fallback: Option<String>,
+    flat_fallback_auth_file: Option<PathBuf>,
+    flat_fallback_model: Option<String>,
+    flat_fallback_daily_max_requests: Option<String>,
+    llm_extra_api_key_files: Vec<PathBuf>,
+    llm_ledger_path: Option<PathBuf>,
+    finops_presence_path: Option<PathBuf>,
+    metered_entity: Option<String>,
+    llm_alarm_path: Option<PathBuf>,
+    embedding_api_key: Option<SecretString>,
     copilot_github_token: Option<SecretString>,
     github_copilot_api_token: Option<SecretString>,
     copilot_api_url: Option<String>,
@@ -322,6 +380,26 @@ pub struct RuntimeEnv {
 }
 
 impl RuntimeEnv {
+    /// Test-only: the lane-chain inputs, everything else default.
+    #[cfg(test)]
+    pub(crate) fn for_lane_test(
+        llm_api_key: &str,
+        extra_key_files: Vec<PathBuf>,
+        ledger: PathBuf,
+    ) -> Self {
+        Self {
+            llm_api_key: Some(SecretString::from(llm_api_key.to_string())),
+            llm_extra_api_key_files: extra_key_files,
+            llm_ledger_path: Some(ledger),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_home_for_test(&mut self, home: &std::path::Path) {
+        self.home_dir = Some(home.display().to_string());
+    }
+
     fn from_process() -> Self {
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
@@ -350,6 +428,41 @@ impl RuntimeEnv {
             gemini_api_key: env_secret("GEMINI_API_KEY").or_else(|| env_secret("GOOGLE_API_KEY")),
             llm_api_key: env_secret("LLM_API_KEY"),
             llm_base_url: env_string("LLM_BASE_URL"),
+            // The flat fallback lane (FN8-9336): the ChatGPT seat the Codex
+            // CLI is signed in with, read-only from its auth.json. On by
+            // default when that file exists; `AI_MEMORY_FLAT_FALLBACK=off`
+            // removes it. Capped per UTC day in requests.
+            flat_fallback: env_string("AI_MEMORY_FLAT_FALLBACK"),
+            flat_fallback_auth_file: env_path("AI_MEMORY_FLAT_FALLBACK_AUTH_FILE"),
+            flat_fallback_model: env_string("AI_MEMORY_FLAT_FALLBACK_MODEL"),
+            flat_fallback_daily_max_requests: env_string(
+                "AI_MEMORY_FLAT_FALLBACK_DAILY_MAX_REQUESTS",
+            ),
+            // Further keys for the PRIMARY provider (e.g. a second Poolside
+            // account), colon-separated FILE PATHS: each becomes its own lane
+            // ahead of the fallback, with its own breaker.
+            llm_extra_api_key_files: env_string("AI_MEMORY_LLM_EXTRA_API_KEY_FILES")
+                .map(|v| {
+                    v.split(':')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // Call ledger (every lane call, key named by fingerprint only);
+            // default `<data_dir>/llm-calls.jsonl`, `off` disables it.
+            llm_ledger_path: env_path("AI_MEMORY_LLM_LEDGER_PATH"),
+            // floo `state/finops/harness-presence.jsonl`: metered calls are
+            // copied there so the charter's FinOps ledger sees them.
+            finops_presence_path: env_path("AI_MEMORY_FINOPS_PRESENCE_PATH"),
+            metered_entity: env_string("AI_MEMORY_METERED_ENTITY"),
+            // Actionable bus for breaker alarms (chyros shape).
+            llm_alarm_path: env_path("AI_MEMORY_LLM_ALARM_PATH"),
+            // The embedding counterpart of LLM_API_KEY: it credentials the
+            // embedding role alone, so the embedder can target a different
+            // provider than the chat model instead of borrowing its key.
+            embedding_api_key: env_secret("EMBEDDING_API_KEY"),
             copilot_github_token: env_secret("COPILOT_GITHUB_TOKEN")
                 .or_else(|| env_secret("GH_TOKEN"))
                 .or_else(|| env_secret("GITHUB_TOKEN")),
@@ -445,9 +558,9 @@ pub struct AuthSettings {
     /// `Authorization: Bearer <token>`. Generate one with
     /// `ai-memory generate-auth-token`.
     pub bearer_token: Option<String>,
-    /// Mark the browser session cookie `Secure`. Enable this only when a
-    /// trusted reverse proxy terminates HTTPS for `/web`; direct HTTP browsers
-    /// deliberately will not send a Secure cookie.
+    /// Mark the browser session cookie `Secure`. Human authentication on a
+    /// non-loopback listener requires this explicit HTTPS reverse-proxy
+    /// posture. It may be false only for direct loopback smoke/development.
     pub secure_cookie: bool,
     /// Username attributed to writes authenticated by the bearer
     /// token (rung 1: "identified single-user"). When set, the
@@ -474,12 +587,11 @@ pub struct AuthSettings {
     pub root_name: Option<String>,
     /// Per-server token pepper used by
     /// [`ai_memory_store::hash_token`] to keep stolen
-    /// `users.token_hash` rows useless to an offline attacker.
+    /// `api_credentials.token_hash` rows useless to an offline attacker.
     /// Auto-generated by `ai-memory init` (32 bytes of OS CSPRNG,
-    /// hex-encoded). MUST NOT change after the first user is added
-    /// — rotating it invalidates every existing token. It enables DB-user
-    /// token resolution even during first-user bootstrap; operational admin
-    /// access becomes root-only once a user row exists.
+    /// hex-encoded). MUST NOT change after the first native API key is
+    /// added — rotating it invalidates every existing native key. Human
+    /// passwords and sessions do not use this pepper.
     pub token_pepper: Option<String>,
     /// Dedicated bearer token for a trusted authenticating proxy, allowing it
     /// to name the real end user in `X-Memory-Actor-*` headers.
@@ -491,6 +603,21 @@ pub struct AuthSettings {
     ///
     /// Only set this when the server is reachable *only* through that proxy.
     pub actor_proxy_bearer_token: Option<String>,
+    /// One-shot greenfield root password. Consumed when
+    /// `human_auth_state.bootstrap_completed` is false, then ignored forever.
+    /// Set with `AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD`.
+    #[serde(skip_serializing)]
+    pub initial_root_password: Option<SecretString>,
+    /// Break-glass recovery secret for `POST /auth/recovery`. Compared
+    /// constant-time; never stored in SQLite. Set with
+    /// `AI_MEMORY_AUTH__RECOVERY_TOKEN`.
+    #[serde(skip_serializing)]
+    pub recovery_token: Option<SecretString>,
+    /// CIDRs allowed to supply `X-Forwarded-For` for login rate limiting.
+    /// Bare addresses are treated as `/32` or `/128`. Set with
+    /// `AI_MEMORY_AUTH__TRUSTED_PROXY_CIDRS`.
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub trusted_proxy_cidrs: Vec<String>,
 }
 
 impl std::fmt::Debug for AuthSettings {
@@ -514,6 +641,15 @@ impl std::fmt::Debug for AuthSettings {
                 "actor_proxy_bearer_token",
                 &self.actor_proxy_bearer_token.as_ref().map(|_| "<redacted>"),
             )
+            .field(
+                "initial_root_password",
+                &self.initial_root_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "recovery_token",
+                &self.recovery_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .finish()
     }
 }
@@ -577,6 +713,7 @@ impl Default for Config {
             llm_base_url: None,
             llm_compat_strict: true,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
+            llm_reasoning_effort: None,
             consolidate_on_session_end: false,
             capture_assistant: false,
             strip_root_combinators: false,
@@ -678,6 +815,9 @@ pub struct AutoImproveSettings {
     pub max_rule_page_tokens: usize,
     /// Maximum approximate tokens allowed in one procedures/ page.
     pub max_procedure_page_tokens: usize,
+    /// Output-token budget for one review call; providers clamp it to their
+    /// own ceiling (Poolside 14,000, Gemini 2.5 Flash 65,536).
+    pub review_max_output_tokens: u32,
     /// Whether future reviewers may include raw observation fallback details.
     pub include_raw_fallback: bool,
     /// Synthetic actor used for autonomous proposal provenance.
@@ -726,6 +866,12 @@ pub struct AutoImproveSchedulerSettings {
     pub max_sessions_per_tick: usize,
     /// Minimum age after SessionEnd before a session becomes eligible.
     pub min_session_age_secs: u64,
+    /// Cross-session ("experience") pass: run after this many NEW
+    /// completed sessions per project. `0` (default) disables the pass —
+    /// it is opt-in and shaped by docs/experience.md.
+    pub experience_every_sessions: u64,
+    /// How many recent session summary pages one experience pass reads.
+    pub experience_sessions: usize,
 }
 
 impl Default for AutoImproveSchedulerSettings {
@@ -735,6 +881,8 @@ impl Default for AutoImproveSchedulerSettings {
             interval_secs: 3_600,
             max_sessions_per_tick: 1,
             min_session_age_secs: 600,
+            experience_every_sessions: 0,
+            experience_sessions: 10,
         }
     }
 }
@@ -771,6 +919,8 @@ impl Default for AutoImproveSettings {
             max_rule_page_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS,
             max_procedure_page_tokens:
                 ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
+            review_max_output_tokens:
+                ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS,
             include_raw_fallback: false,
             proposal_actor: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
             pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
@@ -924,6 +1074,19 @@ impl Config {
             );
         }
 
+        // Fail closed at load rather than at 3am inside a destructive pass: a
+        // negative age would be a nonsensical cutoff, and a zero batch would
+        // spin the prune loop forever without deleting anything.
+        if config.decay.observation_retention_days < 0 {
+            anyhow::bail!(
+                "decay.observation_retention_days must be greater than or equal to zero \
+                 (0 disables observation pruning)"
+            );
+        }
+        if config.decay.observation_prune_batch == 0 {
+            anyhow::bail!("decay.observation_prune_batch must be greater than zero");
+        }
+
         // Fail at startup rather than shipping a prompt that is all scaffolding
         // and no observations: below this floor the fixed system prompt and page
         // conventions consume the entire budget, so every consolidation would
@@ -954,6 +1117,7 @@ impl Config {
                 config.llm_timeout_secs
             );
         }
+        validate_auth_secrets(&config.auth)?;
 
         Ok(config)
     }
@@ -973,41 +1137,8 @@ impl Config {
         let Some(provider_raw) = non_empty(self.llm_provider.as_deref()) else {
             return Ok(None);
         };
-        let provider = match provider_raw {
-            "anthropic" => ProviderChoice::Anthropic,
-            "openai" => ProviderChoice::OpenAi,
-            "gemini" | "google" => ProviderChoice::Gemini,
-            "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
-            "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
-            "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
-            "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
-            "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
-            other => {
-                return Err(LlmError::NotConfigured(format!(
-                    "AI_MEMORY_LLM_PROVIDER={other} is not one of \
-                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
-                )));
-            }
-        };
-        let model = match non_empty(self.llm_model.as_deref()) {
-            Some(s) => s.to_string(),
-            None => match provider {
-                ProviderChoice::Anthropic => "claude-haiku-4-5".to_string(),
-                ProviderChoice::AnthropicOAuth => "claude-sonnet-4-6".to_string(),
-                ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
-                ProviderChoice::Gemini => "gemini-3.5-flash".to_string(),
-                ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
-                ProviderChoice::Copilot => "gpt-5.5".to_string(),
-                ProviderChoice::OpenAiCompat => {
-                    return Err(LlmError::NotConfigured(
-                        "AI_MEMORY_LLM_MODEL must be set explicitly for openai-compat \
-                         (no safe default for self-hosted / aggregator endpoints)"
-                            .into(),
-                    ));
-                }
-                ProviderChoice::OpenCode => OPENCODE_DEFAULT_MODEL.to_string(),
-            },
-        };
+        let provider = parse_provider_choice(provider_raw, "AI_MEMORY_LLM_PROVIDER")?;
+        let model = resolve_llm_model(provider, self.llm_model.as_deref(), "AI_MEMORY_LLM_MODEL")?;
         Ok(Some(ProviderConfig {
             provider,
             model,
@@ -1021,13 +1152,134 @@ impl Config {
                 .or_else(|| self.runtime_env.llm_base_url.clone()),
             compat_strict: self.llm_compat_strict,
             request_timeout_secs: self.llm_timeout_secs,
+            reasoning_effort: self.llm_reasoning_effort,
         }))
     }
 
-    /// OpenAI-compatible embedding key. Direct OpenAI keeps requiring
-    /// `OPENAI_API_KEY`; a custom embedding base URL may reuse `LLM_API_KEY`
-    /// for gateways such as OpenRouter.
+    /// The flat fallback lane (FN8-9336): the ChatGPT seat through the Codex
+    /// CLI's own sign-in, or `None` when it is switched off
+    /// (`AI_MEMORY_FLAT_FALLBACK=off`) or the CLI's `auth.json` is absent.
+    ///
+    /// Defaults, used whenever the env is unset: auth file
+    /// `$HOME/.codex/auth.json`, model [`FLAT_FALLBACK_DEFAULT_MODEL`], cap
+    /// [`ai_memory_llm::DEFAULT_FLAT_DAILY_MAX_REQUESTS`] requests per UTC day.
+    /// A cap that does not parse keeps the default: a typo never raises it.
+    #[must_use]
+    pub fn flat_fallback_settings(&self) -> Option<FlatFallbackSettings> {
+        let env = &self.runtime_env;
+        match non_empty(env.flat_fallback.as_deref()).map(str::to_ascii_lowercase) {
+            None => {}
+            Some(v) if v == "codex-oauth" || v == "on" || v == "1" || v == "true" => {}
+            Some(v) if v == "off" || v == "0" || v == "false" || v == "none" => return None,
+            Some(other) => {
+                tracing::warn!(
+                    value = %other,
+                    "AI_MEMORY_FLAT_FALLBACK not recognised (codex-oauth|off); flat lane disabled"
+                );
+                return None;
+            }
+        }
+        let auth_file = env.flat_fallback_auth_file.clone().or_else(|| {
+            non_empty(env.home_dir.as_deref()).map(|h| PathBuf::from(h).join(".codex/auth.json"))
+        })?;
+        if !auth_file.is_file() {
+            tracing::info!(
+                path = %auth_file.display(),
+                "no Codex CLI sign-in found; flat fallback lane not configured"
+            );
+            return None;
+        }
+        let default_cap = ai_memory_llm::DEFAULT_FLAT_DAILY_MAX_REQUESTS;
+        let daily_max_requests = match non_empty(env.flat_fallback_daily_max_requests.as_deref()) {
+            None => default_cap,
+            Some(raw) => raw.trim().parse::<u32>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    value = raw,
+                    default = default_cap,
+                    "AI_MEMORY_FLAT_FALLBACK_DAILY_MAX_REQUESTS is not a number; default kept"
+                );
+                default_cap
+            }),
+        };
+        Some(FlatFallbackSettings {
+            auth_file,
+            model: non_empty(env.flat_fallback_model.as_deref())
+                .unwrap_or(FLAT_FALLBACK_DEFAULT_MODEL)
+                .to_string(),
+            daily_max_requests,
+            reasoning_effort: ai_memory_llm::ReasoningEffort::Low,
+            timeout_secs: self.llm_timeout_secs,
+        })
+    }
+
+    /// Extra lanes for the PRIMARY provider: one [`ProviderConfig`] per
+    /// readable key file in `AI_MEMORY_LLM_EXTRA_API_KEY_FILES`, identical to
+    /// `primary` except for the key, each paired with its key fingerprint.
+    ///
+    /// A file that is unreadable, empty, or holds the primary's own key is
+    /// skipped with a warning naming the path only. Only providers
+    /// authenticated by an API key can have extra lanes.
+    #[must_use]
+    pub fn llm_extra_primary_configs(&self, primary: &ProviderConfig) -> Vec<(ProviderConfig, String)> {
+        let primary_fp = self.primary_key_fingerprint(primary.provider);
+        let mut seen: Vec<String> = primary_fp.into_iter().collect();
+        let mut out = Vec::new();
+        for path in &self.runtime_env.llm_extra_api_key_files {
+            let key = match std::fs::read_to_string(path) {
+                Ok(raw) if !raw.trim().is_empty() => raw.trim().to_string(),
+                Ok(_) => {
+                    tracing::warn!(path = %path.display(), "extra LLM key file is empty; lane skipped");
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(path = %path.display(), error = %err, "extra LLM key file unreadable; lane skipped");
+                    continue;
+                }
+            };
+            let fp = ai_memory_llm::key_fingerprint(&key);
+            if seen.contains(&fp) {
+                tracing::warn!(path = %path.display(), key_fp = %fp, "extra LLM key duplicates a configured key; lane skipped");
+                continue;
+            }
+            seen.push(fp.clone());
+            let mut cfg = primary.clone();
+            cfg.auth = self.provider_auth(primary.provider, Some(SecretString::from(key)));
+            out.push((cfg, fp));
+        }
+        out
+    }
+
+    /// Fingerprint of the primary provider's env-sourced API key, if any.
+    #[must_use]
+    pub fn primary_key_fingerprint(&self, provider: ProviderChoice) -> Option<String> {
+        self.provider_api_key(provider)
+            .map(|k| ai_memory_llm::key_fingerprint(k.expose_secret()))
+    }
+
+    /// The LLM call ledger configured by the environment. See
+    /// [`ai_memory_llm::JsonlLedger`].
+    #[must_use]
+    pub fn llm_ledger(&self) -> ai_memory_llm::JsonlLedger {
+        let env = &self.runtime_env;
+        let calls = match env.llm_ledger_path.as_deref() {
+            Some(p) if p.as_os_str() == "off" => None,
+            Some(p) => Some(p.to_path_buf()),
+            None => Some(self.data_dir.join("llm-calls.jsonl")),
+        };
+        ai_memory_llm::JsonlLedger::new(calls)
+            .with_presence(env.finops_presence_path.clone(), env.metered_entity.clone())
+            .with_alarm(env.llm_alarm_path.clone())
+    }
+
+    /// OpenAI-compatible embedding key. `EMBEDDING_API_KEY` is checked first
+    /// so an operator can point the embedder at one provider while the LLM
+    /// uses another; without it, direct OpenAI keeps requiring
+    /// `OPENAI_API_KEY` and a custom embedding base URL may reuse
+    /// `LLM_API_KEY` for gateways such as OpenRouter.
     fn openai_embedding_api_key(&self) -> LlmResult<SecretString> {
+        if let Some(key) = self.runtime_env.embedding_api_key.clone() {
+            return Ok(key);
+        }
         if let Some(key) = self.runtime_env.openai_api_key.clone() {
             return Ok(key);
         }
@@ -1036,10 +1288,14 @@ impl Config {
                 return Ok(key);
             }
             return Err(LlmError::NotConfigured(
-                "OPENAI_API_KEY or LLM_API_KEY required for openai-compatible embeddings".into(),
+                "EMBEDDING_API_KEY, OPENAI_API_KEY or LLM_API_KEY required for \
+                 openai-compatible embeddings"
+                    .into(),
             ));
         }
-        Err(LlmError::NotConfigured("OPENAI_API_KEY".into()))
+        Err(LlmError::NotConfigured(
+            "EMBEDDING_API_KEY or OPENAI_API_KEY".into(),
+        ))
     }
 
     /// Whether the operator opted into post-RRF reranking.
@@ -1068,18 +1324,26 @@ impl Config {
     /// Returns [`LlmError::NotConfigured`] for unknown providers, missing API
     /// keys, or invalid dimensions.
     pub fn embedder_config(&self) -> LlmResult<Option<EmbedderConfig>> {
-        let Some(provider_raw) = non_empty(self.embedding_provider.as_deref()) else {
-            return Ok(None);
+        // 2.0 default: hybrid retrieval out of the box. An unset provider
+        // selects in-process `local` embeddings BEST-EFFORT (the serve
+        // layer degrades to no-embedder if the model cannot be fetched or
+        // loaded); `embedding_provider = "none"` opts out entirely, and an
+        // explicitly configured provider keeps hard-failure semantics.
+        let (provider_raw, defaulted) = match non_empty(self.embedding_provider.as_deref()) {
+            Some("none" | "off" | "disabled") => return Ok(None),
+            Some(raw) => (raw, false),
+            None => ("local", true),
         };
         let provider = match provider_raw {
             "openai" => EmbedderChoice::OpenAi,
             "voyage" => EmbedderChoice::Voyage,
             "google" | "gemini" => EmbedderChoice::Google,
             "openai-compat" | "openai_compat" => EmbedderChoice::OpenAiCompat,
+            "local" => EmbedderChoice::Local,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of \
-                     openai|voyage|google|gemini|openai-compat"
+                     openai|voyage|google|gemini|openai-compat|local|none"
                 )));
             }
         };
@@ -1096,6 +1360,7 @@ impl Config {
                             .into(),
                     ));
                 }
+                EmbedderChoice::Local => ai_memory_llm::LOCAL_MODEL.to_string(),
             },
         };
         let dim = match self.embedding_dim {
@@ -1126,12 +1391,16 @@ impl Config {
                 LlmError::NotConfigured("GEMINI_API_KEY or GOOGLE_API_KEY".into())
             })?,
             // Keyless engines (Ollama, LM Studio) are the norm; a
-            // gateway key rides on LLM_API_KEY when present.
+            // gateway key rides on EMBEDDING_API_KEY, or on LLM_API_KEY
+            // when the chat model shares that gateway.
             EmbedderChoice::OpenAiCompat => self
                 .runtime_env
-                .llm_api_key
+                .embedding_api_key
                 .clone()
+                .or_else(|| self.runtime_env.llm_api_key.clone())
                 .unwrap_or_else(|| SecretString::from(String::new())),
+            // In-process: no key, ever.
+            EmbedderChoice::Local => SecretString::from(String::new()),
         };
         let base_url = self.embedding_base_url.clone();
         if provider == EmbedderChoice::OpenAiCompat && non_empty(base_url.as_deref()).is_none() {
@@ -1145,6 +1414,8 @@ impl Config {
             dim,
             api_key,
             base_url,
+            models_dir: Some(self.data_dir.join("models")),
+            defaulted,
         }))
     }
 
@@ -1245,6 +1516,53 @@ impl Config {
     }
 }
 
+/// Parse a user-facing LLM provider name. `var` names the setting in errors.
+fn parse_provider_choice(raw: &str, var: &str) -> LlmResult<ProviderChoice> {
+    Ok(match raw {
+        "anthropic" => ProviderChoice::Anthropic,
+        "openai" => ProviderChoice::OpenAi,
+        "gemini" | "google" => ProviderChoice::Gemini,
+        "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
+        "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
+        "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
+        "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
+        "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
+        other => {
+            return Err(LlmError::NotConfigured(format!(
+                "{var}={other} is not one of \
+                 anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
+            )));
+        }
+    })
+}
+
+/// The configured model, or the provider's built-in default. `var` names the
+/// model setting in errors.
+fn resolve_llm_model(
+    provider: ProviderChoice,
+    configured: Option<&str>,
+    var: &str,
+) -> LlmResult<String> {
+    Ok(match non_empty(configured) {
+        Some(s) => s.to_string(),
+        None => match provider {
+            ProviderChoice::Anthropic => "claude-haiku-4-5".to_string(),
+            ProviderChoice::AnthropicOAuth => "claude-sonnet-4-6".to_string(),
+            ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
+            ProviderChoice::Gemini => "gemini-3.5-flash".to_string(),
+            ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
+            ProviderChoice::Copilot => "gpt-5.5".to_string(),
+            ProviderChoice::OpenAiCompat => {
+                return Err(LlmError::NotConfigured(format!(
+                    "{var} must be set explicitly for openai-compat \
+                     (no safe default for self-hosted / aggregator endpoints)"
+                )));
+            }
+            ProviderChoice::OpenCode => OPENCODE_DEFAULT_MODEL.to_string(),
+        },
+    })
+}
+
 fn env_string(name: &str) -> Option<String> {
     std::env::var(name).ok().and_then(|s| {
         let trimmed = s.trim();
@@ -1264,8 +1582,137 @@ fn env_secret(name: &str) -> Option<SecretString> {
     env_string(name).map(SecretString::from)
 }
 
+fn non_empty_secret(secret: Option<&SecretString>) -> Option<&str> {
+    non_empty(secret.map(ExposeSecret::expose_secret))
+}
+
+/// Reject equal configured secrets without logging their values.
+fn validate_auth_secrets(auth: &AuthSettings) -> Result<()> {
+    let mut named: Vec<(&str, &str)> = Vec::new();
+    if let Some(v) = non_empty(auth.bearer_token.as_deref()) {
+        named.push(("[auth].bearer_token", v));
+    }
+    if let Some(v) = non_empty(auth.actor_proxy_bearer_token.as_deref()) {
+        named.push(("[auth].actor_proxy_bearer_token", v));
+    }
+    if let Some(v) = non_empty_secret(auth.recovery_token.as_ref()) {
+        if v.len() < 32 {
+            anyhow::bail!("[auth].recovery_token must be at least 32 characters");
+        }
+        if v.starts_with(ai_memory_core::SESSION_SECRET_PREFIX)
+            || v.starts_with(ai_memory_core::NATIVE_API_KEY_PREFIX)
+            || v.starts_with(ai_memory_core::EXTERNAL_API_KEY_PREFIX)
+        {
+            anyhow::bail!("[auth].recovery_token must not use a reserved credential prefix");
+        }
+        named.push(("[auth].recovery_token", v));
+    }
+    if let Some(v) = non_empty_secret(auth.initial_root_password.as_ref()) {
+        named.push(("[auth].initial_root_password", v));
+    }
+    for i in 0..named.len() {
+        for j in (i + 1)..named.len() {
+            if named[i].1 == named[j].1 {
+                anyhow::bail!(
+                    "{} must differ from {}; reuse would collapse credential classes",
+                    named[i].0,
+                    named[j].0
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn non_empty(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// `<data_dir>/auth-token` — the raw bearer, `0600`.
+#[must_use]
+pub fn hook_auth_token_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("auth-token")
+}
+
+/// `<data_dir>/auth-header` — the same bearer as a complete
+/// `Authorization:` line, `0600`.
+///
+/// A second file rather than a second parse: the shell hooks pass this to
+/// `curl -H @<file>`, which is what keeps the credential out of *curl's*
+/// argv. Building the header inline would put it straight back on a command
+/// line, which is the whole problem (#552).
+#[must_use]
+pub fn hook_auth_header_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("auth-header")
+}
+
+/// Persist the bearer for hooks to read, replacing any previous pair.
+///
+/// Both files are written `0600` inside the data dir, which is itself `0700`.
+/// That is strictly less exposure than the status quo, where the token sat in
+/// the agent's own config file *and* on the command line of every hook and
+/// every `curl` — readable through `/proc/<pid>/cmdline` by any local user for
+/// as long as each ran.
+///
+/// # Errors
+/// Propagates IO failures from creating the data dir or writing either file.
+pub fn store_hook_auth_token(data_dir: &Path, token: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    write_secret(&hook_auth_token_path_in(data_dir), token)?;
+    write_secret(
+        &hook_auth_header_path_in(data_dir),
+        &format!("Authorization: Bearer {token}\n"),
+    )
+}
+
+/// Remove a persisted bearer pair. Absent files are not an error.
+///
+/// # Errors
+/// Propagates IO failures other than "not found".
+pub fn clear_hook_auth_token(data_dir: &Path) -> std::io::Result<()> {
+    for path in [
+        hook_auth_token_path_in(data_dir),
+        hook_auth_header_path_in(data_dir),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Read the persisted bearer, if one was stored. Trailing newline trimmed.
+#[must_use]
+pub fn read_hook_auth_token(data_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(hook_auth_token_path_in(data_dir)).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Write `contents` to `path` with owner-only permissions.
+///
+/// The mode is set on the handle before any bytes are written on Unix, so the
+/// secret is never briefly world-readable between `create` and `set_permissions`.
+fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no mode bits here; the data dir's own ACL is the boundary.
+        std::fs::write(path, contents)
+    }
 }
 
 fn default_data_dir() -> PathBuf {
@@ -1301,8 +1748,85 @@ fn normalize_home_dir(home: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #552: the bearer used to travel on every hook's command line, readable
+    /// through `/proc/<pid>/cmdline` by any local user. It now lives in the
+    /// data dir instead — which is only an improvement if the files are not
+    /// world-readable, so the mode is asserted rather than assumed.
+    #[test]
+    fn a_persisted_hook_token_is_owner_only_and_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+
+        store_hook_auth_token(&dd, "s3cret-bearer").unwrap();
+
+        assert_eq!(read_hook_auth_token(&dd).as_deref(), Some("s3cret-bearer"));
+        assert_eq!(
+            std::fs::read_to_string(hook_auth_header_path_in(&dd)).unwrap(),
+            "Authorization: Bearer s3cret-bearer\n",
+            "the header file is what curl reads with -H @file"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for path in [hook_auth_token_path_in(&dd), hook_auth_header_path_in(&dd)] {
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(
+                    mode,
+                    0o600,
+                    "{} must be owner-only, got {mode:o}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// Re-running `install-hooks --apply` after `user rotate-token` must leave
+    /// the new bearer, not both.
+    #[test]
+    fn storing_a_second_token_replaces_the_first() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        store_hook_auth_token(&dd, "old-token").unwrap();
+        store_hook_auth_token(&dd, "new-token").unwrap();
+
+        assert_eq!(read_hook_auth_token(&dd).as_deref(), Some("new-token"));
+        assert!(
+            !std::fs::read_to_string(hook_auth_header_path_in(&dd))
+                .unwrap()
+                .contains("old-token"),
+            "a rotated token must not leave the previous one behind"
+        );
+    }
+
+    /// Absent, empty, and whitespace-only files all read as "no token" rather
+    /// than as an empty bearer, which would send `Authorization: Bearer `.
+    #[test]
+    fn an_absent_or_blank_token_file_reads_as_none() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        assert!(read_hook_auth_token(&dd).is_none(), "absent");
+
+        std::fs::create_dir_all(&dd).unwrap();
+        std::fs::write(hook_auth_token_path_in(&dd), "").unwrap();
+        assert!(read_hook_auth_token(&dd).is_none(), "empty");
+        std::fs::write(hook_auth_token_path_in(&dd), "  \n ").unwrap();
+        assert!(read_hook_auth_token(&dd).is_none(), "whitespace only");
+    }
+
+    #[test]
+    fn clearing_a_token_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        store_hook_auth_token(&dd, "tok").unwrap();
+        clear_hook_auth_token(&dd).unwrap();
+        assert!(read_hook_auth_token(&dd).is_none());
+        clear_hook_auth_token(&dd).expect("clearing twice must not error");
+    }
     use super::*;
-    use secrecy::ExposeSecret;
+    use rstest::rstest;
+    use secrecy::{ExposeSecret, SecretString};
     use tempfile::TempDir;
 
     #[test]
@@ -1312,6 +1836,8 @@ mod tests {
             root_username: Some("operator".into()),
             token_pepper: Some("pepper-secret-sentinel".into()),
             actor_proxy_bearer_token: Some("proxy-secret-sentinel".into()),
+            initial_root_password: Some(SecretString::from("initial-password-sentinel")),
+            recovery_token: Some(SecretString::from("recovery-token-sentinel-32chars")),
             ..AuthSettings::default()
         };
         let config = Config {
@@ -1326,9 +1852,55 @@ mod tests {
                 "bearer-secret-sentinel",
                 "pepper-secret-sentinel",
                 "proxy-secret-sentinel",
+                "initial-password-sentinel",
+                "recovery-token-sentinel-32chars",
             ] {
                 assert!(!rendered.contains(secret), "Debug output exposed {secret}");
             }
+        }
+    }
+
+    #[test]
+    fn validate_auth_secrets_rejects_short_recovery_token() {
+        let auth = AuthSettings {
+            recovery_token: Some(SecretString::from("too-short-recovery-token")),
+            ..AuthSettings::default()
+        };
+        let err = validate_auth_secrets(&auth).unwrap_err();
+        assert!(err.to_string().contains("32"), "{err:#}");
+        assert!(!err.to_string().contains("too-short-recovery-token"));
+    }
+
+    #[test]
+    fn validate_auth_secrets_rejects_equal_recovery_and_bearer() {
+        let secret = "this-recovery-token-is-32-chars!!";
+        let auth = AuthSettings {
+            bearer_token: Some(secret.into()),
+            recovery_token: Some(SecretString::from(secret)),
+            ..AuthSettings::default()
+        };
+        let err = validate_auth_secrets(&auth).unwrap_err();
+        assert!(err.to_string().contains("must differ"), "{err:#}");
+    }
+
+    #[test]
+    fn validate_auth_secrets_rejects_recovery_credential_prefixes() {
+        for prefix in [
+            ai_memory_core::SESSION_SECRET_PREFIX,
+            ai_memory_core::NATIVE_API_KEY_PREFIX,
+            ai_memory_core::EXTERNAL_API_KEY_PREFIX,
+        ] {
+            let auth = AuthSettings {
+                recovery_token: Some(SecretString::from(format!(
+                    "{prefix}reserved-recovery-token-padding-32"
+                ))),
+                ..AuthSettings::default()
+            };
+            let err = validate_auth_secrets(&auth).unwrap_err();
+            assert!(
+                err.to_string().contains("reserved credential prefix"),
+                "{err:#}"
+            );
         }
     }
 
@@ -1349,6 +1921,11 @@ mod tests {
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
         assert_eq!(cfg.decay.breadth_weight, 0.0);
+        // Observation pruning must stay OFF by default: an install that never
+        // opts in keeps every raw observation it has today.
+        assert_eq!(cfg.decay.observation_retention_days, 0);
+        assert_eq!(cfg.decay.observation_prune_batch, 5_000);
+        assert!(!cfg.decay.observation_retention().is_enabled());
         assert!(!cfg.slots.per_user);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 3_600);
@@ -1413,6 +1990,27 @@ mod tests {
             assert!(
                 error.to_string().contains("breadth_weight"),
                 "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    /// A negative retention age or a zero batch is rejected at load, beside
+    /// the breadth-weight guard, so a destructive pass can never be configured
+    /// into a nonsensical shape.
+    #[test]
+    fn load_rejects_destructive_invalid_observation_retention() {
+        for (key, value) in [
+            ("observation_retention_days", "-1"),
+            ("observation_prune_batch", "0"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, format!("[decay]\n{key} = {value}\n")).unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("invalid observation retention must fail closed");
+            assert!(
+                error.to_string().contains(key),
+                "unexpected error for {key} = {value}: {error:#}"
             );
         }
     }
@@ -1502,6 +2100,35 @@ mod tests {
         assert!(
             error.to_string().contains("llm_timeout_secs"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    fn load_reasoning_effort(raw: &str) -> anyhow::Result<Config> {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, format!("llm_reasoning_effort = \"{raw}\"\n")).unwrap();
+        Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+    }
+
+    #[rstest]
+    #[case::none("none", ReasoningEffort::None)]
+    #[case::low("low", ReasoningEffort::Low)]
+    #[case::high("high", ReasoningEffort::High)]
+    fn load_accepts_reasoning_effort(#[case] raw: &str, #[case] expected: ReasoningEffort) {
+        let cfg = load_reasoning_effort(raw).unwrap();
+        assert_eq!(cfg.llm_reasoning_effort, Some(expected));
+    }
+
+    #[rstest]
+    #[case::unknown("ludicrous")]
+    #[case::uppercase("HIGH")]
+    fn load_rejects_invalid_reasoning_effort(#[case] raw: &str) {
+        let error =
+            load_reasoning_effort(raw).expect_err("invalid reasoning effort must fail closed");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("llm_reasoning_effort") && rendered.contains("unknown variant"),
+            "unexpected error: {rendered}"
         );
     }
 
@@ -1728,6 +2355,73 @@ mod tests {
             embedder.base_url.as_deref(),
             Some("https://openrouter.ai/api/v1")
         );
+
+        // A dedicated embedding key outranks the borrowed LLM one.
+        let cfg = Config {
+            runtime_env: RuntimeEnv {
+                embedding_api_key: Some(SecretString::from("sk-embed-key")),
+                ..cfg.runtime_env.clone()
+            },
+            ..cfg
+        };
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.api_key.expose_secret(), "sk-embed-key");
+    }
+
+    #[test]
+    fn openai_embedding_prefers_dedicated_embedding_api_key() {
+        // The LLM runs on api.openai.com (OPENAI_API_KEY) while embeddings
+        // run somewhere else; without a dedicated key the OpenAI one would
+        // be sent to the embedding base URL and rejected.
+        let cfg = Config {
+            embedding_provider: Some("openai".into()),
+            embedding_base_url: Some("https://api.cheap-embeddings.example/v1".into()),
+            runtime_env: RuntimeEnv {
+                embedding_api_key: Some(SecretString::from("sk-embed-key")),
+                openai_api_key: Some(SecretString::from("sk-openai-key")),
+                llm_api_key: Some(SecretString::from("sk-llm-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.api_key.expose_secret(), "sk-embed-key");
+
+        // It also works without a custom base URL, i.e. against OpenAI
+        // itself, where OPENAI_API_KEY was previously the only accepted key.
+        let direct = Config {
+            embedding_base_url: None,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            direct
+                .embedder_config()
+                .unwrap()
+                .unwrap()
+                .api_key
+                .expose_secret(),
+            "sk-embed-key"
+        );
+
+        // Absent, the previous precedence is untouched: OPENAI_API_KEY
+        // still beats LLM_API_KEY.
+        let without = Config {
+            runtime_env: RuntimeEnv {
+                embedding_api_key: None,
+                ..cfg.runtime_env.clone()
+            },
+            ..cfg
+        };
+        assert_eq!(
+            without
+                .embedder_config()
+                .unwrap()
+                .unwrap()
+                .api_key
+                .expose_secret(),
+            "sk-openai-key"
+        );
     }
 
     #[test]
@@ -1760,6 +2454,18 @@ mod tests {
         };
         let embedder = cfg_with_key.embedder_config().unwrap().unwrap();
         assert_eq!(embedder.api_key.expose_secret(), "sk-or-key");
+
+        // EMBEDDING_API_KEY takes precedence over that borrowed key, and
+        // still leaves the keyless path keyless when it is unset.
+        let cfg_with_embedding_key = Config {
+            runtime_env: RuntimeEnv {
+                embedding_api_key: Some(SecretString::from("sk-embed-key")),
+                ..cfg_with_key.runtime_env.clone()
+            },
+            ..cfg_with_key
+        };
+        let embedder = cfg_with_embedding_key.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.api_key.expose_secret(), "sk-embed-key");
 
         // Missing model / dim / base URL each fail closed.
         let missing_model = Config {
@@ -1808,7 +2514,28 @@ mod tests {
         };
 
         let err = cfg.embedder_config().unwrap_err();
-        assert!(matches!(err, LlmError::NotConfigured(msg) if msg == "OPENAI_API_KEY"));
+        assert!(
+            matches!(err, LlmError::NotConfigured(msg) if msg == "EMBEDDING_API_KEY or OPENAI_API_KEY")
+        );
+
+        // The error names the dedicated key, and setting it resolves the
+        // same configuration.
+        let with_embedding_key = Config {
+            runtime_env: RuntimeEnv {
+                embedding_api_key: Some(SecretString::from("sk-embed-key")),
+                ..cfg.runtime_env.clone()
+            },
+            ..cfg
+        };
+        assert_eq!(
+            with_embedding_key
+                .embedder_config()
+                .unwrap()
+                .unwrap()
+                .api_key
+                .expose_secret(),
+            "sk-embed-key"
+        );
     }
 
     #[test]
@@ -1897,6 +2624,76 @@ mod tests {
         assert!(auth.optional_api_key().is_none());
     }
 
+    // ── FN8-8120 runtime fallback lane configuration.
+
+    fn primary_poolside(runtime_env: RuntimeEnv) -> Config {
+        Config {
+            llm_provider: Some("openai-compat".into()),
+            llm_model: Some("poolside/laguna-s-2.1".into()),
+            runtime_env: RuntimeEnv {
+                llm_api_key: Some(SecretString::from("primary-key")),
+                llm_base_url: Some("https://inference.poolside.ai/v1".into()),
+                ..runtime_env
+            },
+            ..Config::default()
+        }
+    }
+
+    fn codex_home(tmp: &TempDir) -> String {
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::fs::write(tmp.path().join(".codex/auth.json"), "{\"tokens\":{}}").unwrap();
+        tmp.path().display().to_string()
+    }
+
+    /// (g) With no flat-fallback env at all, the lane is the Codex CLI's own
+    /// sign-in under $HOME, capped at 40 requests a day.
+    #[test]
+    fn flat_fallback_defaults_apply_when_the_env_is_unset() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = primary_poolside(RuntimeEnv {
+            home_dir: Some(codex_home(&tmp)),
+            ..RuntimeEnv::default()
+        });
+        let flat = cfg.flat_fallback_settings().expect("on by default");
+        assert_eq!(flat.auth_file, tmp.path().join(".codex/auth.json"));
+        assert_eq!(flat.daily_max_requests, 40);
+        assert_eq!(flat.model, FLAT_FALLBACK_DEFAULT_MODEL);
+        assert_eq!(flat.reasoning_effort, ai_memory_llm::ReasoningEffort::Low);
+    }
+
+    #[test]
+    fn flat_fallback_is_absent_without_a_codex_sign_in_or_when_off() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = primary_poolside(RuntimeEnv {
+            home_dir: Some(tmp.path().display().to_string()),
+            ..RuntimeEnv::default()
+        });
+        assert!(cfg.flat_fallback_settings().is_none(), "no auth.json");
+        let cfg = primary_poolside(RuntimeEnv {
+            home_dir: Some(codex_home(&tmp)),
+            flat_fallback: Some("off".into()),
+            ..RuntimeEnv::default()
+        });
+        assert!(cfg.flat_fallback_settings().is_none(), "switched off");
+    }
+
+    #[test]
+    fn a_cap_that_does_not_parse_keeps_the_default() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = primary_poolside(RuntimeEnv {
+            home_dir: Some(codex_home(&tmp)),
+            flat_fallback_daily_max_requests: Some("forty".into()),
+            ..RuntimeEnv::default()
+        });
+        assert_eq!(cfg.flat_fallback_settings().unwrap().daily_max_requests, 40);
+        let cfg = primary_poolside(RuntimeEnv {
+            home_dir: Some(codex_home(&tmp)),
+            flat_fallback_daily_max_requests: Some("12".into()),
+            ..RuntimeEnv::default()
+        });
+        assert_eq!(cfg.flat_fallback_settings().unwrap().daily_max_requests, 12);
+    }
+
     #[test]
     fn openai_compat_provider_defaults_strict_and_allows_opt_out() {
         let mut cfg = Config {
@@ -1942,6 +2739,26 @@ mod tests {
             provider.auth.require_openai_oauth_token_file().unwrap(),
             tmp.path().join("auth.json")
         );
+        assert_eq!(provider.reasoning_effort, None);
+    }
+
+    #[rstest]
+    #[case::unset(None)]
+    #[case::low(Some(ReasoningEffort::Low))]
+    #[case::none_wire(Some(ReasoningEffort::None))]
+    fn openai_oauth_provider_config_forwards_reasoning_effort(
+        #[case] effort: Option<ReasoningEffort>,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            llm_provider: Some("openai-oauth".into()),
+            llm_reasoning_effort: effort,
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert_eq!(provider.reasoning_effort, effort);
     }
 
     #[test]

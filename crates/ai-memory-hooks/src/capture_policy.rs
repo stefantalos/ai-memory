@@ -28,6 +28,41 @@ pub struct CaptureConfig {
     pub ignore_paths: Vec<String>,
 }
 
+/// Whether a repository is captured unless excluded, or only when it opts in.
+///
+/// This is the failure-mode switch requested in #446. Under [`Self::Denylist`]
+/// — the historical behaviour and still the default — a repository with no
+/// marker is captured, so forgetting a marker leaks. Under
+/// [`Self::Allowlist`] the same omission captures nothing.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureMode {
+    /// Absence of a marker means capture normally.
+    #[default]
+    Denylist,
+    /// Absence of a marker means capture nothing at all.
+    Allowlist,
+}
+
+/// Whether this repository may emit *any* lifecycle event, decided before the
+/// per-event policy in [`CapturePolicy::inspect`] and before anything is
+/// spooled.
+///
+/// Deliberately independent of the event kind. `inspect` is reached only for
+/// tool events (`is_tool_event` in the CLI hook), so a gate expressed through
+/// [`CaptureDisposition`] alone would leave `UserPromptSubmit`,
+/// `SessionStart`/`SessionEnd`, and `Stop` bodies flowing while reporting the
+/// repository as opted out — the precise false guarantee #446 is about. Prompt
+/// text is the field that issue cares about most, so this must gate every
+/// event or it gates nothing that matters.
+#[must_use]
+pub const fn repository_admits_capture(mode: CaptureMode, marker_present: bool) -> bool {
+    match mode {
+        CaptureMode::Denylist => true,
+        CaptureMode::Allowlist => marker_present,
+    }
+}
+
 /// Typed result of marker discovery and parsing, supplied by the IO-owning caller.
 pub enum CaptureSource<'a> {
     /// No nearest marker exists.
@@ -126,7 +161,10 @@ pub(crate) fn tool_observation_metadata(
 ) -> Option<ToolObservationMetadata> {
     let object = raw.as_object()?;
     let (name, id) = match agent {
-        AgentKind::ClaudeCode | AgentKind::CommandCode => (
+        // ZCode tool payloads carry Claude Code's snake_case aliases
+        // (`tool_name`, `tool_use_id`, `tool_input`) alongside the native
+        // camelCase — all captured live (engine v0.16.5, #512).
+        AgentKind::ClaudeCode | AgentKind::CommandCode | AgentKind::Zcode => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -150,6 +188,11 @@ pub(crate) fn tool_observation_metadata(
                 .and_then(|extra| extra.get("tool_call_id"))
                 .and_then(Value::as_str),
         ),
+        // Pool (Poolside Agent CLI) tool hooks use snake_case `tool_name` +
+        // `tool_input` (hooks api 1.0, verified against Poolside CLI v1.0.16);
+        // no tool-call id is documented. Unknown payload shapes fail safe to
+        // metadata-only under an active policy.
+        AgentKind::Pool => (object.get("tool_name")?.as_str()?, None),
         _ => return None,
     };
     // PreToolUse needs a proven input shape. PostToolUse deliberately does
@@ -165,6 +208,8 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::CommandCode
                             | AgentKind::Hermes
                             | AgentKind::KiroCli
+                            | AgentKind::Pool
+                            | AgentKind::Zcode
                     ) {
                         "tool_input"
                     } else {
@@ -197,6 +242,19 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             None => ToolOutcome::Unknown,
         },
         AgentKind::AntigravityCli
+            if raw
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| !error.is_empty()) =>
+        {
+            ToolOutcome::Error
+        }
+        // ZCode fires `PostToolUseFailure` instead of `PostToolUse` when the
+        // tool throws; that payload carries `error` (string) + `error_details`
+        // (live-captured, #512). `exitCode` is deliberately not mapped to
+        // Success: the same `tool_response` object carries `timedOut` /
+        // `interrupted`, so exit code alone does not prove success.
+        AgentKind::Zcode
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -538,7 +596,11 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
         | AgentKind::GeminiCli
         | AgentKind::Devin
         | AgentKind::Hermes
-        | AgentKind::KiroCli => object
+        | AgentKind::KiroCli
+        | AgentKind::Pool
+        // ZCode mirrors Claude Code's snake_case `tool_name`/`tool_input`
+        // aliases on every tool event (live-captured, #512).
+        | AgentKind::Zcode => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -595,6 +657,7 @@ fn family(name: &str) -> ToolFamily {
         | "notebook_edit"
         | "create_file"
         | "delete_file"
+        | "remove"
         | "rename_file"
         | "move_file"
         | "multi_edit"
@@ -923,6 +986,24 @@ fn char_equal(left: char, right: char, insensitive: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denylist_admits_every_repository() {
+        assert!(repository_admits_capture(CaptureMode::Denylist, false));
+        assert!(repository_admits_capture(CaptureMode::Denylist, true));
+    }
+
+    #[test]
+    fn allowlist_admits_only_a_marked_repository() {
+        assert!(!repository_admits_capture(CaptureMode::Allowlist, false));
+        assert!(repository_admits_capture(CaptureMode::Allowlist, true));
+    }
+
+    #[test]
+    fn default_mode_is_the_historical_one() {
+        // A new field must not silently tighten capture for existing installs.
+        assert_eq!(CaptureMode::default(), CaptureMode::Denylist);
+    }
     #[test]
     fn fixture_vectors() {
         let fixture: Value =
@@ -1079,6 +1160,119 @@ mod tests {
         ] {
             assert_eq!(family(tool), expected, "tool: {tool}");
         }
+    }
+
+    #[test]
+    fn pool_documented_tool_shape_is_closed_and_honors_exclusions() {
+        let raw = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "write",
+            "tool_input": {"path": "secret/token.txt", "content": "do not retain"},
+            "session_id": "pool-session",
+            "cwd": "/repo"
+        });
+        let metadata = tool_observation_metadata(AgentKind::Pool, &raw, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id, None);
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let decision = policy.inspect(AgentKind::Pool, &raw, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+
+        let unknown = policy.inspect(AgentKind::Other, &raw, "/repo");
+        assert_eq!(
+            unknown.protocol().extraction_state(),
+            ExtractionState::UnsupportedSchema
+        );
+        assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    #[test]
+    fn pool_documented_tool_names_map_to_canonical_families() {
+        for (tool, expected) in [
+            ("read", ToolFamily::File),
+            ("edit", ToolFamily::File),
+            ("write", ToolFamily::File),
+            ("remove", ToolFamily::File),
+            ("shell", ToolFamily::NonFile),
+        ] {
+            assert_eq!(family(tool), expected, "tool: {tool}");
+        }
+    }
+
+    #[test]
+    fn zcode_documented_tool_shape_is_closed_and_honors_exclusions() {
+        // Live-captured ZCode payload (engine v0.16.5, #512): the snake_case
+        // aliases carry exactly the fields Claude Code sends, including a
+        // real provider-format tool call id (`call_…`).
+        let raw = json!({
+            "hookEventName": "PostToolUse",
+            "toolName": "Write",
+            "tool_name": "Write",
+            "tool_use_id": "call_6d8f8fd5d9eb4888b0f9d5c6",
+            "toolInput": {"file_path": "/repo/secret/token.txt", "content": "do not retain"},
+            "tool_input": {"file_path": "/repo/secret/token.txt", "content": "do not retain"},
+            "session_id": "sess_0a5ba797",
+            "cwd": "/repo"
+        });
+        let metadata = tool_observation_metadata(AgentKind::Zcode, &raw, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(
+            metadata.tool_call_id.as_deref(),
+            Some("call_6d8f8fd5d9eb4888b0f9d5c6")
+        );
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let decision = policy.inspect(AgentKind::Zcode, &raw, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+
+        let unknown = policy.inspect(AgentKind::Other, &raw, "/repo");
+        assert_eq!(
+            unknown.protocol().extraction_state(),
+            ExtractionState::UnsupportedSchema
+        );
+        assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    #[test]
+    fn zcode_post_tool_use_failure_error_maps_to_error_outcome() {
+        // Live-captured PostToolUseFailure payload (run 10, real model, #512):
+        // `error` is a plain string, `error_details` carries the internal
+        // error class.
+        let raw = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Write",
+            "error": "File not found: /proc/capture-test.txt",
+            "error_details": {
+                "message": "File not found: /proc/capture-test.txt",
+                "type": "FileSystemPortError"
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Zcode, &raw),
+            ToolOutcome::Error
+        );
+        // exitCode is deliberately not trusted for Success: the same
+        // tool_response object carries timedOut / interrupted flags.
+        let ok = json!({"tool_response": {"exitCode": 0}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Zcode, &ok),
+            ToolOutcome::Unknown
+        );
     }
 
     #[test]

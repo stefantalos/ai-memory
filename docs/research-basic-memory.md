@@ -1,5 +1,10 @@
 # basic-memory - Research Report
 
+> **Follow-up:** the September 2026 landscape refresh — how this project
+> evolved, what the field looks like now, and what we concluded — is in
+> [`research-2026-landscape.md`](research-2026-landscape.md).
+
+
 > Source project: `basicmachines-co/basic-memory` (Python, MCP-native, markdown-on-disk).
 > Studied as inspiration *and* as the manual-write-note model we explicitly
 > diverge from.

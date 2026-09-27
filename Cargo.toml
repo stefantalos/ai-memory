@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.31.1"
+version = "2.0.3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -26,15 +26,15 @@ authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "1.31.1" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "1.31.1" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "1.31.1" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "1.31.1" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "1.31.1" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "1.31.1" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "1.31.1" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "1.31.1" }
-ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "1.31.1" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "2.0.3" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "2.0.3" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "2.0.3" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "2.0.3" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "2.0.3" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "2.0.3" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "2.0.3" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "2.0.3" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "2.0.3" }
 
 # (Workspace shared deps follow below)
 
@@ -97,6 +97,9 @@ base64 = "0.22"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 refinery = { version = "0.8", features = ["rusqlite"] }
 sha2 = "0.10"
+# Argon2id PHC for human passwords. Tokens stay SHA-256+pepper (hot-path
+# unique lookup); the slow KDF is reserved for the password class.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash", "std"] }
 parking_lot = "0.12"
 
 # Filesystem watcher + process inspection.
@@ -109,6 +112,11 @@ fs2 = "0.4"
 winapi-util = "0.1"
 
 # MCP server SDK.
+# Only used to install a process-wide crypto provider for the MCP bridge's HTTPS
+# transport. `default-features = false` is load-bearing: rustls' default set includes
+# `aws_lc_rs`, which is exactly the C/JNI toolchain the bridge avoids by using
+# rmcp's `reqwest-tls-no-provider`. `ring` is already in the lockfile via reqwest 0.12.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
 axum = "0.8"
@@ -130,12 +138,26 @@ regex = "1"
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
 # LLM provider HTTP.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# `rustls-tls` bundles the Mozilla webpki root store and ignores the OS trust
+# store, so a CA an operator installed locally — Caddy's `tls internal`, a
+# corporate MITM appliance, any private PKI — is invisible to this client even
+# though `curl` and the agent CLIs trust it. That made lifecycle capture fail
+# with `UnknownIssuer` on every install following the project's own
+# HTTPS-via-proxy Path 2 (#492). `rustls-tls-native-roots` reads the platform
+# store instead; the runtime image installs `ca-certificates`, so the server
+# path keeps a populated store.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+# Local (in-process, pure-Rust) embeddings — 2.0 item 5.
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 futures-util = "0.3"
 async-trait = "0.1"
 
 # Testing.
 tempfile = "3"
+rstest = "0.26"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

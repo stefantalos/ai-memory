@@ -51,6 +51,53 @@ and worktree, creating one named `default` on first use. `--new NAME` starts an
 independent line of work; `--workstream NAME` returns to one. These are optional
 branching controls, not harness-switch controls.
 
+List the workstreams available to those selectors without launching a harness:
+
+```bash
+ai-memory workstreams [--workspace NAME] [--project NAME]
+ai-memory workstreams --limit 50 --json
+```
+
+The list is scoped to the same `(workspace, project, repository, worktree)`
+identity as `run`, puts the current selection first, then orders by recent
+activity. Each row includes the linked harnesses and stable workstream id; the
+response does not expose checkout paths, repository fingerprints, or native
+session ids.
+
+Names are chosen at `--new` time and can be corrected later:
+
+```bash
+ai-memory rename-workstream --from typo-nmae --to refactor-db
+ai-memory rename-workstream --workstream-id 01a04092-… --to refactor-db
+```
+
+The two selectors are mutually exclusive; the id is the one `workstreams`
+prints. The rename is metadata only. Names are unique per checkout, so a
+destination another workstream already holds is refused rather than merged,
+and the destination is validated exactly like a `--new` name. Because the
+ledger, linked harnesses, and managed runs all key on the workstream id rather
+than its name, nothing else moves — including which workstream a bare
+`ai-memory run` resumes, and the listing order, both of which stay put because
+a rename deliberately does not touch `selected_at` or `updated_at`. A run that
+is already live keeps displaying the name it launched with until it exits.
+
+## Do you need this?
+
+Probably not at first — hooks alone already carry most continuity.
+
+- **Skip it** when a handoff is all you want: you quit Claude Code
+  mid-task, open Codex in the same directory, and the next session
+  starts with "where you left off, what failed, what's open". That
+  works with nothing but `install-hooks`; no `ai-memory run` involved.
+- **Use it** when you want the harness's own native resume (`claude
+  --resume` / the picker) to survive a harness SWITCH — the managed
+  ledger records the visible event stream portably, so `ai-memory
+  continue` can reopen the same workstream in a different agent with
+  the exact tool-call history, not just a summary.
+
+If you never switch harnesses mid-workstream, the default path is
+simpler and loses you nothing.
+
 ## Project-first launcher
 
 `ai-memory show` reverses the usual `cd` then `run` flow: choose a local
@@ -119,6 +166,39 @@ Once a checkout is selected, the launch is exactly bare `ai-memory run` in that
 directory, including automatic harness selection. `continue` therefore accepts
 `--workspace`, `--yolo`, and `--fresh`, but not native harness arguments or
 `--executable`, whose meaning depends on a harness the user did not name.
+
+## Picking a workstream
+
+`ai-memory resume` is the interactive counterpart to `continue`: it presents
+recent workstreams from every valid client-local managed checkout, then launches
+the selected named workstream without needing a `cd` first.
+
+```bash
+ai-memory resume
+ai-memory resume --workspace work --limit 50
+```
+
+Use Up/Down (or `j`/`k`) to move between workstreams and Left/Right to cycle the
+launch harness for the highlighted row. Each row remembers its choice while you
+navigate. `auto` is the initial choice and preserves bare `ai-memory run`'s
+discovery of the newest usable session; the remaining choices are supported
+harness executables detected in the host `PATH`. Enter launches the displayed
+workstream/harness combination, while Escape or `q` cancels.
+
+The current selection for each checkout leads the picker, followed by recent
+activity. Each row identifies its workspace/project, activity age, selected
+launch harness, and already linked harnesses. Choosing a different harness is
+how an existing workstream can be continued in another agent. `--yolo` and
+`--fresh` are forwarded to the eventual managed launch.
+
+The picker seeds discovery with the current checkout and paths from this host's
+private `client-projects.json` registry. It revalidates both the canonical path
+and resolved scope before it asks the server for that checkout's workstreams,
+and deduplicates the same workstream reached through both sources. The server
+receives only the repository/worktree fingerprints required for the existing
+checkout-local listing, never a host path. It needs an interactive terminal;
+scripts can continue to use `ai-memory workstreams --json` after selecting a
+checkout themselves.
 
 ## Automatic harness selection
 
@@ -414,14 +494,14 @@ original config is not modified. ai-memory opens the project database read-only;
 the launched Crush process continues its normal native session writes.
 
 The Linux/macOS Docker shell wrapper cannot inspect host projects or execute a
-host agent from inside its helper container. For `run`, `show`, and `continue`,
-it downloads the matching native release into
+host agent from inside its helper container. For `run`, `show`, `continue`,
+`resume`, and `workstreams`, it downloads the matching native release into
 `~/.cache/ai-memory/native-runner`, verifies the published SHA-256 checksum, and
 executes that host client. Set `AI_MEMORY_NATIVE_BIN=/path/to/ai-memory` to use a
 specific native build. Native package, release, and source installs need no
 shim. On native Windows, use the published `ai-memory.exe` or a source build.
 
-The wrapper intercepts all three commands before Docker and preserves the host
+The wrapper intercepts all five commands before Docker and preserves the host
 `PATH`, `AI_MEMORY_SERVER_URL`, and authentication environment. The native client's
 startup log shows `server_url` as well as its local config paths; `data_dir` and
 `bind` describe local defaults and do not override a configured remote server.

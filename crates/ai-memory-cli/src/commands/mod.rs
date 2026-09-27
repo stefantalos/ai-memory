@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
 
+pub mod api_key;
 pub mod apply_shared;
 pub mod audit_contamination;
 pub mod auth;
@@ -13,15 +14,18 @@ pub mod backup;
 pub mod bootstrap;
 pub mod checkpoints;
 pub mod commit;
+pub mod compact;
 pub mod completions;
 pub mod continue_session;
 pub mod curator;
 pub mod data_purge;
 pub mod delete_page;
 pub mod embed;
+pub mod export_okf;
 pub mod finalize_session;
 pub mod forget_sweep;
 pub mod generate_auth_token;
+pub mod handoffs;
 pub mod hook;
 pub mod hook_capture;
 pub mod hook_drain_process;
@@ -41,14 +45,17 @@ pub mod path_util;
 pub mod pending_writes;
 pub mod project_registry;
 pub mod purge_project;
+pub mod purge_session;
 pub mod read_page;
 pub mod reindex;
 pub mod rename_project;
+pub mod rename_workstream;
 pub mod render_shared;
 pub mod reorg;
 pub mod reset;
 pub mod restore;
 pub mod restore_page;
+pub mod resume;
 pub mod run;
 pub mod search;
 pub mod serve;
@@ -58,6 +65,7 @@ pub mod status;
 pub mod uninstall;
 pub mod user;
 pub mod workstream_search;
+pub mod workstreams;
 pub mod write_page;
 
 /// Resolve the effective `(workspace, project)` pair for a client command.
@@ -79,6 +87,33 @@ pub mod write_page;
 ///
 /// Resolution is announced on stderr whenever the marker decides a field, so
 /// a scope that differs from the flags the user typed is never silent.
+/// Render an elapsed time the way the read-only listings say it.
+///
+/// `ai-memory workstreams` and `ai-memory handoffs` both answer "how long
+/// ago", and each shipped its own renderer a day apart — one saying
+/// `3 hours ago`, the other `3h ago` — so the same quantity read differently
+/// depending on which command you ran.
+///
+/// Deliberately does **not** cover `status`'s spool line. That renders a
+/// duration (`oldest: 2h 10m`), not an "ago", and is a stable surface people
+/// read; folding it in here would change output that no fix requires.
+///
+/// Clamps negatives to "just now": server and client clocks can disagree, and
+/// a skewed timestamp must not render as an enormous age.
+pub(crate) fn humanize_age_secs(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 60 {
+        return "just now".to_owned();
+    }
+    let (value, unit) = match seconds {
+        v if v < 3_600 => (v / 60, "minute"),
+        v if v < 86_400 => (v / 3_600, "hour"),
+        v if v < 2_592_000 => (v / 86_400, "day"),
+        v => (v / 2_592_000, "month"),
+    };
+    format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
+}
+
 /// `AI_MEMORY_IGNORE_MARKER=1` skips rung 2 entirely.
 pub(crate) fn resolve_scope(
     config: &Config,

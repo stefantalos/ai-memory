@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ScheduledAutoImproveSettings,
-    run_auto_improve_scheduler_tick, run_embedding_backfill, run_lint, run_sweep_with_breadth,
+    AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
+    ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
+    run_lint, run_sweep_with_options,
 };
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -16,11 +17,16 @@ use ai_memory_hooks::{
     workstream_router,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder, build_provider};
+use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
-    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_decay_breadth,
+    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
+    expire_legacy_cookie_mw, internal_auth_router, public_auth_router, require_dual_auth,
+    session_auth_router,
 };
-use ai_memory_store::{ReaderPool, Store, WriterHandle};
-use ai_memory_web::{WebMountSpec, mount_web_router, normalize_prefix, web_base_href};
+use ai_memory_store::{
+    ReaderPool, Store, TokenPepper, WriterHandle, hash_session_secret, hash_token,
+};
+use ai_memory_web::{WebMountSpec, normalize_prefix, split_web_routers, web_base_href};
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -33,6 +39,7 @@ use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
+use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -60,14 +67,114 @@ const SESSION_CONSOLIDATION_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// requests are expected to finish well inside this lease.
 const SESSION_CONSOLIDATION_LEASE: Duration = Duration::from_secs(10 * 60);
 
+/// Lock file guarding a data dir against a second `ai-memory serve` (#563).
+const SERVE_LOCK_FILE: &str = ".serve.lock";
+
+/// The single-instance guard for `ai-memory serve`: an exclusive `flock` on
+/// `<data-dir>/.serve.lock` held for the process lifetime. The OS releases it
+/// when the process exits, so a crashed server never locks the operator out of
+/// their own data.
+#[derive(Debug)]
+struct ServeLock {
+    _file: std::fs::File,
+}
+
+/// Unlocked sidecar naming the lock holder (`pid=<n>`). Separate from the
+/// lock file because Windows' exclusive lock blocks reads of the locked
+/// file from other handles; informational only, rewritten by each holder.
+fn holder_info_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join(".serve.lock.holder")
+}
+
+/// Take the single-instance serve lock for `data_dir`.
+///
+/// A contended lock refuses startup naming the holder, unless `force` is set:
+/// the operator who knows the previous server is gone (a hung holder, or a
+/// mount with unreliable locking) must not be stranded. A filesystem that
+/// cannot lock at all only downgrades the guard to a warning — refusing to
+/// start there would be worse than the unguarded risk.
+fn acquire_serve_lock(data_dir: &Path, force: bool) -> Result<Option<ServeLock>> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data directory {}", data_dir.display()))?;
+    let path = data_dir.join(SERVE_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening serve lock {}", path.display()))?;
+    use fs2::FileExt as _;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            // Informational only: the flock is the guard, and this names the
+            // holder in a later refusal message. Best-effort, and written to
+            // an UNLOCKED sidecar — on Windows the exclusive lock blocks
+            // other handles from reading the locked file itself, which made
+            // every refusal report "holder unknown".
+            let _ = std::fs::write(
+                holder_info_path(data_dir),
+                format!("pid={}\n", std::process::id()),
+            );
+            tracing::info!(lock = %path.display(), "single-instance serve lock held");
+            Ok(Some(ServeLock { _file: file }))
+        }
+        Err(err) if crate::commands::hook_spool::is_drain_lock_busy_error(&err) => {
+            let holder = std::fs::read_to_string(holder_info_path(data_dir))
+                .map(|text| text.trim().to_string())
+                .unwrap_or_default();
+            if force {
+                tracing::warn!(
+                    lock = %path.display(),
+                    holder = %holder,
+                    "another process holds the serve lock; continuing unguarded per --force"
+                );
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "another ai-memory serve process appears to be using {} ({}); two servers on one data directory corrupt wiki and index state — stop the other process, or pass --force if you are certain it is gone",
+                data_dir.display(),
+                if holder.is_empty() {
+                    "holder unknown".to_owned()
+                } else {
+                    holder
+                },
+            )
+        }
+        Err(err) => {
+            tracing::warn!(
+                lock = %path.display(),
+                error = %err,
+                "cannot lock the data directory; running without the single-instance guard"
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn validate_api_credential_pepper(api_credentials_exist: bool, auth: &AuthSettings) -> Result<()> {
+    let pepper_present = auth
+        .token_pepper
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if api_credentials_exist && !pepper_present {
+        anyhow::bail!(
+            "api credentials exist but [auth].token_pepper is missing or blank; restore the original pepper from configuration backup before serving"
+        );
+    }
+    Ok(())
+}
+
 /// Validate the credentials that keep an existing multi-user installation
 /// closed. Bootstrap installs have no user rows yet and retain their historical
 /// compatibility behavior regardless of placeholder auth values.
-fn validate_existing_users_auth(users_exist: bool, auth: &AuthSettings) -> Result<()> {
-    if !users_exist {
-        return Ok(());
-    }
-
+fn validate_existing_users_auth(
+    users_exist: bool,
+    api_credentials_exist: bool,
+    human_mode: bool,
+    auth: &AuthSettings,
+) -> Result<()> {
+    validate_api_credential_pepper(api_credentials_exist, auth)?;
     let pepper_present = auth
         .token_pepper
         .as_deref()
@@ -76,18 +183,206 @@ fn validate_existing_users_auth(users_exist: bool, auth: &AuthSettings) -> Resul
         .bearer_token
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
-    match (pepper_present, bearer_present) {
-        (true, true) => Ok(()),
-        (false, false) => anyhow::bail!(
-            "users exist but [auth].token_pepper and [auth].bearer_token are missing or blank; restore both original secrets from configuration backup before serving"
-        ),
-        (false, true) => anyhow::bail!(
-            "users exist but [auth].token_pepper is missing or blank; restore the original pepper from configuration backup before serving"
-        ),
-        (true, false) => anyhow::bail!(
-            "users exist but [auth].bearer_token is missing or blank; configure the original static root bearer token before serving"
-        ),
+    if users_exist && !human_mode {
+        return match (pepper_present, bearer_present) {
+            (true, true) => Ok(()),
+            (false, false) => anyhow::bail!(
+                "users exist but [auth].token_pepper and [auth].bearer_token are missing or blank; restore both original secrets from configuration backup before serving"
+            ),
+            (false, true) => anyhow::bail!(
+                "users exist but [auth].token_pepper is missing or blank; restore the original pepper from configuration backup before serving"
+            ),
+            (true, false) => anyhow::bail!(
+                "users exist but [auth].bearer_token is missing or blank; configure the original static root bearer token before serving"
+            ),
+        };
     }
+    Ok(())
+}
+
+fn secret_configured(secret: Option<&secrecy::SecretString>) -> bool {
+    secret.is_some_and(|s| !s.expose_secret().trim().is_empty())
+}
+
+fn parse_trusted_proxy_cidrs(auth: &AuthSettings) -> Result<Vec<Cidr>> {
+    auth.trusted_proxy_cidrs
+        .iter()
+        .map(|spec| {
+            Cidr::parse(spec).map_err(|e| {
+                anyhow::anyhow!("invalid [auth].trusted_proxy_cidrs entry {spec:?}: {e}")
+            })
+        })
+        .collect()
+}
+
+async fn maybe_bootstrap_root(store: &Store, auth: &AuthSettings) -> Result<()> {
+    if store.reader.bootstrap_completed().await? {
+        if secret_configured(auth.initial_root_password.as_ref()) {
+            tracing::warn!(
+                "[auth].initial_root_password is ignored because bootstrap already completed; unset AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD"
+            );
+        }
+        return Ok(());
+    }
+    let Some(password) = auth
+        .initial_root_password
+        .as_ref()
+        .map(|s| s.expose_secret().to_string())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let username = auth
+        .root_username
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("root");
+    let recovery = auth
+        .recovery_token
+        .as_ref()
+        .map(ExposeSecret::expose_secret)
+        .filter(|s| !s.trim().is_empty());
+    let reserved: Vec<&str> = [
+        auth.bearer_token
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
+        auth.actor_proxy_bearer_token
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
+        recovery,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    ai_memory_core::validate_human_password(&password, Some(username), &reserved)
+        .context("initial root password does not meet policy")?;
+    if let Some(pepper) = auth
+        .token_pepper
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    {
+        let hash = hash_token(&password, &TokenPepper::new(pepper.to_string()));
+        if store.reader.token_hash_exists(hash).await? {
+            anyhow::bail!(
+                "[auth].initial_root_password collides with an existing API credential; choose a different password"
+            );
+        }
+    }
+    let phc = ai_memory_store::password::hash_password(password)
+        .await
+        .context("hashing initial root password")?;
+    store
+        .writer
+        .bootstrap_root(
+            username.to_string(),
+            auth.root_name.clone(),
+            auth.root_email.clone(),
+            phc,
+        )
+        .await
+        .context("bootstrapping root user")?;
+    tracing::warn!(
+        "root user bootstrapped; unset AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD so the plaintext is not kept in the process environment"
+    );
+    Ok(())
+}
+
+async fn validate_configured_secret_collisions(
+    store: &Store,
+    auth: &AuthSettings,
+    include_initial_password: bool,
+) -> Result<()> {
+    let Some(pepper) = auth
+        .token_pepper
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| TokenPepper::new(value.to_string()))
+    else {
+        return Ok(());
+    };
+    let mut secrets = Vec::new();
+    if let Some(value) = auth
+        .bearer_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].bearer_token", value));
+    }
+    if let Some(value) = auth
+        .actor_proxy_bearer_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].actor_proxy_bearer_token", value));
+    }
+    if let Some(value) = auth
+        .recovery_token
+        .as_ref()
+        .map(ExposeSecret::expose_secret)
+        .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].recovery_token", value));
+    }
+    if include_initial_password
+        && let Some(value) = auth
+            .initial_root_password
+            .as_ref()
+            .map(ExposeSecret::expose_secret)
+            .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].initial_root_password", value));
+    }
+    for (name, value) in secrets {
+        if store
+            .reader
+            .token_hash_exists(hash_token(value, &pepper))
+            .await?
+        {
+            anyhow::bail!(
+                "{name} collides with an existing API credential; configure a distinct secret"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn human_auth_intended(auth: &AuthSettings, bootstrap_completed: bool, any_password: bool) -> bool {
+    bootstrap_completed
+        || any_password
+        || secret_configured(auth.initial_root_password.as_ref())
+        || secret_configured(auth.recovery_token.as_ref())
+}
+
+fn require_recoverable_root_or_recovery(
+    human_mode: bool,
+    recoverable_roots: i64,
+    recovery_configured: bool,
+) -> Result<()> {
+    if human_mode && recoverable_roots == 0 && !recovery_configured {
+        anyhow::bail!(
+            "human authentication is enabled but no recoverable root user exists; set [auth].recovery_token to rebuild root via POST /auth/recovery"
+        );
+    }
+    Ok(())
+}
+
+fn reserved_human_passwords(auth: &AuthSettings) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(v) = auth
+        .bearer_token
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        out.push(v.to_string());
+    }
+    if let Some(v) = auth
+        .actor_proxy_bearer_token
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        out.push(v.to_string());
+    }
+    out
 }
 
 fn configured(value: Option<&String>) -> bool {
@@ -139,10 +434,22 @@ fn running_in_container() -> bool {
 fn validate_http_exposure(
     local_addr: SocketAddr,
     auth_enabled: bool,
+    human_mode: bool,
+    secure_cookie: bool,
     allow_insecure_no_auth: bool,
     containerized: bool,
 ) -> Result<HttpExposure> {
-    if local_addr.ip().is_loopback() || auth_enabled {
+    if local_addr.ip().is_loopback() {
+        return Ok(HttpExposure::Safe);
+    }
+    if human_mode && !secure_cookie {
+        anyhow::bail!(
+            "refusing human authentication on non-loopback plain HTTP address {local_addr}: \
+             passwords and session cookies require [auth].secure_cookie=true behind a trusted \
+             HTTPS reverse proxy. Non-Secure human cookies are allowed only on loopback."
+        );
+    }
+    if auth_enabled {
         return Ok(HttpExposure::Safe);
     }
     if allow_insecure_no_auth {
@@ -272,6 +579,48 @@ fn session_consolidation_retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
 }
 
+/// Attempts a generation gets when the model keeps hitting the output
+/// ceiling. The prompt is bounded by `max_input_tokens`, so a retry sends the
+/// SAME prompt to the same model: measured 2026-09-24, session d3345285 cut at
+/// 14,000 output tokens on 10 of 10 retries. One retry covers the rare
+/// non-deterministic cut; after that the generation is parked (`failed`) and
+/// the heuristic page stays.
+const SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS: u32 = 2;
+
+/// When a failure is "no lane could take it" rather than a session failure:
+/// the flat lane's daily allocation is used and nothing before it answered.
+/// Returns the Unix-microsecond time to try again (the reset), or `None`.
+fn session_consolidation_deferral(
+    error: &ai_memory_consolidate::ConsolidatorError,
+) -> Option<i64> {
+    match error {
+        ai_memory_consolidate::ConsolidatorError::Llm(
+            ai_memory_llm::LlmError::AllocationExhausted { resets_at_unix, .. },
+        ) => Some(resets_at_unix.saturating_mul(1_000_000)),
+        _ => None,
+    }
+}
+
+/// When to retry a failed SessionEnd consolidation, or `None` to park it.
+fn session_consolidation_retry_at(
+    attempts: u32,
+    error: &ai_memory_consolidate::ConsolidatorError,
+    now_micros: i64,
+) -> Option<i64> {
+    let truncated = matches!(
+        error,
+        ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Truncated { .. })
+    );
+    if attempts >= ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS
+        || (truncated && attempts >= SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS)
+    {
+        return None;
+    }
+    let delay = session_consolidation_retry_delay(attempts);
+    let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
+    Some(now_micros.saturating_add(delay_micros))
+}
+
 async fn run_session_consolidation_worker(
     writer: WriterHandle,
     consolidator: Arc<Consolidator>,
@@ -349,18 +698,33 @@ async fn run_session_consolidation_worker(
                     "SessionEnd consolidation succeeded but queue completion failed",
                 ),
             },
+            Err(error) if session_consolidation_deferral(&error).is_some() => {
+                let until = session_consolidation_deferral(&error).unwrap_or_default();
+                match writer
+                    .defer_session_consolidation(job, until, error.to_string())
+                    .await
+                {
+                    Ok(()) => tracing::warn!(
+                        %error,
+                        session = %session_id,
+                        generation,
+                        "SessionEnd LLM consolidation deferred to the flat lane's reset \
+                         (no-LLM page stays until then; no attempt spent)",
+                    ),
+                    Err(store_error) => tracing::warn!(
+                        error = %store_error,
+                        session = %session_id,
+                        generation,
+                        "failed to defer SessionEnd consolidation",
+                    ),
+                }
+            }
             Err(error) => {
-                let retry_at = if attempts < ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS {
-                    let delay = session_consolidation_retry_delay(attempts);
-                    let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
-                    Some(
-                        jiff::Timestamp::now()
-                            .as_microsecond()
-                            .saturating_add(delay_micros),
-                    )
-                } else {
-                    None
-                };
+                let retry_at = session_consolidation_retry_at(
+                    attempts,
+                    &error,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
                 let terminal = retry_at.is_none();
                 if let Err(store_error) = writer
                     .fail_session_consolidation(job, error.to_string(), retry_at)
@@ -407,6 +771,25 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let cors_origins = merge_cors_origins(&config.cors_allow_origins, &args.cors_allow_origin);
     validate_cors_origins(&cors_origins)?;
 
+    // Guard the data dir before anything opens it: a second serve process
+    // means a second writer actor, a second git handle on the wiki, and a
+    // second active-project pointer (#563). Held until `run` returns.
+    let _serve_lock = acquire_serve_lock(&config.data_dir, args.force)?;
+
+    // #633: take the pre-migration safety archive BEFORE `Store::open` advances
+    // the SQLite schema, so the archive captures the true pre-2.0 state a 1.x
+    // binary can reopen. `Store::open` below runs the DB migrations; if the
+    // backup ran after it (as it used to, inside the wiki migration), the
+    // archived `db/` would already be at the 2.x schema and the documented
+    // rollback to 1.x would be impossible. A no-op for a fresh install or an
+    // already-migrated store; the OKF wiki migration reuses this archive instead
+    // of taking a second, post-DB-migration one.
+    let backup_dest_override = std::env::var("AI_MEMORY_BACKUP_DIR")
+        .ok()
+        .map(std::path::PathBuf::from);
+    migrations::snapshot_before_db_migration(&config.data_dir, backup_dest_override.as_deref())
+        .with_context(|| "taking the pre-migration safety backup")?;
+
     let store = Store::open(&config.data_dir)
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
 
@@ -427,8 +810,28 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         );
     }
 
-    validate_existing_users_auth(store.reader.users_exist().await?, &config.auth)?;
+    let api_credentials_exist = store.reader.api_credentials_exist().await?;
+    validate_api_credential_pepper(api_credentials_exist, &config.auth)?;
+    let bootstrap_completed_before_start = store.reader.bootstrap_completed().await?;
+    validate_configured_secret_collisions(&store, &config.auth, !bootstrap_completed_before_start)
+        .await?;
+    maybe_bootstrap_root(&store, &config.auth).await?;
+    let bootstrap_completed = store.reader.bootstrap_completed().await?;
+    let any_password = store.reader.any_password_hash().await?;
+    let human_mode = human_auth_intended(&config.auth, bootstrap_completed, any_password);
+    require_recoverable_root_or_recovery(
+        human_mode,
+        store.reader.count_recoverable_roots().await?,
+        secret_configured(config.auth.recovery_token.as_ref()),
+    )?;
+    validate_existing_users_auth(
+        store.reader.users_exist().await?,
+        api_credentials_exist,
+        human_mode,
+        &config.auth,
+    )?;
     validate_trusted_proxy_auth(&config.auth)?;
+    let trusted_proxy_cidrs = parse_trusted_proxy_cidrs(&config.auth)?;
 
     // Run any outstanding wiki-structure migrations before the watcher starts
     // so file moves and renames are never raced by the reconciler.
@@ -525,6 +928,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_wiki(wiki.clone())
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
+        .with_observation_retention(config.decay.observation_retention())
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
@@ -687,7 +1091,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 sanitizer: sanitizer.clone(),
                 data_dir: config.data_dir.clone(),
             });
-            let admin = admin_router_with_decay_breadth(
+            let admin = admin_router_with_sweep_tuning(
                 AdminState {
                     ingest_metrics: ingest_metrics.clone(),
                     writer: store.writer.clone(),
@@ -717,6 +1121,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
                 },
                 config.decay.breadth_weight,
+                config.decay.observation_retention(),
             );
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
@@ -774,14 +1179,50 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     store.writer.clone(),
                 );
             }
+            let recovery_token_hash = config
+                .auth
+                .recovery_token
+                .as_ref()
+                .map(ExposeSecret::expose_secret)
+                .filter(|s| !s.trim().is_empty())
+                .map(hash_session_secret);
+            let root_username = config
+                .auth
+                .root_username
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "root".to_string());
+            auth_state = auth_state.with_human_runtime(
+                HumanAuthRuntime {
+                    reader: store.reader.clone(),
+                    writer: store.writer.clone(),
+                    recovery_token_hash,
+                    root_username,
+                    root_name: config.auth.root_name.clone(),
+                    root_email: config.auth.root_email.clone(),
+                    reserved_passwords: reserved_human_passwords(&config.auth),
+                    trusted_proxy_cidrs: trusted_proxy_cidrs.clone(),
+                    limiter: Arc::new(LoginLimiter::default()),
+                },
+                human_mode,
+            );
             let auth_state = Arc::new(auth_state);
             let auth_enabled = auth_state.enabled();
-            let router = axum::Router::new()
+            let machine = axum::Router::new()
                 .nest_service("/mcp", mcp_service)
                 .merge(hooks)
                 .merge(workstreams)
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-                .merge(admin.layer(DefaultBodyLimit::max(BOOTSTRAP_MAX_BODY_BYTES)));
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    require_bearer,
+                ));
+            let admin = admin
+                .layer(DefaultBodyLimit::max(BOOTSTRAP_MAX_BODY_BYTES))
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    require_dual_auth,
+                ));
             let base_path = normalize_prefix(&args.base_path);
             if base_path.is_empty() && !args.base_path.trim_matches('/').trim().is_empty() {
                 tracing::warn!(
@@ -802,8 +1243,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 );
             }
             let base_href = web_base_href(&args.base_path, &args.web_slug);
-            let router = mount_web_router(
-                router,
+            let web = split_web_routers(
                 args.enable_web,
                 store.reader.clone(),
                 wiki.clone(),
@@ -815,7 +1255,20 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     base_path: &base_path,
                 },
             )?;
-            let router = apply_http_layers(router, auth_state, config.allowed_hosts.clone());
+            let router = machine
+                .merge(admin)
+                .merge(public_auth_router(auth_state.clone()))
+                .merge(session_auth_router(auth_state.clone()))
+                .merge(internal_auth_router(auth_state.clone()))
+                .merge(web.protected.layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    require_dual_auth,
+                )))
+                .merge(web.public.layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    expire_legacy_cookie_mw,
+                )));
+            let router = apply_host_layer(router, config.allowed_hosts.clone());
             // Host the entire surface under the configured base path. Empty
             // base = root (unchanged). The auth/host layers are already
             // attached to `router`, so they run for every nested route.
@@ -845,6 +1298,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let exposure = validate_http_exposure(
                 local_addr,
                 auth_enabled,
+                human_mode,
+                config.auth.secure_cookie,
                 args.allow_insecure_no_auth,
                 running_in_container(),
             )?;
@@ -873,29 +1328,31 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 );
             } else if auth_enabled && !local_addr.ip().is_loopback() {
                 // Auth IS configured but the server is reachable from
-                // the network on plain HTTP. The bearer token (and
-                // multi-user per-user tokens from `ai-memory user
-                // add`) ride cleartext — sniffable on the LAN. Advise
-                // the operator to front with a TLS proxy. One-shot
-                // log at startup, not refusal to serve (operators may
-                // be testing, behind their own proxy already, etc.).
+                // the network on plain HTTP. Machine bearer credentials
+                // ride cleartext — sniffable on the LAN. Advise the
+                // operator to front with a TLS proxy. One-shot log at
+                // startup, not refusal to serve (operators may be testing,
+                // behind their own proxy already, etc.).
                 tracing::warn!(
                     %local_addr,
-                    "AI_MEMORY_AUTH_TOKEN is set but the server is bound to a \
-                     non-loopback address on plain HTTP — bearer tokens travel \
+                    "authentication is enabled but the server is bound to a \
+                     non-loopback address on plain HTTP — bearer credentials travel \
                      cleartext on the network. Front ai-memory with a TLS-terminating \
                      reverse proxy (Caddy, Cloudflare Tunnel, nginx). See \
                      docs/https-via-proxy.md for copy-paste templates."
                 );
             }
             let shutdown_cancel = cancel.clone();
-            let serve_result = axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                    info!("ctrl-c received; shutting down");
-                    shutdown_cancel.cancel();
-                })
-                .await;
+            let serve_result = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("ctrl-c received; shutting down");
+                shutdown_cancel.cancel();
+            })
+            .await;
             cancel.cancel();
             if let Some(task) = session_consolidation_task
                 && let Err(error) = task.await
@@ -966,6 +1423,7 @@ async fn start_maintenance_scheduler(
                             &wiki,
                             &decay.decay_params(),
                             decay.breadth_weight,
+                            decay.observation_retention(),
                         )
                         .await?;
                         if outcome.errors > 0 {
@@ -980,6 +1438,7 @@ async fn start_maintenance_scheduler(
                             evicted = outcome.evicted,
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
+                            observations_pruned = outcome.observations_pruned,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
                             "scheduled forget sweep completed"
@@ -1086,6 +1545,36 @@ async fn start_maintenance_scheduler(
         }));
     }
 
+    // One-shot startup backfill (2.0): with an embedder present, pages
+    // written before it existed - a fresh upgrade onto the default local
+    // embedder, or a provider switch - get their vectors without any
+    // maintenance config. Skips already-embedded pages, so a settled
+    // store logs one cheap no-op pass. Runs in the background; startup
+    // is never blocked on it.
+    if let Some(embedder) = embedder.clone() {
+        let reader = reader.clone();
+        let writer = writer.clone();
+        let wiki = wiki.clone();
+        tasks.push(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match run_scheduled_embedding_backfill_tick(&reader, &writer, &wiki, &embedder).await {
+                Ok(outcome) if outcome.embedded > 0 || outcome.failed > 0 || outcome.errors > 0 => {
+                    info!(
+                        scopes = outcome.scopes,
+                        embedded = outcome.embedded,
+                        skipped = outcome.skipped,
+                        failed = outcome.failed,
+                        errors = outcome.errors,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "startup embedding backfill completed"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "startup embedding backfill failed"),
+            }
+        }));
+    }
+
     if maintenance_enabled && embedding_backfill_interval_secs > 0 {
         if let Some(embedder) = embedder {
             let reader = reader.clone();
@@ -1102,6 +1591,7 @@ async fn start_maintenance_scheduler(
                         Ok(outcome) => info!(
                             scopes = outcome.scopes,
                             embedded = outcome.embedded,
+                            skipped = outcome.skipped,
                             failed = outcome.failed,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
@@ -1130,6 +1620,13 @@ async fn start_maintenance_scheduler(
             require_approval: auto_improve.require_approval,
             min_session_age_secs: scheduler.min_session_age_secs,
             max_sessions_per_tick: scheduler.max_sessions_per_tick,
+            experience: (scheduler.experience_every_sessions > 0).then(|| {
+                ai_memory_consolidate::ExperienceConfig {
+                    sessions: scheduler.experience_sessions.max(1),
+                    min_new_sessions: scheduler.experience_every_sessions,
+                    ..ai_memory_consolidate::ExperienceConfig::default()
+                }
+            }),
         };
         match ai_memory_consolidate::initialize_auto_improve_scheduler_scopes(&reader, &writer)
             .await
@@ -1167,6 +1664,8 @@ async fn start_maintenance_scheduler(
                         reviewed = outcome.reviewed,
                         skipped = outcome.skipped,
                         errors = outcome.errors,
+                        released = outcome.released,
+                        exhausted = outcome.exhausted,
                         elapsed_ms = started.elapsed().as_millis(),
                         "scheduled auto-improve tick completed"
                     ),
@@ -1195,6 +1694,7 @@ struct ScheduledSweepTickOutcome {
     evicted: usize,
     expired: usize,
     hard_deleted: usize,
+    observations_pruned: usize,
     errors: usize,
 }
 
@@ -1204,6 +1704,7 @@ async fn run_scheduled_sweep_tick(
     wiki: &Wiki,
     decay: &ai_memory_store::DecayParams,
     breadth_weight: f64,
+    retention: ObservationRetention,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -1212,7 +1713,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match run_sweep_with_breadth(
+        match run_sweep_with_options(
             reader,
             writer,
             Some(wiki),
@@ -1220,6 +1721,7 @@ async fn run_scheduled_sweep_tick(
             scope.project_id,
             decay,
             breadth_weight,
+            retention,
             false,
         )
         .await
@@ -1229,6 +1731,7 @@ async fn run_scheduled_sweep_tick(
                 outcome.evicted += report.evicted.iter().filter(|page| page.deleted).count();
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
+                outcome.observations_pruned += report.observations_pruned;
             }
             Err(e) => {
                 outcome.errors += 1;
@@ -1299,6 +1802,10 @@ async fn run_scheduled_lint_tick(
 struct ScheduledEmbeddingBackfillTickOutcome {
     scopes: usize,
     embedded: usize,
+    /// Pages that already had a current embedding. Reported because a
+    /// tick that skipped everything and a tick that had nothing to do
+    /// are otherwise indistinguishable in the log.
+    skipped: usize,
     failed: usize,
     errors: usize,
 }
@@ -1329,6 +1836,7 @@ async fn run_scheduled_embedding_backfill_tick(
         {
             Ok(counts) => {
                 outcome.embedded += counts.embedded;
+                outcome.skipped += counts.skipped;
                 outcome.failed += counts.failed;
             }
             Err(e) => {
@@ -1369,6 +1877,7 @@ fn auto_improve_review_config_from_settings(
         max_final_body_chars: settings.max_final_body_chars,
         max_rule_page_tokens: settings.max_rule_page_tokens,
         max_procedure_page_tokens: settings.max_procedure_page_tokens,
+        review_max_output_tokens: settings.review_max_output_tokens,
         eval: ai_memory_consolidate::AutoImproveEvalConfig {
             enabled: settings.eval.enabled,
             command: settings.eval.command.clone(),
@@ -1396,7 +1905,61 @@ async fn configure_embedder(
     let provider_name = cfg.provider.name().to_string();
     let model = cfg.model.clone();
     let dim = cfg.dim;
-    let embedder = build_embedder(cfg).context("building embedder from config")?;
+    let defaulted = cfg.defaulted;
+    // Local embeddings: fetch the model once, checksum-pinned, before
+    // the loader runs (docs/local-embeddings.md). Offline installs drop
+    // the files into models/ by hand and never hit the network.
+    if cfg.provider == ai_memory_llm::EmbedderChoice::Local
+        && let Some(models_dir) = cfg.models_dir.as_deref()
+        && !ai_memory_llm::model_present(models_dir)
+    {
+        if defaulted {
+            // Best-effort default (docs/local-embeddings.md): never
+            // block startup on an ~87 MB download. Fetch in the
+            // background; THIS boot runs without an embedder (the
+            // pre-2.0 behaviour), the next start finds the files and
+            // enables hybrid search. Offline hosts just log the warn.
+            let models_dir = models_dir.to_path_buf();
+            tokio::spawn(async move {
+                tracing::info!(
+                    dir = %models_dir.display(),
+                    "fetching the default local embedding model in the \
+                     background (~87 MB, one time); hybrid search enables \
+                     on the next start"
+                );
+                if let Err(e) = ai_memory_llm::fetch_model(&models_dir).await {
+                    tracing::warn!(
+                        error = %e,
+                        "default local embedding model fetch failed; running \
+                         without an embedder. Set embedding_provider = \"none\" \
+                         to opt out, or install offline per \
+                         docs/local-embeddings.md"
+                    );
+                }
+            });
+            return Ok((wiki, None));
+        }
+        tracing::info!(
+            dir = %models_dir.display(),
+            "local embedding model not present; fetching (~87 MB, one time)"
+        );
+        ai_memory_llm::fetch_model(models_dir).await.context(
+            "fetching the local embedding model (set up offline per \
+             docs/local-embeddings.md if this host has no network)",
+        )?;
+    }
+    let embedder = match build_embedder(cfg) {
+        Ok(e) => e,
+        Err(e) if defaulted => {
+            tracing::warn!(
+                error = %e,
+                "default local embeddings unavailable (model load failed); \
+                 continuing without an embedder"
+            );
+            return Ok((wiki, None));
+        }
+        Err(e) => return Err(e).context("building embedder from config"),
+    };
     let mismatch = store
         .reader
         .embedding_meta_for_mismatch(
@@ -1444,9 +2007,119 @@ fn start_watcher(args: &ServeArgs, wiki: &Wiki) -> Result<Option<WatcherHandle>>
     Ok(Some(WatcherHandle::start(wiki.clone())?))
 }
 
+/// The flat ChatGPT-seat lane (FN8-9336), when configured: the Codex CLI's
+/// own sign-in, read-only, capped per UTC day. The cap is seeded from today's
+/// rows in the call ledger so a restart does not hand out a fresh allocation.
+fn flat_fallback_lane(config: &Config) -> Option<ai_memory_llm::Lane> {
+    let flat = config.flat_fallback_settings()?;
+    let provider = match ai_memory_llm::OpenAiOAuthProvider::from_codex_cli_auth(
+        flat.auth_file.clone(),
+        flat.model.clone(),
+    ) {
+        Ok(p) => p
+            .with_timeout_secs(flat.timeout_secs)
+            .with_reasoning_effort(Some(flat.reasoning_effort)),
+        Err(error) => {
+            tracing::warn!(%error, "flat fallback lane unavailable; chain continues without it");
+            return None;
+        }
+    };
+    let label = "codex-oauth";
+    let used_today = config.llm_ledger().calls_path().map_or(0, |path| {
+        ai_memory_llm::count_lane_calls_since(
+            path,
+            label,
+            ai_memory_llm::utc_day_start(jiff::Timestamp::now().as_second()),
+        )
+    });
+    info!(
+        lane = label,
+        model = %flat.model,
+        daily_max_requests = flat.daily_max_requests,
+        used_today,
+        "flat fallback lane: ChatGPT seat via the Codex CLI sign-in (read-only), capped per UTC day",
+    );
+    Some(
+        ai_memory_llm::Lane::new(Arc::new(provider), label).with_daily_cap(
+            ai_memory_llm::DailyCap::with_wall_clock(
+                flat.daily_max_requests,
+                Arc::new(ai_memory_llm::SystemWallClock),
+                used_today,
+            ),
+        ),
+    )
+}
+
+/// Build the zero-metered lane chain (FN8-9336) around the primary LLM.
+///
+/// Lanes, in order: the primary (key A); one lane per extra primary key
+/// (`AI_MEMORY_LLM_EXTRA_API_KEY_FILES`, e.g. Laguna key B), tried only after a
+/// *transport* failure of the lanes before it; then the flat ChatGPT-seat lane
+/// ([`flat_fallback_lane`]); then nothing — the caller's no-LLM path. No
+/// pay-per-token provider is added here, and a lane that is not zero-metered
+/// raises an alarm at start. The chain is built even for a single lane so
+/// every call reaches the ledger.
+fn with_runtime_fallback(
+    config: &Config,
+    primary_cfg: &ai_memory_llm::ProviderConfig,
+    primary: Arc<dyn ai_memory_llm::LlmProvider>,
+) -> Result<Arc<dyn ai_memory_llm::LlmProvider>> {
+    Ok(finish_chain(config, lane_chain(config, primary_cfg, primary)?))
+}
+
+/// The lanes of [`with_runtime_fallback`], before the ledger is attached.
+fn lane_chain(
+    config: &Config,
+    primary_cfg: &ai_memory_llm::ProviderConfig,
+    primary: Arc<dyn ai_memory_llm::LlmProvider>,
+) -> Result<ai_memory_llm::FallbackProvider> {
+    let extras = config.llm_extra_primary_configs(primary_cfg);
+    let primary_label = if extras.is_empty() {
+        primary.name().to_string()
+    } else {
+        "key-a".to_string()
+    };
+    let first = ai_memory_llm::Lane::new(primary, primary_label)
+        .with_key_fp(config.primary_key_fingerprint(primary_cfg.provider));
+    let mut rest = Vec::new();
+    for (i, (cfg, fp)) in extras.into_iter().enumerate() {
+        let label = format!("key-{}", char::from(b'b' + u8::try_from(i.min(24)).unwrap_or(24)));
+        let provider =
+            build_provider(cfg).context("building extra-key LLM provider from config")?;
+        rest.push(
+            ai_memory_llm::Lane::new(provider, label)
+                .with_key_fp(Some(fp))
+                .transport_only(),
+        );
+    }
+    rest.extend(flat_fallback_lane(config));
+    Ok(ai_memory_llm::FallbackProvider::chain(first, rest))
+}
+
+fn finish_chain(
+    config: &Config,
+    chain: ai_memory_llm::FallbackProvider,
+) -> Arc<dyn ai_memory_llm::LlmProvider> {
+    let chain = chain.with_observer(Arc::new(config.llm_ledger()));
+    let not_zero_metered = chain.non_zero_metered_lanes();
+    if !not_zero_metered.is_empty() {
+        tracing::error!(
+            lanes = ?not_zero_metered,
+            "ALARM: LLM lane chain holds lanes that are not zero-metered (FN8-9336)",
+        );
+    }
+    info!(
+        lanes = ?chain.lane_labels(),
+        cooldown_secs = ai_memory_llm::DEFAULT_COOLDOWN.as_secs(),
+        "LLM lane chain: 429/5xx/timeout moves to the next lane; a loop, cut or bad answer skips \
+         transport-only lanes; the flat lane is capped per UTC day; each lane has its own breaker",
+    );
+    Arc::new(chain)
+}
+
 fn configure_consolidator(
     config: &Config,
-    mut server: AiMemoryServer,
+    server: AiMemoryServer,
     store: &Store,
     wiki: &Wiki,
     workspace_id: WorkspaceId,
@@ -1462,6 +2135,30 @@ fn configure_consolidator(
     // the hook router (for PreCompact checkpointing), and the admin
     // router (for `POST /admin/bootstrap`).
     let Some(cfg) = config.llm_provider_config()? else {
+        // No Laguna key bound (both withheld by the provider gate at boot, or
+        // none configured): the flat seat alone still consolidates.
+        if let Some(lane) = flat_fallback_lane(config) {
+            info!("AI_MEMORY_LLM_PROVIDER unset; the flat ChatGPT-seat lane is the only LLM lane");
+            let llm = finish_chain(config, ai_memory_llm::FallbackProvider::chain(lane, Vec::new()));
+            let llm = provider_health.wrap_llm_provider(
+                llm,
+                "openai-oauth".to_string(),
+                config
+                    .flat_fallback_settings()
+                    .map_or_else(String::new, |f| f.model),
+                None,
+            );
+            return Ok(finish_consolidator_setup(
+                config,
+                server,
+                store,
+                wiki,
+                workspace_id,
+                project_id,
+                llm,
+                want_reranker,
+            ));
+        }
         info!(
             "AI_MEMORY_LLM_PROVIDER unset; memory_consolidate disabled, PreCompact \
              falls back to rule-based checkpoint, lint runs rule-based only"
@@ -1482,8 +2179,35 @@ fn configure_consolidator(
     let provider_name = cfg.provider.name().to_string();
     let model = cfg.model.clone();
     let retry_hint = llm_retry_hint(&provider_name, &model, cfg.base_url.as_deref());
+    let lane_cfg = cfg.clone();
     let llm = build_provider(cfg).context("building LLM provider from config")?;
+    let llm = with_runtime_fallback(config, &lane_cfg, llm)?;
+    // Health wraps the composite: ProviderHealth has one LLM role, and the
+    // configured label stays the primary's.
     let llm = provider_health.wrap_llm_provider(llm, provider_name, model, Some(retry_hint));
+    Ok(finish_consolidator_setup(
+        config,
+        server,
+        store,
+        wiki,
+        workspace_id,
+        project_id,
+        llm,
+        want_reranker,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_consolidator_setup(
+    config: &Config,
+    mut server: AiMemoryServer,
+    store: &Store,
+    wiki: &Wiki,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    llm: Arc<dyn ai_memory_llm::LlmProvider>,
+    want_reranker: bool,
+) -> ConsolidatorSetup {
     info!(
         provider = llm.name(),
         model = llm.model(),
@@ -1519,11 +2243,11 @@ fn configure_consolidator(
         );
         server = server.with_reranker(Arc::new(ai_memory_llm::LlmReranker::new(llm.clone())));
     }
-    Ok(ConsolidatorSetup {
+    ConsolidatorSetup {
         server,
         consolidator: Some(consolidator),
         admin_llm: Some(llm),
-    })
+    }
 }
 
 /// Validate a list of CORS origins before the server binds.
@@ -1596,20 +2320,11 @@ fn llm_retry_hint(provider: &str, model: &str, base_url: Option<&str>) -> String
     command
 }
 
-fn apply_http_layers(
-    router: axum::Router,
-    auth_state: Arc<AuthState>,
-    allowed_hosts: Vec<String>,
-) -> axum::Router {
-    router
-        .layer(axum::middleware::from_fn_with_state(
-            auth_state,
-            require_bearer,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(allowed_hosts),
-            require_allowed_host,
-        ))
+fn apply_host_layer(router: axum::Router, allowed_hosts: Vec<String>) -> axum::Router {
+    router.layer(axum::middleware::from_fn_with_state(
+        Arc::new(allowed_hosts),
+        require_allowed_host,
+    ))
 }
 
 async fn require_allowed_host(
@@ -1654,13 +2369,86 @@ fn host_without_port(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (e) An exhausted flat allocation defers the job to the reset instead of
+    /// spending the retry budget; any other failure does not.
+    #[test]
+    fn an_exhausted_allocation_defers_to_the_reset() {
+        let exhausted = ai_memory_consolidate::ConsolidatorError::Llm(
+            ai_memory_llm::LlmError::AllocationExhausted {
+                lane: "codex-oauth".into(),
+                used: 40,
+                cap: 40,
+                resets_at_unix: 1_790_467_200,
+            },
+        );
+        assert_eq!(
+            session_consolidation_deferral(&exhausted),
+            Some(1_790_467_200_000_000)
+        );
+        let cut = ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Truncated {
+            finish_reason: "repetition".into(),
+            partial: None,
+        });
+        assert_eq!(session_consolidation_deferral(&cut), None);
+    }
+
+    /// A persistent cut is parked after SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS;
+    /// any other failure keeps the full budget and backoff.
+    #[test]
+    fn a_truncated_consolidation_is_parked_after_the_truncation_budget() {
+        let truncated =
+            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Truncated {
+                finish_reason: "length".into(),
+                partial: None,
+            });
+        let other =
+            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Provider {
+                status: 503,
+                body: "overloaded".into(),
+            });
+        let now = 1_000_000_i64;
+        assert_eq!(
+            session_consolidation_retry_at(1, &truncated, now),
+            Some(now + 30_000_000),
+            "one retry for a cut"
+        );
+        assert_eq!(
+            session_consolidation_retry_at(
+                SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS,
+                &truncated,
+                now
+            ),
+            None,
+            "then parked, not re-sent on the same prompt"
+        );
+        assert_eq!(
+            session_consolidation_retry_at(
+                SESSION_CONSOLIDATION_MAX_TRUNCATED_ATTEMPTS,
+                &other,
+                now
+            ),
+            Some(now + 60_000_000),
+            "a non-truncation failure keeps retrying with backoff"
+        );
+        assert_eq!(
+            session_consolidation_retry_at(
+                ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
+                &other,
+                now
+            ),
+            None
+        );
+    }
+
     use ai_memory_core::{
-        AgentKind, NewObservation, NewSession, ObservationKind, PagePath, Sanitized, Sanitizer,
-        SessionId, Tier,
+        AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,
+        Sanitized, Sanitizer, SessionId, Tier,
     };
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult, SyntheticEmbedder};
     use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
+    use secrecy::SecretString;
     use std::future::Future;
     use std::pin::Pin;
     use tempfile::TempDir;
@@ -1689,6 +2477,44 @@ mod tests {
     }
 
     #[test]
+    fn second_server_on_the_same_data_dir_is_refused_and_names_the_holder() {
+        let dir = TempDir::new().unwrap();
+        let first = acquire_serve_lock(dir.path(), false).unwrap();
+        assert!(first.is_some());
+        let err = acquire_serve_lock(dir.path(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--force"),
+            "refusal must name the override: {err}"
+        );
+        assert!(
+            err.contains(&format!("pid={}", std::process::id())),
+            "refusal must name the holding process: {err}"
+        );
+    }
+
+    #[test]
+    fn force_starts_unguarded_while_the_holder_keeps_the_lock() {
+        let dir = TempDir::new().unwrap();
+        let _first = acquire_serve_lock(dir.path(), false).unwrap();
+        assert!(acquire_serve_lock(dir.path(), true).unwrap().is_none());
+        // --force bypasses the refusal, not the holder: a plain attempt still sees it.
+        assert!(acquire_serve_lock(dir.path(), false).is_err());
+    }
+
+    #[test]
+    fn a_released_serve_lock_does_not_lock_out_the_next_server() {
+        let dir = TempDir::new().unwrap();
+        {
+            let _first = acquire_serve_lock(dir.path(), false).unwrap();
+            // Dropping the holder is what process exit does to the flock: the
+            // leftover .serve.lock file must not outlive the lock it named.
+        }
+        assert!(acquire_serve_lock(dir.path(), false).unwrap().is_some());
+    }
+
+    #[test]
     fn existing_users_require_nonempty_pepper_and_root_bearer() {
         for users_exist in [false, true] {
             for (pepper_label, token_pepper) in [
@@ -1706,7 +2532,8 @@ mod tests {
                         bearer_token: bearer_token.map(str::to_string),
                         ..AuthSettings::default()
                     };
-                    let result = validate_existing_users_auth(users_exist, &auth);
+                    let result =
+                        validate_existing_users_auth(users_exist, users_exist, false, &auth);
                     let should_pass =
                         !users_exist || (pepper_label == "present" && bearer_label == "present");
                     assert_eq!(
@@ -1717,6 +2544,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn native_api_key_pepper_preflight_is_independent_of_human_mode() {
+        let missing = AuthSettings::default();
+        assert!(validate_api_credential_pepper(true, &missing).is_err());
+
+        let configured = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_api_credential_pepper(true, &configured).is_ok());
+        assert!(validate_api_credential_pepper(false, &missing).is_ok());
     }
 
     #[test]
@@ -1738,14 +2578,38 @@ mod tests {
                     // the operator overrode it.
                     let allowed = loopback || auth_enabled || allow_override;
                     assert_eq!(
-                        validate_http_exposure(local_addr, auth_enabled, allow_override, false)
-                            .is_ok(),
+                        validate_http_exposure(
+                            local_addr,
+                            auth_enabled,
+                            false,
+                            false,
+                            allow_override,
+                            false,
+                        )
+                        .is_ok(),
                         allowed,
                         "address={address}, auth={auth_enabled}, override={allow_override}"
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn human_auth_non_loopback_requires_secure_cookie_posture() {
+        let remote: SocketAddr = "192.168.1.90:49374".parse().unwrap();
+        assert!(validate_http_exposure(remote, true, true, false, false, false).is_err());
+        assert!(validate_http_exposure(remote, true, true, false, true, true).is_err());
+        assert_eq!(
+            validate_http_exposure(remote, true, true, true, false, false).unwrap(),
+            HttpExposure::Safe
+        );
+
+        let loopback: SocketAddr = "127.0.0.1:49374".parse().unwrap();
+        assert_eq!(
+            validate_http_exposure(loopback, true, true, false, false, false).unwrap(),
+            HttpExposure::Safe
+        );
     }
 
     /// Regression for #407. The published image binds `0.0.0.0` because that
@@ -1758,32 +2622,36 @@ mod tests {
 
         // The exact Quick Start shape: no token, no override, in a container.
         assert_eq!(
-            validate_http_exposure(quick_start, false, false, true).expect("must not refuse"),
+            validate_http_exposure(quick_start, false, false, false, false, true)
+                .expect("must not refuse"),
             HttpExposure::UndeterminedInContainer,
         );
 
         // Identical inputs on a host still refuse — the carve-out is scoped
         // to the container case and does not soften the host rule.
-        assert!(validate_http_exposure(quick_start, false, false, false).is_err());
+        assert!(validate_http_exposure(quick_start, false, false, false, false, false).is_err());
 
-        // A container is not a blanket downgrade: with auth configured the
-        // verdict is Safe, so the operator gets no spurious warning.
+        // A container is not a blanket downgrade: with machine auth configured
+        // the verdict is Safe, so the operator gets no spurious warning.
         assert_eq!(
-            validate_http_exposure(quick_start, true, false, true).expect("auth is fine"),
+            validate_http_exposure(quick_start, true, false, false, false, true)
+                .expect("auth is fine"),
             HttpExposure::Safe,
         );
 
         // An explicit override still reports as an override, not as the
         // container case, so the startup log keeps naming the real reason.
         assert_eq!(
-            validate_http_exposure(quick_start, false, true, true).expect("override is fine"),
+            validate_http_exposure(quick_start, false, false, false, true, true)
+                .expect("override is fine"),
             HttpExposure::InsecureByOverride,
         );
 
         // Loopback inside a container is plain Safe.
         let loopback: SocketAddr = "127.0.0.1:49374".parse().expect("valid test address");
         assert_eq!(
-            validate_http_exposure(loopback, false, false, true).expect("loopback is fine"),
+            validate_http_exposure(loopback, false, false, false, false, true)
+                .expect("loopback is fine"),
             HttpExposure::Safe,
         );
     }
@@ -2521,9 +3389,16 @@ mod tests {
             cold_threshold: 2.0,
             ..ai_memory_store::DecayParams::default()
         };
-        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &wiki, &decay, 0.0)
-            .await
-            .unwrap();
+        let outcome = run_scheduled_sweep_tick(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &decay,
+            0.0,
+            ObservationRetention::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.scopes, 2);
         assert_eq!(outcome.errors, 0);
@@ -2638,6 +3513,58 @@ mod tests {
         }
     }
 
+    /// A tick that skipped every page and a tick that had nothing to do
+    /// both embed zero pages. Without `skipped` in the completion line
+    /// they are the same log entry, so a page being passed over every
+    /// hour reads as a quiet, healthy scheduler (#509).
+    #[tokio::test]
+    async fn scheduled_embedding_tick_distinguishes_skipped_work_from_an_idle_pass() {
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        let embedder: Arc<dyn Embedder> = Arc::new(SyntheticEmbedder::new(16));
+
+        let idle =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!(
+            (idle.embedded, idle.skipped),
+            (0, 0),
+            "no pages yet: nothing embedded and nothing skipped"
+        );
+
+        for (project, name) in [(first, "first"), (second, "second")] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                &format!("notes/{name}.md"),
+                name,
+                Tier::Semantic,
+            )
+            .await;
+        }
+
+        let first_pass =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!((first_pass.embedded, first_pass.skipped), (2, 0));
+
+        let second_pass =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!(
+            (second_pass.embedded, second_pass.failed),
+            (0, 0),
+            "the work is done, so the tick embeds nothing"
+        );
+        assert_eq!(
+            second_pass.skipped, 2,
+            "but it must still say it passed over two pages, or it is              indistinguishable from the idle tick above"
+        );
+    }
+
     #[test]
     fn host_allowed_accepts_host_with_port() {
         let allowed = vec!["127.0.0.1".to_string(), "localhost".to_string()];
@@ -2702,13 +3629,22 @@ mod tests {
         validate_web_ui_args(true, Some(ui.path())).unwrap();
     }
 
+    #[test]
+    fn human_mode_does_not_require_root_bearer() {
+        let auth = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            bearer_token: None,
+            ..AuthSettings::default()
+        };
+        assert!(validate_existing_users_auth(true, false, true, &auth).is_ok());
+    }
+
     #[tokio::test]
     async fn web_routes_are_inside_auth_layer() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        let router = mount_web_router(
-            axum::Router::new(),
+        let web = split_web_routers(
             true,
             store.reader.clone(),
             wiki,
@@ -2721,9 +3657,12 @@ mod tests {
             },
         )
         .unwrap();
-        let router = apply_http_layers(
-            router,
-            Arc::new(AuthState::new(Some("secret".to_string()))),
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let router = apply_host_layer(
+            web.protected.layer(axum::middleware::from_fn_with_state(
+                auth,
+                require_dual_auth,
+            )),
             vec!["localhost".to_string()],
         );
 
@@ -2739,6 +3678,205 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn custom_spa_is_public_while_api_stays_authenticated() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ui = TempDir::new().unwrap();
+        std::fs::write(
+            ui.path().join("index.html"),
+            "<html><body>spa</body></html>",
+        )
+        .unwrap();
+        let web = split_web_routers(
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                web_ui_dir: Some(ui.path()),
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: "/web/",
+                base_path: "",
+            },
+        )
+        .unwrap();
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let router = apply_host_layer(
+            web.public
+                .merge(web.protected.layer(axum::middleware::from_fn_with_state(
+                    auth,
+                    require_dual_auth,
+                ))),
+            vec!["localhost".to_string()],
+        );
+
+        let spa = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spa.status(), StatusCode::OK);
+
+        let api = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn custom_spa_root_fallback_preserves_host_owned_routes() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ui = TempDir::new().unwrap();
+        std::fs::write(
+            ui.path().join("index.html"),
+            "<html><head></head><body>root spa shell</body></html>",
+        )
+        .unwrap();
+        let web = split_web_routers(
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                web_ui_dir: Some(ui.path()),
+                cors_origins: &[],
+                web_slug: "/",
+                base_href: "/",
+                base_path: "",
+            },
+        )
+        .unwrap();
+
+        let mut protected_host = axum::Router::new();
+        for path in [
+            "/admin/status",
+            "/mcp",
+            "/hook",
+            "/handoff",
+            "/workstream/runs",
+        ] {
+            protected_host = protected_host.route(
+                path,
+                axum::routing::any(|| async { StatusCode::UNAUTHORIZED }),
+            );
+        }
+        let public_auth = axum::Router::new().route(
+            "/auth/login",
+            axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+        );
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let router = protected_host
+            .merge(public_auth)
+            .merge(web.protected.layer(axum::middleware::from_fn_with_state(
+                auth,
+                require_dual_auth,
+            )))
+            .merge(web.public)
+            .merge(ai_memory_web::favicon_router());
+
+        // Mutation captured: dropping any host-owned route merge lets the root SPA
+        // wildcard return its HTML shell instead of the reserved route response.
+        for (method, path) in [
+            (axum::http::Method::GET, "/admin/status"),
+            (axum::http::Method::POST, "/mcp"),
+            (axum::http::Method::POST, "/hook"),
+            (axum::http::Method::GET, "/handoff"),
+            (axum::http::Method::POST, "/workstream/runs"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must reach its authenticated host route"
+            );
+        }
+
+        let api = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
+
+        let auth = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/auth/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.status(), StatusCode::NO_CONTENT);
+
+        let favicon = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/favicon.ico")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(favicon.status(), StatusCode::OK);
+        assert_eq!(
+            favicon.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("image/png"))
+        );
+
+        let shell = router
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shell.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(shell.into_body(), 4096).await.unwrap();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("root spa shell"),
+            "/login must still use the root SPA fallback"
+        );
     }
 
     #[tokio::test]
@@ -2838,6 +3976,301 @@ mod tests {
         );
     }
 
+    #[test]
+    fn human_auth_intended_from_bootstrap_password_or_recovery() {
+        let empty = AuthSettings::default();
+        assert!(!human_auth_intended(&empty, false, false));
+        assert!(human_auth_intended(&empty, true, false));
+        assert!(human_auth_intended(&empty, false, true));
+        let recovery = AuthSettings {
+            recovery_token: Some(SecretString::from("break-glass-recovery-token-32chr")),
+            ..AuthSettings::default()
+        };
+        assert!(human_auth_intended(&recovery, false, false));
+        let initial = AuthSettings {
+            initial_root_password: Some(SecretString::from("twelve-chars!!")),
+            ..AuthSettings::default()
+        };
+        assert!(human_auth_intended(&initial, false, false));
+    }
+
+    #[test]
+    fn human_mode_fails_closed_without_recoverable_root_or_recovery() {
+        let err = require_recoverable_root_or_recovery(true, 0, false).unwrap_err();
+        assert!(err.to_string().contains("no recoverable root"));
+        require_recoverable_root_or_recovery(true, 0, true).unwrap();
+        require_recoverable_root_or_recovery(true, 1, false).unwrap();
+        require_recoverable_root_or_recovery(false, 0, false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn maybe_bootstrap_root_is_one_shot() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let first = AuthSettings {
+            initial_root_password: Some(SecretString::from("twelve-chars!!")),
+            ..AuthSettings::default()
+        };
+        maybe_bootstrap_root(&store, &first).await.unwrap();
+        assert!(store.reader.bootstrap_completed().await.unwrap());
+        assert_eq!(store.reader.count_recoverable_roots().await.unwrap(), 1);
+        let second = AuthSettings {
+            initial_root_password: Some(SecretString::from("different-pass!!")),
+            ..AuthSettings::default()
+        };
+        maybe_bootstrap_root(&store, &second).await.unwrap();
+        let login = store
+            .reader
+            .find_login_user_by_username("root".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ai_memory_store::password::verify_password(
+                "twelve-chars!!".into(),
+                login.password_hash.clone().unwrap(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !ai_memory_store::password::verify_password(
+                "different-pass!!".into(),
+                login.password_hash.unwrap(),
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_bootstrap_root_fails_closed_on_api_credential_collision() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let mut user = NewUser {
+            username: "legacy".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
+            .await
+            .unwrap();
+        let pepper = TokenPepper::new("pepper");
+        let password = "twelve-chars!!";
+        store
+            .writer
+            .create_api_credential(
+                ApiCredentialId::new(),
+                user_id,
+                "legacy".into(),
+                hash_token(password, &pepper),
+                None,
+            )
+            .await
+            .unwrap();
+        let auth = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            initial_root_password: Some(SecretString::from(password)),
+            ..AuthSettings::default()
+        };
+        let err = maybe_bootstrap_root(&store, &auth).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("collides with an existing API credential"),
+            "{err}"
+        );
+        assert!(!store.reader.bootstrap_completed().await.unwrap());
+
+        let state =
+            AuthState::new(None).with_multiuser(pepper, store.reader.clone(), store.writer.clone());
+        let mut machine_request = Request::builder()
+            .header("authorization", format!("Bearer {password}"))
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            ai_memory_mcp::auth::authenticate_bearer(&state, &mut machine_request)
+                .await
+                .unwrap(),
+            ai_memory_mcp::auth::BearerAuth::Authenticated
+        ));
+        assert_eq!(
+            machine_request
+                .extensions()
+                .get::<ai_memory_core::AuthLevel>(),
+            Some(&ai_memory_core::AuthLevel::User)
+        );
+
+        let login = public_auth_router(Arc::new(state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "legacy",
+                            "password": password,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn internal_session_introspect_is_inside_host_guard_not_require_bearer() {
+        let state = std::sync::Arc::new(
+            AuthState::new(Some("root-bearer".into()))
+                .with_trusted_proxy_bearer("proxy-bearer-token"),
+        );
+        let router = apply_host_layer(internal_auth_router(state), vec!["memory.example".into()]);
+        let body = Body::from(r#"{"session":"","method":"GET"}"#);
+
+        let missing_host = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/session-introspect")
+                    .header("authorization", "Bearer proxy-bearer-token")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_host.status(), StatusCode::BAD_REQUEST);
+        let text = String::from_utf8(
+            axum::body::to_bytes(missing_host.into_body(), 4096)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("missing Host"), "{text}");
+
+        let bad_host = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/session-introspect")
+                    .header("Host", "evil.example")
+                    .header("authorization", "Bearer proxy-bearer-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"session":"","method":"GET"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_host.status(), StatusCode::FORBIDDEN);
+
+        let allowed = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/session-introspect")
+                    .header("Host", "memory.example")
+                    .header("authorization", "Bearer proxy-bearer-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"session":"","method":"GET"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(allowed.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["authenticated"], false);
+        let body_text = json.to_string();
+        assert!(
+            !body_text.contains("X-Memory-Actor"),
+            "proxy bearer without actor headers must reach introspect, not MissingIdentity: {body_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_authority_secrets_cannot_match_api_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let mut user = NewUser {
+            username: "legacy".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
+            .await
+            .unwrap();
+        let pepper = TokenPepper::new("pepper");
+        let secret = "configured-authority-collision-32chars";
+        store
+            .writer
+            .create_api_credential(
+                ApiCredentialId::new(),
+                user_id,
+                "legacy".into(),
+                hash_token(secret, &pepper),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let cases = [
+            AuthSettings {
+                token_pepper: Some("pepper".into()),
+                bearer_token: Some(secret.into()),
+                ..AuthSettings::default()
+            },
+            AuthSettings {
+                token_pepper: Some("pepper".into()),
+                actor_proxy_bearer_token: Some(secret.into()),
+                ..AuthSettings::default()
+            },
+            AuthSettings {
+                token_pepper: Some("pepper".into()),
+                recovery_token: Some(SecretString::from(secret)),
+                ..AuthSettings::default()
+            },
+        ];
+        for auth in cases {
+            let err = validate_configured_secret_collisions(&store, &auth, false)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("collides with an existing API credential")
+            );
+            assert!(!err.to_string().contains(secret));
+        }
+
+        let ignored_initial = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            initial_root_password: Some(SecretString::from(secret)),
+            ..AuthSettings::default()
+        };
+        validate_configured_secret_collisions(&store, &ignored_initial, false)
+            .await
+            .unwrap();
+        assert!(
+            validate_configured_secret_collisions(&store, &ignored_initial, true)
+                .await
+                .is_err()
+        );
+    }
+
     // ── Part B: CORS validation tests ──────────────────────────────────────
 
     #[test]
@@ -2901,5 +4334,100 @@ mod tests {
                 "https://c.example.com"
             ]
         );
+    }
+
+    /// The production path from env to lanes: `LLM_API_KEY` is key A, an
+    /// extra key FILE is key B, and a 429 on A sends the same request with
+    /// B's key — proven on the wire by the Authorization header.
+    #[tokio::test]
+    async fn extra_key_file_becomes_a_lane_that_sends_its_own_key() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        const KEY_A: &str = "lane-test-key-A-0123456789";
+        const KEY_B: &str = "lane-test-key-B-0123456789";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", format!("Bearer {KEY_A}").as_str()))
+            .respond_with(ResponseTemplate::new(429).set_body_string("usage limit exceeded"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(header("authorization", format!("Bearer {KEY_B}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "{\"summary\":\"b\"}"},
+                             "finish_reason": "stop"}],
+                "model": "m",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        let tmp = TempDir::new().unwrap();
+        let key_b = tmp.path().join("key-b");
+        std::fs::write(&key_b, format!("{KEY_B}\n")).unwrap();
+        let ledger = tmp.path().join("calls.jsonl");
+        let config = Config {
+            llm_provider: Some("openai-compat".into()),
+            llm_model: Some("local-model".into()),
+            llm_base_url: Some(server.uri()),
+            runtime_env: crate::config::RuntimeEnv::for_lane_test(
+                KEY_A,
+                vec![key_b],
+                ledger.clone(),
+            ),
+            ..Config::default()
+        };
+        let cfg = config.llm_provider_config().unwrap().unwrap();
+        let primary = build_provider(cfg.clone()).unwrap();
+        let llm = with_runtime_fallback(&config, &cfg, primary).unwrap();
+        let (out, who) = ai_memory_llm::capture_responder(llm.complete_structured_raw(
+            ChatRequest::user_prompt("x"),
+            serde_json::json!({"type": "object", "properties": {"summary": {"type": "string"}}}),
+        ))
+        .await;
+        assert_eq!(out.unwrap()["summary"], "b");
+        assert_eq!(who.unwrap().lane, "key-b");
+        let ledger = std::fs::read_to_string(ledger).unwrap();
+        assert!(ledger.contains(&ai_memory_llm::key_fingerprint(KEY_A)));
+        assert!(ledger.contains(&ai_memory_llm::key_fingerprint(KEY_B)));
+        assert!(!ledger.contains(KEY_A) && !ledger.contains(KEY_B));
+    }
+
+    /// (f) The chain the default configuration builds — Laguna key A, key B,
+    /// the Codex CLI seat — holds no lane that is not zero-metered, and the
+    /// same builder pointed at a metered gateway is flagged.
+    #[test]
+    fn the_default_chain_holds_only_zero_metered_lanes() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::fs::write(
+            tmp.path().join(".codex/auth.json"),
+            r#"{"tokens":{"access_token":"a.e30.s","refresh_token":"r","account_id":"x"}}"#,
+        )
+        .unwrap();
+        let key_b = tmp.path().join("key-b");
+        std::fs::write(&key_b, "second-key\n").unwrap();
+        let build = |base: &str| {
+            let mut env = crate::config::RuntimeEnv::for_lane_test(
+                "first-key",
+                vec![key_b.clone()],
+                tmp.path().join("calls.jsonl"),
+            );
+            env.set_home_for_test(tmp.path());
+            let config = Config {
+                llm_provider: Some("openai-compat".into()),
+                llm_model: Some("poolside/laguna-s-2.1".into()),
+                llm_base_url: Some(base.into()),
+                runtime_env: env,
+                ..Config::default()
+            };
+            let cfg = config.llm_provider_config().unwrap().unwrap();
+            let primary = build_provider(cfg.clone()).unwrap();
+            lane_chain(&config, &cfg, primary).unwrap()
+        };
+        let chain = build("https://inference.poolside.ai/v1");
+        assert_eq!(chain.lane_labels(), vec!["key-a", "key-b", "codex-oauth"]);
+        assert!(chain.non_zero_metered_lanes().is_empty(), "{:?}", chain.lane_kinds());
+        let chain = build("https://openrouter.ai/api/v1");
+        assert_eq!(chain.non_zero_metered_lanes(), vec!["key-a", "key-b"]);
     }
 }

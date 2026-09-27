@@ -112,12 +112,30 @@ pub(crate) struct ProjectCard {
     pub href: String,
 }
 
+/// The one-time 2.0 migration explainer dialog (docs/okf.md): shown
+/// whenever a migration receipt exists, dismissed per browser via a
+/// "do not show me again" checkbox persisted in localStorage keyed by
+/// the migration timestamp (a future migration re-shows it).
+pub(crate) struct OkfDialog {
+    /// Absolute archive path from the receipt.
+    pub archive_path: String,
+    /// Human-readable archive size.
+    pub size_human: String,
+    /// Migration timestamp — also the localStorage dismissal key.
+    pub created_at: String,
+    /// Whether the archive file still exists (adapts the recovery text).
+    pub archive_present: bool,
+}
+
 /// View-model for `GET /`.
 #[derive(Template)]
 #[template(path = "projects.html")]
 pub(crate) struct ProjectsView {
     /// All project cards, sorted by most recently active first.
     pub projects: Vec<ProjectCard>,
+    /// Present whenever a migration receipt exists (dialog dismissal is
+    /// client-side, per browser).
+    pub okf_dialog: Option<OkfDialog>,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,10 +172,31 @@ pub(crate) struct ProjectView {
     pub workspace: String,
     /// Project name.
     pub project: String,
-    /// Sidebar folder tree.
+    /// Sidebar folder tree — knowledge pages only.
     pub folders: Vec<Folder>,
-    /// N most-recent pages for the right column.
+    /// Machinery pages (lint reports, sessions, logs, indexes),
+    /// rendered collapsed below the knowledge tree.
+    pub system: Vec<Folder>,
+    /// N most-recent knowledge pages for the right column.
     pub recent: Vec<PageRow>,
+}
+
+/// View-model for a namespace (directory) listing — `GET
+/// /w/:workspace/:project/p/:namespace/` when the path names a namespace
+/// rather than a page (#603).
+#[derive(Template)]
+#[template(path = "namespace.html")]
+pub(crate) struct NamespaceView {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+    /// Link back to the project overview.
+    pub project_href: String,
+    /// The namespace path (no trailing slash), e.g. `_lint` or `concepts`.
+    pub namespace: String,
+    /// Pages under this namespace.
+    pub pages: Vec<PageRow>,
 }
 
 // ---------------------------------------------------------------------------

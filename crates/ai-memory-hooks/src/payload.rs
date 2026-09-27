@@ -4,7 +4,7 @@ use ai_memory_core::{AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, tru
 use serde::{Deserialize, Serialize};
 
 use crate::capture_policy::{
-    ToolObservationMetadata, tool_observation_metadata, tool_observation_outcome,
+    ToolFamily, ToolObservationMetadata, tool_observation_metadata, tool_observation_outcome,
 };
 
 /// Durable excerpt ceiling for user prompts. Prompts retain more working
@@ -599,6 +599,8 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Pi
             | AgentKind::AntigravityCli
             | AgentKind::Hermes
+            | AgentKind::Pool
+            | AgentKind::Zcode
     )
 }
 
@@ -609,6 +611,22 @@ fn safe_tool_title(metadata: &ToolObservationMetadata) -> String {
             .unwrap_or_default()
             .trim_matches('"')
     )
+}
+
+/// `true` when `title` is one this module produced from a [`ToolFamily`]
+/// rather than from the harness's own tool name.
+///
+/// Derived from the same serde representation [`safe_tool_title`] writes, so
+/// a new `ToolFamily` variant is recognised here without a second edit — the
+/// two cannot drift into disagreeing about what this module emits.
+///
+/// The distinction matters downstream: a family is a partition of the calls,
+/// not a name for what they did, so a reader gains nothing from being told a
+/// session spent itself "across tool non-file and tool unknown".
+pub(crate) fn is_safe_tool_title(title: &str) -> bool {
+    title.strip_prefix("tool ").is_some_and(|family| {
+        serde_json::from_value::<ToolFamily>(serde_json::Value::String(family.to_owned())).is_ok()
+    })
 }
 
 fn safe_tool_body(
@@ -885,7 +903,7 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
     }
 }
 
-fn truncate_for_title(s: &str) -> String {
+pub(crate) fn truncate_for_title(s: &str) -> String {
     const MAX: usize = 80;
     let one_line: String = s.chars().take_while(|c| *c != '\n').collect();
     if one_line.chars().count() <= MAX {
@@ -992,6 +1010,64 @@ fn normalize_token(value: &str, max_len: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The predicate must accept exactly what `safe_tool_title` emits, for
+    /// every `ToolFamily` variant. Inputs are built *through* the writer
+    /// rather than written by hand, so the two cannot drift apart on what a
+    /// family title looks like.
+    ///
+    /// The list below is checked by the compiler, not by trust: the
+    /// wildcard-free `match` stops compiling the moment a variant is added,
+    /// which routes whoever adds it here. Without that this test would keep
+    /// passing while the new variant went uncovered — the comment would be
+    /// making a promise the enumeration does not keep.
+    #[test]
+    fn the_predicate_recognises_every_title_the_writer_can_emit() {
+        let every_variant = [
+            ToolFamily::File,
+            ToolFamily::SearchList,
+            ToolFamily::NonFile,
+            ToolFamily::Unknown,
+        ];
+        for family in every_variant {
+            match family {
+                ToolFamily::File
+                | ToolFamily::SearchList
+                | ToolFamily::NonFile
+                | ToolFamily::Unknown => {}
+            }
+        }
+        for family in every_variant {
+            let written = safe_tool_title(&ToolObservationMetadata {
+                tool_family: family,
+                tool_call_id: None,
+            });
+            assert!(
+                is_safe_tool_title(&written),
+                "{written:?} is written by safe_tool_title and must be recognised"
+            );
+        }
+    }
+
+    /// A harness's own tool name is never mistaken for a family label, even
+    /// when it happens to start with the same word.
+    #[test]
+    fn a_real_tool_name_is_not_a_family_label() {
+        for name in [
+            "Bash",
+            "Edit",
+            "tool",
+            "tool ",
+            "tool Bash",
+            "toolfile",
+            "Tool file",
+        ] {
+            assert!(
+                !is_safe_tool_title(name),
+                "{name:?} is not something safe_tool_title writes"
+            );
+        }
+    }
 
     #[test]
     fn project_source_parses_both_spellings_and_defaults_closed() {
@@ -1562,6 +1638,8 @@ mod tests {
         assert_eq!(parse_agent("oh-my-pi"), AgentKind::Omp);
         assert_eq!(parse_agent("hermes"), AgentKind::Hermes);
         assert_eq!(parse_agent("hermes-agent"), AgentKind::Hermes);
+        assert_eq!(parse_agent("pool"), AgentKind::Pool);
+        assert_eq!(parse_agent("poolside"), AgentKind::Pool);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.
@@ -1621,6 +1699,61 @@ mod tests {
         );
         assert_eq!(unknown.agent, AgentKind::Other);
         assert!(unknown.title_hint.is_none());
+    }
+
+    #[test]
+    fn pool_tool_title_uses_the_documented_snake_case_shape() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "edit",
+            "tool_input": {"path": "src/lib.rs", "old_string": "a", "new_string": "b"},
+            "session_id": "pool-session",
+            "cwd": "/repo"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("pool".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Pool);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("pool-session"));
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn zcode_tool_payload_uses_the_captured_dual_casing_shape() {
+        // Live-captured PostToolUse payload (embedded engine v0.16.5, #512):
+        // native camelCase plus Claude Code-compatible snake_case aliases on
+        // every shared field.
+        let raw = serde_json::json!({
+            "hookEventName": "PostToolUse",
+            "hook_event_name": "PostToolUse",
+            "toolName": "Bash",
+            "tool_name": "Bash",
+            "toolCallId": "call_86cedcb9c40a4a40856e9ee7",
+            "tool_use_id": "call_86cedcb9c40a4a40856e9ee7",
+            "toolInput": {"command": "echo capture-ok"},
+            "tool_input": {"command": "echo capture-ok"},
+            "sessionId": "sess_4fc06da3",
+            "session_id": "sess_4fc06da3",
+            "cwd": "/tmp/zcode-capture"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("zcode".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Zcode);
+        assert_eq!(env.session_id.as_deref(), Some("sess_4fc06da3"));
+        assert_eq!(env.cwd.as_deref(), Some("/tmp/zcode-capture"));
+        assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
     }
 
     /// Body is well-formed JSON but the expected `session_id` /

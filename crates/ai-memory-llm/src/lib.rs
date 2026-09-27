@@ -42,9 +42,15 @@ pub mod copilot;
 pub mod embedding;
 pub mod error;
 pub mod factory;
+pub mod fallback;
+pub mod ledger;
+pub mod usage;
 pub mod gemini;
 pub mod google;
 pub mod health;
+pub mod laguna;
+#[cfg(feature = "local-embeddings")]
+pub mod local;
 pub mod oidc;
 pub mod openai;
 pub mod openai_compat;
@@ -69,16 +75,31 @@ pub use copilot::{
 pub use embedding::{
     Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, SyntheticEmbedder, VoyageEmbedder, cosine,
 };
-pub use error::{LlmError, LlmResult};
+pub use error::{LlmError, LlmResult, PartialText};
 pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
     default_embedding_dim, try_default_embedding_dim,
 };
-pub use gemini::GeminiProvider;
+pub use fallback::{
+    CIRCUIT_5XX_THRESHOLD, Clock, DEFAULT_COOLDOWN, DEFAULT_FLAT_DAILY_MAX_REQUESTS, DailyCap,
+    FallbackProvider, Lane, Responder, SystemClock, SystemWallClock, WallClock, capture_responder,
+    utc_day_start,
+};
+pub use laguna::{
+    CHUNKABLE_MARKER_CHARS, LAGUNA_MAX_OUTPUT_TOKENS, LAGUNA_RETRY_TEMPERATURE, LAGUNA_TEMPERATURE, mark_chunkable,
+};
+pub use ledger::{
+    BreakerEvent, CallRecord, JsonlLedger, LaneKind, LaneObserver, METERED_FUNDING_TYPE,
+    count_lane_calls_since, key_fingerprint, lane_kind,
+};
+pub use usage::{ReportedUsage, capture_usage, current_caller, with_caller};
+pub use gemini::{GEMINI_25_FLASH_MAX_OUTPUT_TOKENS, GeminiProvider, model_max_output_tokens};
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{
     ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot,
 };
+#[cfg(feature = "local-embeddings")]
+pub use local::{LOCAL_DIM, LOCAL_MODEL, LocalEmbedder, fetch_model, model_present};
 pub use oidc::{
     DeviceAuthorizationResponse, OIDC_DEFAULT_SCOPE, OidcDiscovery, OidcExtras, OidcToken,
     OidcTokenResponse, PollOutcome, discover, poll_token_once, refresh_access_token,
@@ -92,7 +113,9 @@ pub use openai_oauth::{
     OpenAiOAuthTokenResponse,
 };
 pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
-pub use provider::{LlmProvider, complete_structured};
+pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
 pub use stored_token::StoredOAuthToken;
-pub use types::{ChatMessage, ChatRequest, ChatResponse, Role, Usage};
+pub use types::{
+    ChatMessage, ChatRequest, ChatResponse, LlmOperationId, ReasoningEffort, Role, Usage,
+};

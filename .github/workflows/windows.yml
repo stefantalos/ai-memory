@@ -29,9 +29,11 @@ name: windows
 #
 # If you are changing any of those areas, add the `windows` label to the
 # pull request rather than finding out after the merge.
+# During feature iteration this workflow no longer runs on every push to
+# main: fast Linux CI gates each merge, and the full Windows suite runs
+# nightly, on demand, and MANDATORILY right before a release (dispatch it
+# on the release-candidate SHA and wait for green — see AGENTS.md).
 on:
-  push:
-    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   schedule:
@@ -65,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo test --workspace --all-targets
         env:
           TAILWIND_SKIP: "1"

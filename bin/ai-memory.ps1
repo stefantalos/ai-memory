@@ -79,9 +79,23 @@ if ($InsideHome) {
 } else {
     $ScopeRoot = $WorkPath
     if (Get-Command git -ErrorAction SilentlyContinue) {
-        $DetectedScopeRoot = (& git -C $WorkPath rev-parse --show-toplevel 2>$null)
-        if (-not [string]::IsNullOrWhiteSpace($DetectedScopeRoot)) {
-            $ScopeRoot = [IO.Path]::GetFullPath($DetectedScopeRoot.Trim())
+        # Probe for the repo root, but never let git's "not a git
+        # repository" message abort the wrapper. Under this script's
+        # $ErrorActionPreference = 'Stop', Windows PowerShell 5.1 turns a
+        # REDIRECTED native stderr (the 2>$null below) into a *terminating*
+        # error, so running `status` outside a repo crashed the wrapper
+        # (#591). Suppress locally, gate on the exit code, and restore. The
+        # unredirected `& $Docker` calls are unaffected, which is why only
+        # this probe tripped it.
+        $PrevErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
+        try {
+            $DetectedScopeRoot = (& git -C $WorkPath rev-parse --show-toplevel 2>$null)
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($DetectedScopeRoot)) {
+                $ScopeRoot = [IO.Path]::GetFullPath($DetectedScopeRoot.Trim())
+            }
+        } finally {
+            $ErrorActionPreference = $PrevErrorAction
         }
     }
     $ScopeRoot = $ScopeRoot.TrimEnd([char[]]@('/', '\'))
@@ -143,6 +157,7 @@ foreach ($Name in @(
     "OPENAI_API_KEY",
     "VOYAGE_API_KEY",
     "LLM_API_KEY",
+    "EMBEDDING_API_KEY",
     "RUST_LOG"
 )) {
     if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($Name))) {

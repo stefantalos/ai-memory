@@ -1135,18 +1135,13 @@ fn display_session_id(value: &str) -> String {
     output
 }
 
+/// Age of a native session, rendered the way every other read-only listing
+/// renders one. Gains a "months" tier over the previous day-capped form, so a
+/// long-idle session reads as `2 months ago` here and in `show` / `workstreams`
+/// / `handoffs` rather than `74 days ago` in this one command.
 fn session_age(updated_at: SystemTime, now: SystemTime) -> String {
-    let age = now.duration_since(updated_at).unwrap_or_default().as_secs();
-    match age {
-        0..60 => "just now".into(),
-        60..3_600 => plural_age(age / 60, "minute"),
-        3_600..86_400 => plural_age(age / 3_600, "hour"),
-        _ => plural_age(age / 86_400, "day"),
-    }
-}
-
-fn plural_age(value: u64, unit: &str) -> String {
-    format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
+    let secs = now.duration_since(updated_at).unwrap_or_default().as_secs();
+    super::humanize_age_secs(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
 async fn export_after_flush(
@@ -1618,7 +1613,16 @@ mod tests {
         let prepared = prepare_managed_run_with_retry(
             &endpoint,
             &request,
-            Duration::from_millis(100),
+            // A wall-clock give-up deadline, not a latency assertion. This
+            // test is about the retry loop reaching the third attempt, and at
+            // 100ms it was really asserting that three HTTP round-trips fit
+            // inside 100ms — which a loaded CI runner does not guarantee, so
+            // it failed intermittently on both ubuntu and macOS with the
+            // 409 the mock is supposed to retry past. The window is generous
+            // because nothing here should depend on its size; the loop still
+            // returns the instant the third attempt succeeds, so the fast
+            // path stays a few milliseconds.
+            Duration::from_secs(5),
             Duration::from_millis(1),
         )
         .await

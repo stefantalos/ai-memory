@@ -43,6 +43,18 @@ pub enum WikiError {
     #[error("destination dir already exists: {0}")]
     DestinationExists(String),
 
+    /// The `wiki_migrations` table records a migration this binary does
+    /// not know: the wiki was migrated by a newer ai-memory. Refusing to
+    /// open it read-write prevents silent format mixing.
+    #[error(
+        "this wiki was migrated by a newer ai-memory (unknown wiki migration `{migration}`). \
+         Upgrade the binary, or restore the pre-migration backup archive to go back."
+    )]
+    NewerWikiFormat {
+        /// The unknown migration name found in `wiki_migrations`.
+        migration: String,
+    },
+
     /// A move-session refused to overwrite an existing page file at the
     /// destination (`<wiki_root>/<ws>/<proj>/sessions/<id>.md`). Surfaced as
     /// `409 Conflict` at the admin layer.

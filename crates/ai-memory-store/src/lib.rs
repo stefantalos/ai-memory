@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+mod api_credentials;
 mod auto_improve;
 pub mod decay;
 mod error;
@@ -21,22 +22,26 @@ mod fts_query;
 mod maintenance;
 mod migrations;
 mod ops;
+pub mod password;
 mod reader;
 mod scope;
 mod session_consolidation;
 pub mod users;
+pub mod web_sessions;
 mod workstream;
 mod writer;
 
 pub use fts_query::prepare_fts5_query;
 
+pub use api_credentials::{AuthenticatedApiUser, generate_api_key, preview_for as api_key_preview};
 pub use auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
     AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
     AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
-    OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, SkippedProposal,
-    StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
+    OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, ReleasedSchedulerClaim,
+    SCHEDULER_MAX_FAILED_ATTEMPTS, SchedulerFailureKind, SkippedProposal, StageAutoImproveRun,
+    StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use decay::{
     DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
@@ -45,20 +50,23 @@ pub use decay::{
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary, PagesMode,
-    PurgeSummary, ReorgSummary,
+    AdmittedSession, CompactSummary, Compaction, DeleteWorkspaceSummary, EmbedOutcome,
+    EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission, IngestObservationOutcome,
+    LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary, ObservationPruneOutcome,
+    OkfMigratedPage, PagesMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
+    backfill_entity_index, purge_session, record_embed_failure,
 };
 pub use reader::{
-    ActivityWindow, AgentSessionCount, AutoImproveCandidateSession, BriefPageBody, BriefingPage,
-    BriefingSnapshot, ClientActivity, ContaminationFinding, ContaminationReport,
-    ContaminationSummary, DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount,
-    FeedbackFinding, GraphVia, HealthDetail, HealthPage, ObservationHit, ObservationOrder,
-    ObservationPage, ObservationPageResult, ObservationRecord, OpenSession, PageAuthor, PageHit,
-    PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
-    ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
-    SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts, StoredEmbedding,
-    StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
+    BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity, ContaminationFinding,
+    ContaminationReport, ContaminationSummary, ContradictionEdge, DecayCandidate, DecayTombstone,
+    DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
+    ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
+    OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
+    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow,
+    SearchExplain, SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts,
+    StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
+    f32_vec_to_bytes,
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
@@ -66,10 +74,14 @@ pub use scope::{
     lookup_global_scope, resolve_many_existing_scopes,
 };
 pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
-pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
+pub use users::{
+    LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token,
+};
+pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, ManagedRunContext, PrepareWorkstreamRun,
-    PreparedWorkstreamRun, StoredManagedRunStatus, WorkstreamSelection,
+    PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus,
+    StoredWorkstreamSummary, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -122,6 +134,23 @@ impl Store {
         migrations::run(&mut conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
+        // One-shot, idempotent entity-index backfill (docs/temporal.md).
+        // Populates entities/entity_page_links from existing frontmatter
+        // for pages that predate entity extraction, so the entity
+        // retrieval stream and `as_of` timelines work on an upgraded
+        // store without a manual reindex. A store already populated
+        // through the write path finds no candidate pages and returns
+        // immediately. Runs single-threaded here, before the writer actor
+        // spawns, so it completes before the server accepts traffic.
+        let entity_backfill = ops::backfill_entity_index(&mut conn)?;
+        if entity_backfill.links_added > 0 {
+            tracing::info!(
+                pages = entity_backfill.pages_backfilled,
+                links = entity_backfill.links_added,
+                "entity index backfilled from existing frontmatter"
+            );
+        }
+
         let writer = WriterHandle::spawn(conn);
         let reader = ReaderPool::new(&db_path, READER_POOL_SOFT_CAP)?;
         Ok(Self {
@@ -169,7 +198,7 @@ mod tests {
         ActorContext, AgentKind, HandoffAcceptance, HandoffId, HandoffState, LinkTarget,
         ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewWorkstreamEvent,
         ObservationId, ObservationKind, PageId, PagePath, ProjectId, Sanitized, Sanitizer,
-        SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
+        SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind, WorkstreamId,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -1873,11 +1902,13 @@ mod tests {
                 workspace: None,
                 project: Some("infra".into()),
                 path: PagePath::new("runbooks/02.md").unwrap(),
+                relation: None,
             },
             LinkTarget {
                 workspace: None,
                 project: Some("nope".into()),
                 path: PagePath::new("ghost.md").unwrap(),
+                relation: None,
             },
         ];
         store.writer.upsert_page(dep).await.unwrap();
@@ -2526,6 +2557,172 @@ mod tests {
         );
     }
 
+    /// The body a session page is synthesised with, minus the frontmatter.
+    /// Written out in full because the point of the test below is what a
+    /// reader can learn from this page *without* opening it.
+    const SESSION_BODY: &str = concat!(
+        "# Bound the scheduler queue\n",
+        "\n",
+        "## Session metadata\n",
+        "\n",
+        "- **session_id:** `9f2c1d0e`\n",
+        "- **started_at:** 2026-08-24T10:00:00Z\n",
+        "- **ended_at:** 2026-08-24T10:18:00Z\n",
+        "- **observations:** 41\n",
+        "\n",
+        "## Prompts\n",
+        "\n",
+        "1. Bound the scheduler queue\n",
+        "2. Make the backpressure test deterministic\n",
+    );
+
+    /// #513: `memory_handoff_cancel` takes an exact id and nothing exposed
+    /// one, so an accumulated backlog was visible as a count and impossible
+    /// to address. Oldest-first because the operator's question is which are
+    /// stale.
+    #[tokio::test]
+    async fn open_handoffs_are_listed_oldest_first_and_exclude_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let new_handoff = |agent: AgentKind| NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: agent,
+            to_agent: None,
+            cwd: None,
+            summary: "continue".into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: None,
+        };
+        let first = store
+            .writer
+            .insert_handoff(new_handoff(AgentKind::ClaudeCode))
+            .await
+            .unwrap();
+        let second = store
+            .writer
+            .insert_handoff(new_handoff(AgentKind::Codex))
+            .await
+            .unwrap();
+
+        let open = store
+            .reader
+            .open_handoffs_for_project(ws, proj, 50)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 2, "both handoffs are open");
+        assert_eq!(
+            open[0].id,
+            first.to_string(),
+            "oldest first: {:?}",
+            open.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
+        assert_eq!(open[1].id, second.to_string());
+        assert_eq!(open[0].from_agent, "claude-code");
+        assert_eq!(open[1].from_agent, "codex");
+
+        // The listing must answer "what is still pending", so an accepted
+        // handoff has to drop out — otherwise it re-proposes work already
+        // taken, which is the failure the backlog already causes.
+        store
+            .writer
+            .accept_handoff(HandoffAcceptance {
+                handoff_id: first,
+                workspace_id: ws,
+                project_id: proj,
+                accepting_agent: AgentKind::Codex,
+                accepting_session: None,
+                accepting_user: None,
+                owner_filter: ai_memory_core::OwnerFilter::Any,
+                receiving_cwd: None,
+            })
+            .await
+            .unwrap();
+        let open = store
+            .reader
+            .open_handoffs_for_project(ws, proj, 50)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1, "the accepted handoff must not be listed");
+        assert_eq!(open[0].id, second.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_written_summary_changes_what_the_descriptor_tells_the_reader() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        // Same page twice. The only difference is that one was written by a
+        // path that fills `summary` and the other by one that does not.
+        let mut without = sample_page(ws, proj, "without-summary.md", SESSION_BODY);
+        without.title = "Bound the scheduler queue".into();
+        store.writer.upsert_page(without).await.unwrap();
+
+        let mut with = sample_page(ws, proj, "with-summary.md", SESSION_BODY);
+        with.title = "Bound the scheduler queue".into();
+        with.frontmatter_json = serde_json::json!({
+            "summary": "2 prompts, 34 completed tool calls across Bash, Edit and Read, over 18m.",
+        });
+        store.writer.upsert_page(with).await.unwrap();
+
+        let hits = store
+            .reader
+            .recent_pages_for_project(ws, proj, 10)
+            .await
+            .unwrap();
+        let descriptor = |path: &str| {
+            hits.iter()
+                .find(|h| h.path.as_str() == path)
+                .map(|h| h.snippet.clone())
+                .unwrap_or_else(|| panic!("{path} should be listed"))
+        };
+        let without = descriptor("without-summary.md");
+        let with = descriptor("with-summary.md");
+
+        assert_ne!(without, with);
+
+        // Without a summary the descriptor is the best the body affords: the
+        // prompts after the first, since the first repeats the title. That is
+        // real signal, and it is what #463 already delivers.
+        assert!(
+            without.contains("Make the backpressure test deterministic"),
+            "body-derived descriptor should reach the prompts: {without:?}"
+        );
+        // What it cannot say is how much work the session was. Those counts
+        // exist only at write time, and the summary is what carries them.
+        assert!(
+            !without.contains("34 completed tool calls"),
+            "the body never states the totals: {without:?}"
+        );
+        assert!(
+            with.contains("2 prompts") && with.contains("34 completed tool calls"),
+            "summary-derived descriptor should state the session's shape: {with:?}"
+        );
+    }
+
     #[tokio::test]
     async fn frontmatter_summary_wins_over_the_body_lede() {
         let tmp = TempDir::new().unwrap();
@@ -2671,6 +2868,15 @@ mod tests {
         assert_eq!(source_details.fts_rank, Some(1));
         assert!(source_details.vector_rank.is_none());
         assert!(source_details.graph_rank.is_none());
+        // #486: the hydrate must fill only what is empty. An FTS hit carries
+        // a `snippet()` excerpt centred on the matched term, which is more
+        // useful than the generic page descriptor — re-describing every hit
+        // would quietly downgrade it, so the fix keys on an empty title.
+        assert!(
+            source_hit.snippet.contains("needle"),
+            "an FTS hit must keep its term-centred excerpt, got {:?}",
+            source_hit.snippet
+        );
 
         let (target_hit, target_details) = explained
             .iter()
@@ -2723,6 +2929,28 @@ mod tests {
         assert_eq!(target_vector_details.vector_rank, Some(1));
         assert_eq!(target_vector_details.cosine, Some(1.0));
         assert!(target_vector_details.rrf.vector > 0.0);
+
+        // #486: a hit the vector stream ranked must still be describable.
+        // The fusion map is built with `or_insert_with` and the vector loop
+        // has only `(PageId, PagePath, f32)` to insert, so before the
+        // post-fusion hydrate these came back as empty strings — and with a
+        // reranker enabled an empty candidate is scored as an empty document
+        // and can be truncated away. This test previously asserted the rank
+        // and nothing about what the caller actually receives.
+        let (target_vector_hit, _) = vector_explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "target.md")
+            .unwrap();
+        assert!(
+            !target_vector_hit.title.is_empty(),
+            "a vector-ranked hit must carry a title, got {:?}",
+            target_vector_hit.title
+        );
+        assert!(
+            !target_vector_hit.snippet.is_empty(),
+            "a vector-ranked hit must carry a snippet, got {:?}",
+            target_vector_hit.snippet
+        );
     }
 
     #[tokio::test]
@@ -3691,6 +3919,391 @@ mod tests {
             )
             .unwrap();
         assert_eq!(claim_rows, 1);
+    }
+
+    /// One ended session past a fresh scope watermark, for the claim-release
+    /// tests. Returns the store handles, scope and the session's `ended_at`.
+    async fn claim_release_fixture(
+        tmp: &TempDir,
+    ) -> (Store, WorkspaceId, ProjectId, SessionId, i64) {
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        let ended_at = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 1)
+            .await
+            .unwrap()[0]
+            .ended_at;
+        (store, ws, proj, session_id, ended_at)
+    }
+
+    async fn is_candidate(store: &Store, ws: WorkspaceId, proj: ProjectId, id: SessionId) -> bool {
+        store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.session_id == id)
+    }
+
+    fn claim_row(store: &Store, id: SessionId) -> (i64, Option<i64>, Option<String>) {
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.query_row(
+            "SELECT failed_attempts, released_at, last_error \
+             FROM auto_improve_scheduler_claims WHERE session_id = ?1",
+            params![id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// A failed run used to keep its claim forever, and the candidate query
+    /// hides every claimed session: the session left the backlog without a
+    /// review. A released claim must put it back, and a HELD claim must still
+    /// never be taken twice.
+    #[tokio::test]
+    async fn a_released_scheduler_claim_returns_the_session_to_the_backlog() {
+        let tmp = TempDir::new().unwrap();
+        let (store, ws, proj, id, ended_at) = claim_release_fixture(&tmp).await;
+
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !is_candidate(&store, ws, proj, id).await,
+            "held claim hides it"
+        );
+        assert!(
+            !store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap(),
+            "a held claim is never taken a second time"
+        );
+
+        let released = store
+            .writer
+            .release_auto_improve_scheduler_claim(
+                ws,
+                proj,
+                id,
+                SchedulerFailureKind::SessionAttributable,
+                "provider error 500: boom".into(),
+            )
+            .await
+            .unwrap()
+            .expect("the held claim is released");
+        assert_eq!(released.failed_attempts, 1);
+        assert!(!released.exhausted);
+        assert!(
+            is_candidate(&store, ws, proj, id).await,
+            "back in the backlog"
+        );
+        let (attempts, released_at, last_error) = claim_row(&store, id);
+        assert_eq!(attempts, 1);
+        assert!(released_at.is_some());
+        assert_eq!(last_error.as_deref(), Some("provider error 500: boom"));
+
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap(),
+            "a released claim is taken again"
+        );
+        assert!(!is_candidate(&store, ws, proj, id).await);
+        assert_eq!(claim_row(&store, id).1, None, "re-claim holds it again");
+        assert!(
+            store
+                .writer
+                .release_auto_improve_scheduler_claim(
+                    ws,
+                    proj,
+                    id,
+                    SchedulerFailureKind::SessionAttributable,
+                    "x".into(),
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .writer
+                .release_auto_improve_scheduler_claim(
+                    ws,
+                    proj,
+                    id,
+                    SchedulerFailureKind::SessionAttributable,
+                    "x".into(),
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "releasing an already released claim changes nothing"
+        );
+        assert_eq!(claim_row(&store, id).0, 2);
+    }
+
+    /// Measured 2026-09-24: three ticks in a row, 24 of 24 calls were
+    /// Poolside 429s. A lane that could not be asked says nothing about the
+    /// session, so any number of those must leave the session eligible.
+    #[tokio::test]
+    async fn lane_unavailable_failures_never_spend_the_session_budget() {
+        let tmp = TempDir::new().unwrap();
+        let (store, ws, proj, id, ended_at) = claim_release_fixture(&tmp).await;
+        for _ in 0..5 {
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                    .await
+                    .unwrap()
+            );
+            let released = store
+                .writer
+                .release_auto_improve_scheduler_claim(
+                    ws,
+                    proj,
+                    id,
+                    SchedulerFailureKind::LaneUnavailable,
+                    "provider error 429: usage limit exceeded".into(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(released.failed_attempts, 0);
+            assert!(!released.exhausted);
+            assert!(is_candidate(&store, ws, proj, id).await);
+        }
+    }
+
+    /// Three session-attributable failures and the session is done: not a
+    /// candidate, not claimable, and the claim row names the last error.
+    /// The expected 3 is the specification, not read from the constant.
+    #[tokio::test]
+    async fn the_third_session_attributable_failure_is_terminal_and_named() {
+        let tmp = TempDir::new().unwrap();
+        let (store, ws, proj, id, ended_at) = claim_release_fixture(&tmp).await;
+        for attempt in 1..=3_i64 {
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                    .await
+                    .unwrap(),
+                "attempt {attempt} must be claimable"
+            );
+            let released = store
+                .writer
+                .release_auto_improve_scheduler_claim(
+                    ws,
+                    proj,
+                    id,
+                    SchedulerFailureKind::SessionAttributable,
+                    format!("unexpected response shape #{attempt}"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(released.failed_attempts, attempt);
+            assert_eq!(released.exhausted, attempt == 3);
+        }
+        assert!(
+            !is_candidate(&store, ws, proj, id).await,
+            "exhausted: not a candidate"
+        );
+        assert!(
+            !store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap(),
+            "exhausted: not claimable"
+        );
+        let (attempts, released_at, last_error) = claim_row(&store, id);
+        assert_eq!(attempts, 3);
+        assert!(released_at.is_some(), "stays released, not silently held");
+        assert_eq!(last_error.as_deref(), Some("unexpected response shape #3"));
+    }
+
+    /// A released claim for a session that since got a run (a manual review,
+    /// say) must not be re-claimed: the run check applies on the re-claim
+    /// path too, not only to a fresh insert.
+    #[tokio::test]
+    async fn a_released_claim_is_not_retaken_once_the_session_has_a_run() {
+        let tmp = TempDir::new().unwrap();
+        let (store, ws, proj, id, ended_at) = claim_release_fixture(&tmp).await;
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap()
+        );
+        store
+            .writer
+            .release_auto_improve_scheduler_claim(
+                ws,
+                proj,
+                id,
+                SchedulerFailureKind::SessionAttributable,
+                "boom".into(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: Some(id),
+                provider: Some("none".into()),
+                model: Some("none".into()),
+                summary: Some("reviewed manually".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                proposal_actor: ActorContext::default(),
+                proposals: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(!is_candidate(&store, ws, proj, id).await);
+        assert!(
+            !store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, id, ended_at)
+                .await
+                .unwrap(),
+            "a reviewed session is never claimed again"
+        );
+    }
+
+    /// Startup releases held claims that have no run (the 32 stranded before
+    /// this change), without spending budget, and leaves a held claim whose
+    /// run exists alone.
+    #[tokio::test]
+    async fn startup_releases_orphan_claims_but_not_reviewed_ones() {
+        let tmp = TempDir::new().unwrap();
+        let (store, ws, proj, orphan, orphan_ended) = claim_release_fixture(&tmp).await;
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, orphan, orphan_ended)
+                .await
+                .unwrap()
+        );
+
+        let reviewed = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: reviewed,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(reviewed, None).await.unwrap();
+        let reviewed_ended = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.session_id == reviewed)
+            .unwrap()
+            .ended_at;
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, reviewed, reviewed_ended)
+                .await
+                .unwrap()
+        );
+        store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: Some(reviewed),
+                provider: Some("none".into()),
+                model: Some("none".into()),
+                summary: Some("reviewed".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                proposal_actor: ActorContext::default(),
+                proposals: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !is_candidate(&store, ws, proj, orphan).await,
+            "stranded before"
+        );
+        assert_eq!(
+            store
+                .writer
+                .release_orphan_auto_improve_scheduler_claims()
+                .await
+                .unwrap(),
+            1,
+            "exactly the run-less claim is released"
+        );
+        assert!(
+            is_candidate(&store, ws, proj, orphan).await,
+            "back after startup"
+        );
+        assert_eq!(claim_row(&store, orphan).0, 0, "no budget spent");
+        assert_eq!(
+            claim_row(&store, reviewed).1,
+            None,
+            "reviewed claim untouched"
+        );
+        assert!(!is_candidate(&store, ws, proj, reviewed).await);
     }
 
     #[tokio::test]
@@ -5622,6 +6235,465 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_workstreams_are_checkout_local_and_include_linked_harnesses() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-list").await;
+        let prepare = |name: &str, agent| PrepareWorkstreamRun {
+            agent,
+            selection: WorkstreamSelection::New(name.into()),
+            ..managed_prepare_input(ws, proj, name)
+        };
+
+        let older = store
+            .writer
+            .prepare_workstream_run(prepare("older", AgentKind::OpenCode))
+            .await
+            .unwrap();
+        let current = store
+            .writer
+            .prepare_workstream_run(prepare("current", AgentKind::Codex))
+            .await
+            .unwrap();
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: current.run_id,
+                native_session_id: Some("codex-native".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+        let claude = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                agent: AgentKind::ClaudeCode,
+                selection: WorkstreamSelection::Named("current".into()),
+                ..managed_prepare_input(ws, proj, "claude")
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: claude.run_id,
+                native_session_id: Some("claude-native".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+        // A non-current workstream may finish later and therefore be more
+        // recently active; the selected workstream must still lead the list.
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: older.run_id,
+                native_session_id: Some("open-code-native".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+
+        let hidden = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                repo_fingerprint: "other-repo".into(),
+                worktree_fingerprint: "other-worktree".into(),
+                selection: WorkstreamSelection::New("hidden".into()),
+                ..managed_prepare_input(ws, proj, "hidden")
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(hidden.run_id)
+            .await
+            .unwrap();
+
+        let rows = store
+            .reader
+            .recent_workstreams(ws, proj, "repo".into(), "worktree".into(), 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["current", "older"]
+        );
+        assert!(rows[0].current);
+        assert!(!rows[1].current);
+        assert_eq!(
+            rows[0].linked_harnesses,
+            [AgentKind::ClaudeCode, AgentKind::Codex]
+        );
+        assert_eq!(rows[1].linked_harnesses, [AgentKind::OpenCode]);
+        assert!(rows[0].last_active_at >= rows[0].created_at);
+        let limited = store
+            .reader
+            .recent_workstreams(ws, proj, "repo".into(), "worktree".into(), 1)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].workstream_id, current.workstream_id);
+        assert!(limited[0].current);
+        assert_eq!(
+            limited[0].linked_harnesses,
+            [AgentKind::ClaudeCode, AgentKind::Codex]
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_workstreams_do_not_leak_across_workspaces() {
+        // Two workspaces can hold a project of the same name over the very
+        // same clone, so repo/worktree identity alone does not separate them:
+        // only the scope columns do.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (mine, mine_proj) = open_managed_scope(&store, "shared-name").await;
+        let theirs = store
+            .writer
+            .get_or_create_workspace("other-workspace")
+            .await
+            .unwrap();
+        let theirs_proj = store
+            .writer
+            .get_or_create_project(theirs, "shared-name", None)
+            .await
+            .unwrap();
+
+        for (ws, proj, name) in [(mine, mine_proj, "mine"), (theirs, theirs_proj, "theirs")] {
+            store
+                .writer
+                .prepare_workstream_run(PrepareWorkstreamRun {
+                    selection: WorkstreamSelection::New(name.into()),
+                    ..managed_prepare_input(ws, proj, name)
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn visible(store: &Store, ws: WorkspaceId, proj: ProjectId) -> Vec<String> {
+            store
+                .reader
+                .recent_workstreams(ws, proj, "repo".into(), "worktree".into(), 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.name)
+                .collect()
+        }
+        assert_eq!(visible(&store, mine, mine_proj).await, ["mine"]);
+        assert_eq!(visible(&store, theirs, theirs_proj).await, ["theirs"]);
+        // A real workspace paired with the other one's project must not fall
+        // back to either list.
+        assert!(visible(&store, mine, theirs_proj).await.is_empty());
+    }
+
+    /// Create `names` as workstreams in one checkout, newest last, and hand
+    /// back each one's `(workstream, run)` pair. Preparing is the only way to
+    /// create a workstream, so every seeded row also owns a live run lease.
+    async fn seed_workstreams(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        names: &[&str],
+    ) -> Vec<(WorkstreamId, ManagedRunId)> {
+        let mut ids = Vec::new();
+        for name in names {
+            let prepared = store
+                .writer
+                .prepare_workstream_run(PrepareWorkstreamRun {
+                    selection: WorkstreamSelection::New((*name).into()),
+                    ..managed_prepare_input(ws, proj, name)
+                })
+                .await
+                .unwrap();
+            ids.push((prepared.workstream_id, prepared.run_id));
+        }
+        ids
+    }
+
+    fn rename_input(
+        ws: WorkspaceId,
+        proj: ProjectId,
+        selector: WorkstreamSelector,
+        to: &str,
+    ) -> RenameWorkstream {
+        RenameWorkstream {
+            workspace_id: ws,
+            project_id: proj,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            selector,
+            new_name: to.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_retitles_by_name_or_id_and_keeps_the_stable_id() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        let seeded = seed_workstreams(&store, ws, proj, &["alpha", "beta"]).await;
+        let ids: Vec<WorkstreamId> = seeded.iter().map(|(id, _)| *id).collect();
+        let run_ids: Vec<ManagedRunId> = seeded.iter().map(|(_, run)| *run).collect();
+
+        let by_name = store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Name("alpha".into()),
+                "alpha-renamed",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(by_name.from, "alpha");
+        assert_eq!(by_name.to, "alpha-renamed");
+        // The id is what the ledger and `workstream-search` key on, so a
+        // rename that minted a new one would orphan the history.
+        assert_eq!(by_name.workstream_id, ids[0]);
+
+        let by_id = store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Id(ids[1]),
+                "beta-renamed",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(by_id.from, "beta");
+        assert_eq!(by_id.workstream_id, ids[1]);
+
+        // Both new names are selectable, which is the whole point of the
+        // rename. Seeding left a live lease on each workstream, so release
+        // them first: `Named` selection refuses a busy workstream, and that
+        // refusal would mask whether the name resolved at all.
+        for run_id in &run_ids {
+            assert!(store.writer.cancel_managed_run(*run_id).await.unwrap());
+        }
+        for name in ["alpha-renamed", "beta-renamed"] {
+            store
+                .writer
+                .prepare_workstream_run(PrepareWorkstreamRun {
+                    selection: WorkstreamSelection::Named(name.into()),
+                    ..managed_prepare_input(ws, proj, name)
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_does_not_reorder_the_discovery_listing() {
+        // Relabelling is not activity. If a rename bumped `updated_at` the
+        // renamed row would jump its peers, and if it bumped `selected_at` a
+        // bare `ai-memory run` would silently resume a different workstream —
+        // both as a side effect of fixing a typo.
+        //
+        // Three rows, not two: `is_current` leads the ORDER BY, so the
+        // current workstream sorts first whatever its timestamps say. Only a
+        // pair of non-current rows can show an `updated_at` bump at all.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        seed_workstreams(&store, ws, proj, &["oldest", "middle", "current"]).await;
+
+        async fn listing(store: &Store, ws: WorkspaceId, proj: ProjectId) -> Vec<(String, bool)> {
+            store
+                .reader
+                .recent_workstreams(ws, proj, "repo".into(), "worktree".into(), 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.name, row.current))
+                .collect()
+        }
+        let before = listing(&store, ws, proj).await;
+        assert_eq!(
+            before,
+            [
+                ("current".to_owned(), true),
+                ("middle".to_owned(), false),
+                ("oldest".to_owned(), false),
+            ]
+        );
+
+        store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Name("oldest".into()),
+                "oldest-renamed",
+            ))
+            .await
+            .unwrap();
+
+        // `oldest-renamed` must stay behind `middle`: it was renamed, not
+        // worked on. A bumped `updated_at` would put it second.
+        assert_eq!(
+            listing(&store, ws, proj).await,
+            [
+                ("current".to_owned(), true),
+                ("middle".to_owned(), false),
+                ("oldest-renamed".to_owned(), false),
+            ]
+        );
+
+        // Renaming the current workstream must not hand `current` to anyone
+        // else either, which a bumped `selected_at` on the wrong row would do.
+        store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Name("oldest-renamed".into()),
+                "oldest-again",
+            ))
+            .await
+            .unwrap();
+        let after = listing(&store, ws, proj).await;
+        assert_eq!(after[0], ("current".to_owned(), true));
+        assert_eq!(after[2].0, "oldest-again");
+    }
+
+    #[tokio::test]
+    async fn rename_refuses_a_name_another_workstream_holds() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        seed_workstreams(&store, ws, proj, &["alpha", "beta"]).await;
+
+        let failure = store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Name("alpha".into()),
+                "beta",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&failure, StoreError::WorkstreamNameTaken(name) if name == "beta"),
+            "expected a named collision, got {failure:?}"
+        );
+
+        // Renaming onto its own current name writes nothing and is not an
+        // error, so a repeated command stays safe.
+        let noop = store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Name("alpha".into()),
+                "alpha",
+            ))
+            .await
+            .unwrap();
+        assert_eq!((noop.from.as_str(), noop.to.as_str()), ("alpha", "alpha"));
+    }
+
+    #[tokio::test]
+    async fn rename_cannot_reach_a_workstream_outside_the_resolved_scope() {
+        // `workstreams.id` is globally unique, so the id selector would be a
+        // cross-scope write primitive without the checkout predicate.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (mine, mine_proj) = open_managed_scope(&store, "shared-name").await;
+        let theirs = store
+            .writer
+            .get_or_create_workspace("other-workspace")
+            .await
+            .unwrap();
+        let theirs_proj = store
+            .writer
+            .get_or_create_project(theirs, "shared-name", None)
+            .await
+            .unwrap();
+        let theirs_ids = seed_workstreams(&store, theirs, theirs_proj, &["theirs"]).await;
+        let theirs_workstream = theirs_ids[0].0;
+        seed_workstreams(&store, mine, mine_proj, &["mine"]).await;
+
+        let by_id = store
+            .writer
+            .rename_workstream(rename_input(
+                mine,
+                mine_proj,
+                WorkstreamSelector::Id(theirs_workstream),
+                "stolen",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(by_id, StoreError::NotFound(_)),
+            "an id from another workspace must read as absent, got {by_id:?}"
+        );
+
+        let by_name = store
+            .writer
+            .rename_workstream(rename_input(
+                mine,
+                mine_proj,
+                WorkstreamSelector::Name("theirs".into()),
+                "stolen",
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(by_name, StoreError::NotFound(_)));
+
+        // The other workspace's row is untouched by either attempt.
+        let theirs_names: Vec<String> = store
+            .reader
+            .recent_workstreams(theirs, theirs_proj, "repo".into(), "worktree".into(), 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(theirs_names, ["theirs"]);
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_a_name_that_run_new_would_reject() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        seed_workstreams(&store, ws, proj, &["alpha"]).await;
+
+        for bad in ["", "   ", "has/slash", "has\\backslash", "ctrl\u{1}char"] {
+            let failure = store
+                .writer
+                .rename_workstream(rename_input(
+                    ws,
+                    proj,
+                    WorkstreamSelector::Name("alpha".into()),
+                    bad,
+                ))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(failure, StoreError::InvalidState(_)),
+                "name {bad:?} should be rejected, got {failure:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn prepare_expires_a_stale_lease_and_reopens_the_workstream() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -5663,6 +6735,401 @@ mod tests {
             "active"
         );
     }
+    /// Bi-temporal-lite (docs/temporal.md): entity-link windows follow
+    /// page supersession, and `as_of` returns what the store knew at
+    /// that instant — including versions that have since been replaced.
+    #[tokio::test]
+    async fn as_of_returns_the_version_that_was_valid_then() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal", None)
+            .await
+            .unwrap();
+
+        // v1 carries the entity.
+        let mut v1 = sample_page(ws, proj, "notes/db.md", "we use postgres");
+        v1.entities = vec!["postgres".into()];
+        let v1_id = store.writer.upsert_page(v1).await.unwrap();
+        let between = jiff::Timestamp::now().as_microsecond();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // v2 supersedes; the entity moved on.
+        let mut v2 = sample_page(ws, proj, "notes/db.md", "we migrated to sqlite");
+        v2.entities = vec!["sqlite".into()];
+        let v2_id = store.writer.upsert_page(v2).await.unwrap();
+        assert_ne!(v1_id, v2_id);
+
+        // Current query: postgres is gone.
+        let now_hits = store
+            .reader
+            .entity_hits_for_project(ws, proj, "postgres", 10, None)
+            .await
+            .unwrap();
+        assert!(now_hits.is_empty(), "{now_hits:?}");
+
+        // as_of between v1 and v2: the superseded version answers.
+        let then_hits = store
+            .reader
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(between))
+            .await
+            .unwrap();
+        assert_eq!(then_hits.len(), 1, "{then_hits:?}");
+        assert_eq!(then_hits[0].hit.id, v1_id);
+
+        // as_of now: identical to the default view for the new entity.
+        let sqlite_now = store
+            .reader
+            .entity_hits_for_project_at(
+                ws,
+                proj,
+                "sqlite",
+                10,
+                None,
+                Some(jiff::Timestamp::now().as_microsecond()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sqlite_now.len(), 1);
+        assert_eq!(sqlite_now[0].hit.id, v2_id);
+
+        // And before v1 existed: nothing was known.
+        let before = store
+            .reader
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(1))
+            .await
+            .unwrap();
+        assert!(before.is_empty(), "{before:?}");
+    }
+
+    /// End to end: a page written with only `tags` (no explicit
+    /// `entities`) — the shape of essentially every page on a mature
+    /// store — has no entity index until the one-shot startup backfill
+    /// runs, after which both the entity retrieval stream and `as_of`
+    /// find it. This is the fix that made `as_of` do anything on a real
+    /// deployment (docs/temporal.md).
+    #[tokio::test]
+    async fn startup_backfill_lets_as_of_find_tag_only_pages() {
+        let tmp = TempDir::new().unwrap();
+        let created;
+        let (ws, proj, page_id) = {
+            let store = Store::open(tmp.path()).unwrap();
+            let ws = store
+                .writer
+                .get_or_create_workspace("default")
+                .await
+                .unwrap();
+            let proj = store
+                .writer
+                .get_or_create_project(ws, "temporal", None)
+                .await
+                .unwrap();
+
+            let mut p = sample_page(ws, proj, "concepts/writer.md", "the writer actor");
+            p.frontmatter_json = serde_json::json!({"tags": ["SQLite"]});
+            p.entities = Vec::new();
+            let id = store.writer.upsert_page(p).await.unwrap();
+
+            // Nothing in the entity index yet — the pre-fix state.
+            let none = store
+                .reader
+                .entity_hits_for_project(ws, proj, "sqlite", 10, None)
+                .await
+                .unwrap();
+            assert!(none.is_empty(), "no entities before backfill: {none:?}");
+            created = jiff::Timestamp::now().as_microsecond();
+            (ws, proj, id)
+            // `store` drops here: the writer thread joins and the WAL flushes.
+        };
+
+        // Reopen: `Store::open` runs the one-shot entity backfill.
+        let store = Store::open(tmp.path()).unwrap();
+
+        let now = store
+            .reader
+            .entity_hits_for_project(ws, proj, "sqlite", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(now.len(), 1, "backfill populated the entity index: {now:?}");
+        assert_eq!(now[0].hit.id, page_id);
+
+        // `as_of` an instant after the page was written finds it too — the
+        // window opened at the version's creation.
+        let later = store
+            .reader
+            .entity_hits_for_project_at(ws, proj, "sqlite", 10, None, Some(created + 1))
+            .await
+            .unwrap();
+        assert_eq!(later.len(), 1, "{later:?}");
+        assert_eq!(later[0].hit.id, page_id);
+    }
+
+    /// Post-audit regression: retirement WITHOUT a successor (a decay
+    /// tombstone) closes the entity-link window too — `as_of` instants
+    /// after retirement must not resurrect the page.
+    #[tokio::test]
+    async fn decay_tombstone_closes_the_entity_window() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "t", None)
+            .await
+            .unwrap();
+        let mut page = sample_page(ws, proj, "notes/old.md", "we use postgres");
+        page.entities = vec!["postgres".into()];
+        let id = store.writer.upsert_page(page).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let retired_at = jiff::Timestamp::now().as_microsecond();
+        store
+            .writer
+            .soft_delete_for_decay_if_latest(
+                ws,
+                proj,
+                ai_memory_core::PagePath::new("notes/old.md").unwrap(),
+                id,
+            )
+            .await
+            .unwrap();
+
+        // Before retirement: visible.
+        let before = store
+            .reader
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(retired_at - 1000))
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1, "{before:?}");
+        // After retirement: gone.
+        let after = store
+            .reader
+            .entity_hits_for_project_at(
+                ws,
+                proj,
+                "postgres",
+                10,
+                None,
+                Some(jiff::Timestamp::now().as_microsecond()),
+            )
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "retired page resurrected: {after:?}");
+    }
+
+    /// The windows themselves: insert opens at the version's
+    /// `created_at`; supersession closes the old version's links.
+    #[tokio::test]
+    async fn supersession_closes_the_entity_link_window() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal2", None)
+            .await
+            .unwrap();
+        let mut v1 = sample_page(ws, proj, "notes/x.md", "v1");
+        v1.entities = vec!["thing".into()];
+        let v1_id = store.writer.upsert_page(v1).await.unwrap();
+        let mut v2 = sample_page(ws, proj, "notes/x.md", "v2");
+        v2.entities = vec!["thing".into()];
+        store.writer.upsert_page(v2).await.unwrap();
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let rows: Vec<(Vec<u8>, i64, Option<i64>)> = db
+            .prepare(
+                "SELECT page_id, valid_from, superseded_at FROM entity_page_links \
+                 ORDER BY valid_from",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, v1_id.as_bytes().to_vec());
+        assert!(
+            rows[0].2.is_some(),
+            "superseded version's window must be closed"
+        );
+        assert!(rows[1].2.is_none(), "latest version's window stays open");
+        assert!(
+            rows[0].2.unwrap() >= rows[0].1,
+            "window must not be inverted"
+        );
+    }
+
+    /// The V56 backfill reconstructs the same windows the write path
+    /// produces: `valid_from` from each version's `created_at`,
+    /// `superseded_at` from the superseding version, NULL for latest.
+    #[tokio::test]
+    async fn v56_backfill_reconstructs_the_windows() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "backfill", None)
+            .await
+            .unwrap();
+        for body in ["v1", "v2", "v3"] {
+            let mut page = sample_page(ws, proj, "notes/x.md", body);
+            page.entities = vec!["thing".into()];
+            store.writer.upsert_page(page).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let live: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
+            .prepare(
+                "SELECT page_id, valid_from, superseded_at FROM entity_page_links \
+                 ORDER BY valid_from",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(live.len(), 3);
+
+        // Fabricate the pre-V56 state, then replay the migration's
+        // backfill statements.
+        db.execute(
+            "UPDATE entity_page_links SET valid_from = NULL, superseded_at = NULL",
+            [],
+        )
+        .unwrap();
+        db.execute_batch(
+            "UPDATE entity_page_links \
+             SET valid_from = (SELECT p.created_at FROM pages p WHERE p.id = page_id); \
+             UPDATE entity_page_links \
+             SET superseded_at = ( \
+                 SELECT p2.created_at FROM pages p2 WHERE p2.supersedes = page_id \
+             ) \
+             WHERE page_id IN (SELECT id FROM pages WHERE is_latest = 0);",
+        )
+        .unwrap();
+        let backfilled: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
+            .prepare(
+                "SELECT page_id, valid_from, superseded_at FROM entity_page_links \
+                 ORDER BY valid_from",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // Same shape: two closed windows, one open; same version order.
+        assert_eq!(backfilled.len(), 3);
+        for (i, (live_row, back_row)) in live.iter().zip(backfilled.iter()).enumerate() {
+            assert_eq!(live_row.0, back_row.0, "row {i} page id");
+            assert_eq!(
+                live_row.2.is_some(),
+                back_row.2.is_some(),
+                "row {i} open/closed"
+            );
+            assert_eq!(back_row.1, {
+                let created: i64 = db
+                    .query_row(
+                        "SELECT created_at FROM pages WHERE id = ?1",
+                        rusqlite::params![back_row.0],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                Some(created)
+            });
+        }
+    }
+
+    /// Item 7 truthfulness: "missing embeddings" counts only pages a
+    /// backfill can act on; empty-body pages are reported apart instead
+    /// of inflating the actionable number forever.
+    #[tokio::test]
+    async fn missing_embeddings_excludes_unembeddable_pages() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "s", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/real.md", "actual content"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/empty.md", "   "))
+            .await
+            .unwrap();
+        let derived = store.reader.derived_index_status().await.unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
+        assert_eq!(derived.latest_pages_unembeddable, 1, "{derived:?}");
+    }
+
+    /// Typed edges surface in the derived status by relation.
+    #[tokio::test]
+    async fn typed_links_are_counted_by_relation() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "s", None)
+            .await
+            .unwrap();
+        let mut page = sample_page(ws, proj, "notes/a.md", "body");
+        page.links = vec![
+            ai_memory_core::LinkTarget {
+                workspace: None,
+                project: None,
+                path: ai_memory_core::PagePath::new("notes/b.md").unwrap(),
+                relation: Some(ai_memory_core::Relation::Fixes),
+            },
+            ai_memory_core::LinkTarget {
+                workspace: None,
+                project: None,
+                path: ai_memory_core::PagePath::new("notes/c.md").unwrap(),
+                relation: None,
+            },
+        ];
+        store.writer.upsert_page(page).await.unwrap();
+        let derived = store.reader.derived_index_status().await.unwrap();
+        assert_eq!(
+            derived.typed_links_from_latest_pages,
+            vec![("fixes".to_string(), 1)],
+            "{derived:?}"
+        );
+    }
+
     #[tokio::test]
     async fn entity_stream_finds_and_weights_pages() {
         let tmp = TempDir::new().unwrap();

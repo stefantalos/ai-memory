@@ -287,20 +287,27 @@ async fn stateless_config_strip_strips_root_any_of_without_flavor() {
     );
 }
 
-/// The toggle is opt-in: with it off and no flavor marker, the upstream root
-/// `anyOf` stays, so schema-respecting clients keep their early refusal
-/// (issue #155).
+/// #577 inverted the default: the source schema no longer carries a
+/// root `anyOf` at all, so even with the strip toggle OFF and no flavor
+/// marker, every Messages-API-routed client gets a session-safe schema.
+/// (#155's early refusal moved to descriptions + runtime validation.)
 #[tokio::test]
-async fn stateless_config_without_strip_keeps_root_any_of_without_flavor() {
+async fn stateless_config_without_strip_is_already_root_combinator_free() {
     let tmp = TempDir::new().unwrap();
     let (router, _store) = make_router(&tmp, false).await;
 
     let resp = router.oneshot(post_to("/mcp", TOOLS_LIST)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let schema = read_page_input_schema(&body_string(resp).await);
+    for key in ["anyOf", "oneOf", "allOf"] {
+        assert!(
+            schema.get(key).is_none(),
+            "the default schema must be root-combinator-free (#577): {schema}"
+        );
+    }
     assert!(
-        schema.get("anyOf").is_some(),
-        "default config must keep the upstream root anyOf: {schema}"
+        schema.get("properties").is_some(),
+        "the flat schema must keep describing the args: {schema}"
     );
 }
 
@@ -379,17 +386,20 @@ async fn stateless_moonshot_flavor_keeps_nullable_unions() {
     );
 }
 
-/// Control: without the marker, tools/list keeps the upstream root `anyOf`.
+/// Unflavored tools/list is root-combinator-free too (#577): the safe
+/// shape is the default, not a per-flavor patch.
 #[tokio::test]
-async fn stateless_tools_list_without_flavor_keeps_root_any_of() {
+async fn stateless_tools_list_without_flavor_is_root_combinator_free() {
     let tmp = TempDir::new().unwrap();
     let (router, _store) = make_router(&tmp, false).await;
 
     let resp = router.oneshot(post(TOOLS_LIST)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let schema = read_page_input_schema(&body_string(resp).await);
-    assert!(
-        schema.get("anyOf").is_some(),
-        "unflavored tools/list must keep the upstream root anyOf: {schema}"
-    );
+    for key in ["anyOf", "oneOf", "allOf"] {
+        assert!(
+            schema.get(key).is_none(),
+            "unflavored tools/list must be root-combinator-free (#577): {schema}"
+        );
+    }
 }

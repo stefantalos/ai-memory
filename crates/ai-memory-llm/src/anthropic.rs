@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use crate::types::{ChatRequest, ChatResponse, ReasoningEffort, Usage};
 
 /// Default Anthropic API base.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -46,6 +46,7 @@ pub struct AnthropicProvider {
     base_url: String,
     model: String,
     timeout: Duration,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl AnthropicProvider {
@@ -62,6 +63,7 @@ impl AnthropicProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
         })
     }
 
@@ -82,6 +84,7 @@ impl AnthropicProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
         })
     }
 
@@ -99,6 +102,15 @@ impl AnthropicProvider {
         self.timeout = Duration::from_secs(secs);
         self
     }
+
+    /// Set Claude effort / thinking. `None` omits both fields so the model
+    /// default applies. On models that accept `output_config.effort`, a
+    /// configured value is mapped onto that field; `none` disables thinking.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +126,22 @@ struct AnthropicRequest<'a> {
     tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<AnthropicToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicOutputConfig {
+    effort: ReasoningEffort,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicThinking {
+    Adaptive,
+    Disabled,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,10 +248,7 @@ impl AnthropicProvider {
             .messages
             .iter()
             .map(|m| AnthropicMsg {
-                role: match m.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                },
+                role: m.role.as_str(),
                 content: &m.content,
             })
             .collect();
@@ -240,13 +265,15 @@ impl AnthropicProvider {
             ),
             None => (None, None),
         };
-        // Newer models reject ai-memory's non-default `temperature` with a
-        // 400; omit the field so the API applies its own default.
-        let temperature = if model_rejects_temperature(&self.model) {
-            None
-        } else {
-            request.temperature
-        };
+        let claude = ClaudeId::parse(&self.model);
+        let temperature = request
+            .temperature
+            .filter(|_| !claude.is_some_and(ClaudeId::rejects_temperature));
+        let (output_config, thinking) = self
+            .reasoning_effort
+            .zip(claude)
+            .map(|(effort, claude)| claude.reasoning_fields(effort))
+            .unwrap_or((None, None));
         AnthropicRequest {
             model: &self.model,
             max_tokens: request.max_tokens,
@@ -255,6 +282,8 @@ impl AnthropicProvider {
             temperature,
             tools,
             tool_choice,
+            output_config,
+            thinking,
         }
     }
 
@@ -300,77 +329,191 @@ impl AnthropicProvider {
     }
 }
 
-/// Models that reject ai-memory's non-default `temperature`.
+/// Modern `claude-<family>-<major>[-<minor>]` id, or dateless Mythos Preview.
 ///
-/// Anthropic deprecated sampling parameters on the newer models: sending
-/// `temperature` to Claude 4.7+ or to Claude Mythos Preview returns a
-/// 400 with `` `temperature` is deprecated for this model. `` Every structured
-/// call site — bootstrap, consolidation, lint, auto-improve — passes 0.1-0.2,
-/// so without this the whole LLM pipeline is unusable on those models.
-/// Omitting the field lets the API apply its own default, the same escape
-/// hatch `openai.rs::model_requires_default_temperature` uses for gpt-5 /
-/// o-series.
-///
-/// Anything we can't parse as a modern `claude-<family>-<major>[-<minor>]` id
-/// keeps the caller's value: the legacy `claude-3-5-sonnet-…` ordering and the
-/// whole Claude 4.0-4.6 line still accept sampling parameters, and a gateway
-/// proxying a non-Claude model behind this wire format must not be silently
-/// stripped either.
-fn model_rejects_temperature(model: &str) -> bool {
-    if is_mythos_preview(model) {
-        return true;
+/// Legacy family-last ids (`claude-3-5-sonnet-…`) and unversioned aliases
+/// (`claude-opus-latest`) stay `None` so we leave those requests alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeId {
+    Released {
+        family: ClaudeFamily,
+        major: u32,
+        minor: u32,
+    },
+    MythosPreview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeFamily {
+    Opus,
+    Sonnet,
+    Haiku,
+    Fable,
+    Mythos,
+}
+
+impl ClaudeFamily {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Opus => "opus",
+            Self::Sonnet => "sonnet",
+            Self::Haiku => "haiku",
+            Self::Fable => "fable",
+            Self::Mythos => "mythos",
+        }
     }
-    match claude_family_version(model) {
-        Some((major, minor)) => major >= 5 || (major == 4 && minor >= 7),
-        None => false,
+
+    fn effort_since(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Opus => Some((4, 5)),
+            Self::Sonnet => Some((4, 6)),
+            Self::Fable | Self::Mythos => Some((5, 0)),
+            Self::Haiku => None,
+        }
+    }
+
+    fn adaptive_since(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Opus | Self::Sonnet => Some((4, 6)),
+            Self::Fable | Self::Mythos => Some((5, 0)),
+            Self::Haiku => None,
+        }
     }
 }
 
-/// Match the dateless preview id, including vendor-prefixed variants.
-fn is_mythos_preview(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    let Some(rest) = lower
-        .find("claude-")
-        .map(|start| &lower[start + "claude-".len()..])
-    else {
-        return false;
-    };
-    let mut parts = rest.split(|c: char| !c.is_ascii_alphanumeric());
-    matches!(
-        (parts.next(), parts.next()),
-        (Some("mythos"), Some("preview"))
-    )
+impl std::str::FromStr for ClaudeFamily {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        for family in [
+            Self::Opus,
+            Self::Sonnet,
+            Self::Haiku,
+            Self::Fable,
+            Self::Mythos,
+        ] {
+            if s == family.as_str() {
+                return Ok(family);
+            }
+        }
+        Err(())
+    }
 }
 
-/// Parse the `<major>[-<minor>]` version following the family name of a modern
-/// Claude id (`claude-opus-5`, `claude-sonnet-4-6`, `claude-opus-5@20260115`,
-/// `anthropic.claude-opus-5-v1:0`). Returns `None` for the legacy
-/// family-last ordering (`claude-3-5-sonnet-20241022`) and for ids that carry
-/// no numeric version (`claude-opus-latest`).
-fn claude_family_version(model: &str) -> Option<(u32, u32)> {
-    let lower = model.to_ascii_lowercase();
-    // Bedrock/Vertex ids carry a vendor prefix and a snapshot suffix around
-    // the same `claude-<family>-<version>` core.
-    let rest = &lower[lower.find("claude-")? + "claude-".len()..];
-    let mut parts = rest.split(|c: char| !c.is_ascii_alphanumeric());
-    if !matches!(
-        parts.next()?,
-        "opus" | "sonnet" | "haiku" | "fable" | "mythos"
-    ) {
-        return None;
+impl ClaudeId {
+    fn parse(model: &str) -> Option<Self> {
+        let lower = model.to_ascii_lowercase();
+        // Bedrock/Vertex wrap the same `claude-<family>-…` core in a prefix
+        // and snapshot suffix.
+        let rest = lower.split_once("claude-")?.1;
+        let mut parts = rest.split(|c: char| !c.is_ascii_alphanumeric());
+        let family = parts.next()?.parse().ok()?;
+        match parts.next()? {
+            "preview" if family == ClaudeFamily::Mythos => Some(Self::MythosPreview),
+            major => Some(Self::Released {
+                family,
+                major: version_segment(major)?,
+                minor: parts.next().and_then(version_segment).unwrap_or(0),
+            }),
+        }
     }
-    let major = version_segment(parts.next()?)?;
-    let minor = parts.next().and_then(version_segment).unwrap_or(0);
-    Some((major, minor))
+
+    fn family(self) -> ClaudeFamily {
+        match self {
+            Self::MythosPreview => ClaudeFamily::Mythos,
+            Self::Released { family, .. } => family,
+        }
+    }
+
+    fn meets(self, floor: Option<(u32, u32)>) -> bool {
+        match self {
+            Self::MythosPreview => true,
+            Self::Released { major, minor, .. } => floor.is_some_and(|min| (major, minor) >= min),
+        }
+    }
+
+    /// Claude 4.7+ and Mythos Preview 400 if we send a non-default
+    /// `temperature`. Unparsed ids keep the caller's value.
+    fn rejects_temperature(self) -> bool {
+        self.meets(Some((4, 7)))
+    }
+
+    fn supports_effort(self) -> bool {
+        self.meets(self.family().effort_since())
+    }
+
+    fn uses_adaptive_thinking(self) -> bool {
+        self.meets(self.family().adaptive_since())
+    }
+
+    /// Fable 5, Mythos 5, and Mythos Preview reject `thinking.type=disabled`.
+    fn thinking_always_on(self) -> bool {
+        match self {
+            Self::MythosPreview => true,
+            Self::Released {
+                family: ClaudeFamily::Fable | ClaudeFamily::Mythos,
+                major,
+                ..
+            } => major >= 5,
+            _ => false,
+        }
+    }
+
+    fn accepts_thinking_disabled(self) -> bool {
+        self.supports_effort() && !self.thinking_always_on()
+    }
+
+    /// Official effort availability: Opus 4.5 is `high` and below; Opus/Sonnet
+    /// 4.6 and Mythos Preview accept `max` but not `xhigh`; later models take
+    /// the full set.
+    fn clamp_output_effort(self, effort: ReasoningEffort) -> Option<ReasoningEffort> {
+        let mapped = effort.anthropic_output_effort()?;
+        Some(match (self, mapped) {
+            (
+                Self::Released {
+                    family: ClaudeFamily::Opus,
+                    major: 4,
+                    minor: 5,
+                },
+                ReasoningEffort::XHigh | ReasoningEffort::Max,
+            ) => ReasoningEffort::High,
+            (
+                Self::MythosPreview
+                | Self::Released {
+                    family: ClaudeFamily::Opus | ClaudeFamily::Sonnet,
+                    major: 4,
+                    minor: 6,
+                },
+                ReasoningEffort::XHigh,
+            ) => ReasoningEffort::Max,
+            (_, mapped) => mapped,
+        })
+    }
+
+    fn reasoning_fields(
+        self,
+        effort: ReasoningEffort,
+    ) -> (Option<AnthropicOutputConfig>, Option<AnthropicThinking>) {
+        match effort {
+            ReasoningEffort::None => (
+                None,
+                self.accepts_thinking_disabled()
+                    .then_some(AnthropicThinking::Disabled),
+            ),
+            effort if self.supports_effort() => (
+                self.clamp_output_effort(effort)
+                    .map(|effort| AnthropicOutputConfig { effort }),
+                self.uses_adaptive_thinking()
+                    .then_some(AnthropicThinking::Adaptive),
+            ),
+            _ => (None, None),
+        }
+    }
 }
 
-/// A version segment is one or two digits; a longer digit run is a date
-/// snapshot (`claude-opus-4-20250514`), not a minor version.
-fn version_segment(segment: &str) -> Option<u32> {
-    if segment.is_empty() || segment.len() > 2 || !segment.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    segment.parse().ok()
+/// One or two digits. Longer runs are date snapshots (`…-4-20250514`).
+fn version_segment(s: &str) -> Option<u32> {
+    s.parse().ok().filter(|_| (1..=2).contains(&s.len()))
 }
 
 #[cfg(test)]
@@ -378,7 +521,8 @@ mod tests {
     use secrecy::SecretString;
     use serde_json::json;
 
-    use crate::types::ChatMessage;
+    use crate::types::{ChatMessage, ReasoningEffort};
+    use rstest::rstest;
 
     use super::*;
 
@@ -444,10 +588,7 @@ mod tests {
     fn chat_request() -> ChatRequest {
         ChatRequest {
             system: None,
-            messages: vec![ChatMessage {
-                role: Role::User,
-                content: "x".into(),
-            }],
+            messages: vec![ChatMessage::user("x")],
             max_tokens: 256,
             temperature: Some(0.2),
         }
@@ -519,6 +660,70 @@ mod tests {
         let plain = body_for("claude-opus-5", None);
         assert!(plain.get("tools").is_none());
         assert!(plain.get("tool_choice").is_none());
+        assert!(plain.get("output_config").is_none());
+        assert!(plain.get("thinking").is_none());
+    }
+
+    fn body_for_effort(model: &str, effort: ReasoningEffort) -> serde_json::Value {
+        let provider = AnthropicProvider::new(SecretString::from("sk-ant-test"), model)
+            .unwrap()
+            .with_reasoning_effort(Some(effort));
+        serde_json::to_value(provider.build_request(&chat_request(), None)).unwrap()
+    }
+
+    #[rstest]
+    #[case::sonnet_46_adaptive(
+        "claude-sonnet-4-6",
+        ReasoningEffort::Low,
+        Some("low"),
+        Some("adaptive")
+    )]
+    #[case::opus_5_disabled("claude-opus-5", ReasoningEffort::None, None, Some("disabled"))]
+    #[case::haiku_45_omits("claude-haiku-4-5", ReasoningEffort::Low, None, None)]
+    #[case::opus_45_effort_only("claude-opus-4-5", ReasoningEffort::High, Some("high"), None)]
+    #[case::mythos_preview_none_omits_disabled(
+        "claude-mythos-preview",
+        ReasoningEffort::None,
+        None,
+        None
+    )]
+    #[case::fable_5_none_omits_disabled("claude-fable-5", ReasoningEffort::None, None, None)]
+    #[case::sonnet_46_xhigh_clamps_max(
+        "claude-sonnet-4-6",
+        ReasoningEffort::XHigh,
+        Some("max"),
+        Some("adaptive")
+    )]
+    #[case::opus_45_max_clamps_high("claude-opus-4-5", ReasoningEffort::Max, Some("high"), None)]
+    fn maps_effort_to_native_thinking_fields(
+        #[case] model: &str,
+        #[case] effort: ReasoningEffort,
+        #[case] output_effort: Option<&str>,
+        #[case] thinking: Option<&str>,
+    ) {
+        let body = body_for_effort(model, effort);
+        match output_effort {
+            Some(expected) => assert_eq!(body["output_config"]["effort"], json!(expected)),
+            None => assert!(body.get("output_config").is_none()),
+        }
+        match thinking {
+            Some(expected) => assert_eq!(body["thinking"]["type"], json!(expected)),
+            None => assert!(body.get("thinking").is_none()),
+        }
+    }
+
+    #[test]
+    fn claude_family_parses_lowercase_labels() {
+        for family in [
+            ClaudeFamily::Opus,
+            ClaudeFamily::Sonnet,
+            ClaudeFamily::Haiku,
+            ClaudeFamily::Fable,
+            ClaudeFamily::Mythos,
+        ] {
+            assert_eq!(family.as_str().parse::<ClaudeFamily>().unwrap(), family);
+        }
+        assert!("unknown".parse::<ClaudeFamily>().is_err());
     }
 
     #[test]

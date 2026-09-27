@@ -18,7 +18,7 @@ use crate::error::{LlmError, LlmResult};
 use crate::openai::{OpenAiProvider, RequestDialect, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
 use crate::text::{suffix_within_bytes, truncate_with_ellipsis};
-use crate::types::{ChatRequest, ChatResponse};
+use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 
 // Compiled once. Matches <think>, <thinking>, <analysis>, <reasoning> blocks
 // (case-insensitive, non-greedy, DOTALL) that reasoning models emit before
@@ -61,6 +61,31 @@ pub struct OpenAiCompatProvider {
     /// instead of the tolerant parser. Set by the factory from
     /// `ProviderConfig::compat_strict` (sourced once by `Config::load`).
     strict: bool,
+    /// Structured output through one forced function call instead of
+    /// `response_format`. On by default for `poolside/*` models, whose
+    /// hosted endpoint ignores `response_format` (see
+    /// `crate::laguna`).
+    structured_via_tool: bool,
+    /// Upper bound on `max_tokens` for every request. `Some(POOLSIDE_MAX_OUTPUT_TOKENS)`
+    /// by default for `poolside/*` models, `None` otherwise.
+    max_output_cap: Option<u32>,
+}
+
+/// Output ceiling for Poolside/Laguna plain-text calls (operator ruling
+/// 2026-09-23). Structured calls use the tighter
+/// [`crate::laguna::LAGUNA_MAX_OUTPUT_TOKENS`]. Laguna S 2.1
+/// has a documented overthinking limitation, and a 16k-token review on a
+/// 1520-observation session came back as HTTP 500 after ~275 s, twice.
+pub const POOLSIDE_MAX_OUTPUT_TOKENS: u32 = 14_000;
+
+/// Engines measured to ignore `response_format` but honour a forced tool call.
+fn model_prefers_forced_tool(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("poolside/")
+}
+
+/// Hosts that accept Poolside's `chat_template_kwargs.enable_thinking`.
+fn host_accepts_thinking_toggle(base_url: &str) -> bool {
+    base_url.to_ascii_lowercase().contains("poolside.ai")
 }
 
 impl OpenAiCompatProvider {
@@ -76,17 +101,24 @@ impl OpenAiCompatProvider {
         model: impl Into<String>,
     ) -> LlmResult<Self> {
         let key = api_key.unwrap_or_else(|| SecretString::from("dummy"));
+        let base_url = base_url.into();
+        let model = model.into();
+        let structured_via_tool = model_prefers_forced_tool(&model);
+        let disable_thinking = structured_via_tool && host_accepts_thinking_toggle(&base_url);
         // Local / proxy engines speak the legacy OpenAI wire format
         // only — no `max_completion_tokens`, no model-family caps, no
         // temperature massaging. Swap dialect so the inner provider's
         // per-request quirks don't leak into Ollama / vLLM setups.
         let inner = OpenAiProvider::new(key, model)?
             .with_base_url(base_url)
-            .with_dialect(RequestDialect::Compat);
+            .with_dialect(RequestDialect::Compat)
+            .with_disable_thinking(disable_thinking);
         Ok(Self {
             inner,
             name_tag: "openai-compat",
             strict: false,
+            structured_via_tool,
+            max_output_cap: structured_via_tool.then_some(POOLSIDE_MAX_OUTPUT_TOKENS),
         })
     }
 
@@ -99,12 +131,58 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Force (or disable) the forced-tool structured path regardless of model.
+    #[must_use]
+    pub fn with_structured_via_tool(mut self, via_tool: bool) -> Self {
+        self.structured_via_tool = via_tool;
+        self
+    }
+
+    /// Override the output ceiling (`None` = the caller's `max_tokens` as-is).
+    #[must_use]
+    pub fn with_max_output_cap(mut self, cap: Option<u32>) -> Self {
+        self.max_output_cap = cap;
+        self
+    }
+
+    fn capped(&self, mut request: ChatRequest) -> ChatRequest {
+        if let Some(cap) = self.max_output_cap {
+            request.max_tokens = request.max_tokens.min(cap);
+        }
+        request
+    }
+
+    /// Override the Poolside thinking toggle on the forced-tool call
+    /// (default: on for poolside.ai hosts serving `poolside/*` models).
+    #[must_use]
+    pub fn with_disable_thinking(mut self, disable: bool) -> Self {
+        self.inner = self.inner.with_disable_thinking(disable);
+        self
+    }
+
     /// Override the per-request timeout on the wrapped
     /// [`OpenAiProvider`]. The factory calls this with
     /// `ProviderConfig::request_timeout_secs`.
     #[must_use]
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.inner = self.inner.with_timeout_secs(secs);
+        self
+    }
+
+    /// Forward reasoning effort to the inner Chat Completions client.
+    /// OpenRouter and xAI hosts use their native request shapes.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<crate::ReasoningEffort>) -> Self {
+        self.inner = self.inner.with_reasoning_effort(effort);
+        self
+    }
+
+    pub(crate) fn with_client_headers(
+        mut self,
+        user_agent: &'static str,
+        operation_id: &'static str,
+    ) -> Self {
+        self.inner = self.inner.with_client_headers(user_agent, operation_id);
         self
     }
 }
@@ -119,14 +197,51 @@ impl LlmProvider for OpenAiCompatProvider {
         self.inner.model()
     }
 
+    fn endpoint(&self) -> Option<&str> {
+        Some(self.inner.base_url())
+    }
+
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
-        self.inner.complete(request).await
+        self.complete_with_operation_id(request, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_with_operation_id(
+        &self,
+        request: ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<ChatResponse> {
+        self.inner
+            .complete_with_operation_id(self.capped(request), operation_id)
+            .await
     }
 
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
         schema: serde_json::Value,
+    ) -> LlmResult<serde_json::Value> {
+        self.complete_structured_raw_with_operation_id(request, schema, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_structured_raw_with_operation_id(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
+        self.complete_structured(self.capped(request), schema, operation_id)
+            .await
+    }
+}
+
+impl OpenAiCompatProvider {
+    async fn complete_structured(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
         // Strict mode: modern local engines
         // honour `response_format=json_schema`. Normalise the schema
@@ -153,14 +268,26 @@ impl LlmProvider for OpenAiCompatProvider {
         // so we can't reuse the response body. Operators on engines that
         // routinely fall back (e.g. reasoning models with `<think>` in
         // `content`) should keep `strict=false` to avoid the double call.
+        if self.structured_via_tool {
+            // The Laguna contract (FN8-9336): streamed forced call, repetition
+            // guard, salvage, one same-key retry — and no plain-text second
+            // request with thinking at the template default, the request
+            // shape that was cut 4 of 4 times (A/B 2026-09-25).
+            return crate::laguna::complete_structured(&self.inner, request, schema, operation_id)
+                .await;
+        }
         if self.strict {
             let mut strict_schema = schema.clone();
             enforce_strict_object_schemas(&mut strict_schema);
-            match self
+            let strict_result = self
                 .inner
-                .complete_structured_raw(request.clone(), strict_schema)
-                .await
-            {
+                .complete_structured_raw_with_operation_id(
+                    request.clone(),
+                    strict_schema,
+                    operation_id,
+                )
+                .await;
+            match strict_result {
                 Ok(v) if v.is_object() => return Ok(v),
                 Ok(_) => {
                     debug!("compat strict: non-object response, falling back to tolerant parser");
@@ -182,7 +309,11 @@ impl LlmProvider for OpenAiCompatProvider {
         // Default (and strict fallback): most older local engines don't
         // honour `response_format`. Ask for JSON and extract the first
         // balanced `{…}` object from the text.
-        let res = self.inner.complete(request).await?;
+        let (res, finish_reason) = self
+            .inner
+            .complete_text_with_finish_reason(&request, operation_id)
+            .await?;
+        let cut_at_limit = finish_reason.as_deref() == Some("length");
         // Reasoning models (DeepSeek, Qwen, MiniMax M2.7, …) prepend
         // `<think>…</think>` before the JSON. Strip those blocks (and any
         // surrounding markdown fences) before trying to parse — otherwise
@@ -205,13 +336,30 @@ impl LlmProvider for OpenAiCompatProvider {
                         total_len = cleaned.len(),
                         "no balanced JSON object found"
                     );
+                    // Cut at the output ceiling before any JSON closed:
+                    // a zero yield the lane chain can route past, not a
+                    // shape error it must treat as fatal.
+                    if cut_at_limit {
+                        return Err(truncated(res.text));
+                    }
                     return Err(LlmError::UnexpectedShape(
                         "openai-compat response did not contain a JSON object".into(),
                     ));
                 };
-                serde_json::from_str::<serde_json::Value>(slice).map_err(LlmError::from)
+                match serde_json::from_str::<serde_json::Value>(slice) {
+                    Ok(v) => Ok(v),
+                    Err(_) if cut_at_limit => Err(truncated(res.text)),
+                    Err(err) => Err(LlmError::from(err)),
+                }
             }
         }
+    }
+}
+
+fn truncated(text: String) -> LlmError {
+    LlmError::Truncated {
+        finish_reason: "length".into(),
+        partial: (!text.trim().is_empty()).then_some(crate::error::PartialText(text)),
     }
 }
 
@@ -250,7 +398,7 @@ fn is_response_format_rejection(err: &LlmError) -> bool {
 /// either truncates the object early or never closes it. This
 /// version tracks whether we're inside a `"..."` literal and
 /// honours backslash escapes the JSON spec defines.
-fn first_json_object(s: &str) -> Option<&str> {
+pub(crate) fn first_json_object(s: &str) -> Option<&str> {
     let start = s.find('{')?;
     let mut depth = 0_i32;
     let mut in_string = false;
@@ -295,6 +443,29 @@ mod tests {
         assert!(!p.strict);
         let p = p.with_strict(true);
         assert!(p.strict);
+    }
+
+    #[test]
+    fn forced_tool_and_thinking_toggle_detection() {
+        assert!(model_prefers_forced_tool("poolside/laguna-s-2.1"));
+        assert!(model_prefers_forced_tool("Poolside/laguna-m.1"));
+        assert!(!model_prefers_forced_tool("mistral-nemo"));
+        assert!(!model_prefers_forced_tool("openrouter/poolside-like"));
+        assert!(host_accepts_thinking_toggle(
+            "https://inference.poolside.ai/v1"
+        ));
+        assert!(!host_accepts_thinking_toggle(
+            "https://openrouter.ai/api/v1"
+        ));
+        let p = OpenAiCompatProvider::new(
+            "https://inference.poolside.ai/v1",
+            None,
+            "poolside/laguna-s-2.1",
+        )
+        .unwrap();
+        assert!(p.structured_via_tool);
+        let q = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "qwen3").unwrap();
+        assert!(!q.structured_via_tool);
     }
 
     #[test]
@@ -351,6 +522,23 @@ mod tests {
         assert!(!is_parse_shape_error(&LlmError::Provider {
             status: 429,
             body: "rate limited".into()
+        }));
+    }
+
+    /// FN8-8120: `Truncated` must NOT classify as a parse-shape error. If it
+    /// did, `complete_structured`'s `match strict_result` would fall back to
+    /// the tolerant path (same/larger token budget, no schema) on every
+    /// truncation, doubling metered spend on a call that could not have
+    /// succeeded (measured against poolside/laguna-s-2.1, 2026-09-22:
+    /// finish_reason=length + completion_tokens==max_tokens). Because this
+    /// case falls through to `complete_structured`'s final
+    /// `Err(err) => return Err(err)` arm, this single classification test is
+    /// sufficient to prove no same-shape retry happens on this error.
+    #[test]
+    fn truncated_is_not_a_parse_shape_error() {
+        assert!(!is_parse_shape_error(&LlmError::Truncated {
+            finish_reason: "length".into(),
+            partial: None,
         }));
     }
 

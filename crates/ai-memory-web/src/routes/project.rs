@@ -22,8 +22,14 @@ pub(crate) async fn handler(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Build sidebar folder tree (group by first path segment).
-    let mut folder_map: BTreeMap<String, Vec<PageRow>> = BTreeMap::new();
+    // Build sidebar folder trees (group by first path segment), split
+    // into knowledge and machinery. A store accumulates far more
+    // machinery pages (lint reports, session captures, monthly logs,
+    // bundle indexes) than curated knowledge; listing them as peers
+    // buried the concepts/decisions/rules a human actually opens this
+    // UI for.
+    let mut knowledge_map: BTreeMap<String, Vec<PageRow>> = BTreeMap::new();
+    let mut system_map: BTreeMap<String, Vec<PageRow>> = BTreeMap::new();
     for p in &pages {
         let folder = p
             .path
@@ -38,7 +44,12 @@ pub(crate) async fn handler(
                 }
             })
             .unwrap_or_else(|| "(root)".to_owned());
-        folder_map.entry(folder).or_default().push(PageRow {
+        let map = if is_system_page(&p.path) {
+            &mut system_map
+        } else {
+            &mut knowledge_map
+        };
+        map.entry(folder).or_default().push(PageRow {
             path: p.path.clone(),
             href: page_href(&workspace, &project, &p.path),
             title: p.title.clone(),
@@ -46,13 +57,24 @@ pub(crate) async fn handler(
             updated_relative: humanize(&p.updated_at),
         });
     }
-    let folders: Vec<Folder> = folder_map
+    let folders: Vec<Folder> = knowledge_map
+        .into_iter()
+        .map(|(name, pages)| Folder { name, pages })
+        .collect();
+    let system: Vec<Folder> = system_map
         .into_iter()
         .map(|(name, pages)| Folder { name, pages })
         .collect();
 
-    // Recent pages: sort by updated_at desc, take 20.
-    let mut sorted = pages.clone();
+    // Recent pages: knowledge only, sorted by updated_at desc, take 20.
+    // Machinery updates constantly (logs append every consolidation,
+    // lint reruns daily), so an unfiltered recency sort would show
+    // nothing else.
+    let mut sorted: Vec<_> = pages
+        .iter()
+        .filter(|p| !is_system_page(&p.path))
+        .cloned()
+        .collect();
     sorted.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     sorted.truncate(20);
     let recent: Vec<PageRow> = sorted
@@ -70,9 +92,28 @@ pub(crate) async fn handler(
         workspace,
         project,
         folders,
+        system,
         recent,
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Html(html))
+}
+
+/// Machinery rather than knowledge: hidden from Recent Activity and
+/// collapsed into the sidebar's System section. Underscore-prefixed
+/// trees are system surfaces — except `_rules`, which holds standing
+/// human-authored rules — as are session captures and the root-level
+/// bookkeeping pages (monthly logs, the OKF bundle index, `_meta.md`).
+fn is_system_page(path: &str) -> bool {
+    if path.starts_with("_rules/") {
+        return false;
+    }
+    if path.starts_with('_') || path.starts_with("sessions/") {
+        return true;
+    }
+    if path.contains('/') {
+        return false;
+    }
+    path == "index.md" || path == "_meta.md" || (path.starts_with("log-") && path.ends_with(".md"))
 }

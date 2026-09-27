@@ -77,6 +77,19 @@ pub enum ProviderHealthStatus {
     Error,
 }
 
+impl ProviderHealthStatus {
+    /// Canonical kebab-case wire string.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Unknown => "unknown",
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// Wire-format health snapshot for all provider roles.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProviderHealthSnapshot {
@@ -489,5 +502,25 @@ mod tests {
         let after = health.snapshot().embedding;
         assert_eq!(after.status, ProviderHealthStatus::Ok);
         assert!(after.last_call_at.is_some());
+    }
+
+    #[test]
+    fn provider_health_status_wire_labels() {
+        for (status, label) in [
+            (ProviderHealthStatus::Disabled, "disabled"),
+            (ProviderHealthStatus::Unknown, "unknown"),
+            (ProviderHealthStatus::Ok, "ok"),
+            (ProviderHealthStatus::Error, "error"),
+        ] {
+            assert_eq!(status.as_str(), label);
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                serde_json::json!(label)
+            );
+            assert_eq!(
+                serde_json::from_value::<ProviderHealthStatus>(serde_json::json!(label)).unwrap(),
+                status
+            );
+        }
     }
 }

@@ -117,3 +117,19 @@ This project follows [Semantic Versioning](https://semver.org/):
 Breaking changes only ship in major releases. Deprecated items are
 documented in the CHANGELOG under `### Deprecated` and removed no sooner
 than the following major release.
+
+### How this affects your PR
+
+- Put your CHANGELOG entry under the heading that matches its semver
+  impact — `### Fixed` for bug fixes, `### Added` for new capabilities,
+  `### Changed` for altered behaviour. The maintainer reads the
+  `[Unreleased]` section to pick the next version number, so a fix filed
+  under `Added` (or vice versa) can bump the wrong release.
+- If your change is **breaking** (on-disk format, removed/renamed
+  surface, changed MCP schema), say so explicitly in the PR description
+  so it gets the `breaking-change` label and is scheduled for the next
+  major instead of blocking patch/minor releases.
+- Bug fixes ship in the next **patch** release, usually promptly —
+  they are not held for feature releases. Small additive features (a new
+  agent harness, LLM provider, install client) ship in the next
+  **minor**.

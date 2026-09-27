@@ -510,10 +510,102 @@ pub fn ensure_scheduler_state(
     Ok(())
 }
 
+/// Cross-session ("experience") pass cadence probe — 2.0 item 6.
+/// Counts completed sessions newer than the pass's last run (or the
+/// scope's initialization, so enabling the pass never re-digests
+/// history) and returns the count together with the anchor instant.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statements fail.
+pub fn experience_pass_due(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> StoreResult<(u64, i64)> {
+    let anchor: Option<i64> = conn
+        .query_row(
+            "SELECT COALESCE(last_experience_run_at, initialized_at)              FROM auto_improve_scheduler_state              WHERE workspace_id = ?1 AND project_id = ?2",
+            params![workspace_id.as_bytes(), project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(anchor) = anchor else {
+        // No scheduler state yet (scope initialised after startup);
+        // nothing is due until the state row exists.
+        return Ok((0, 0));
+    };
+    let newer: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sessions          WHERE workspace_id = ?1 AND project_id = ?2            AND ended_at IS NOT NULL AND ended_at > ?3",
+        params![workspace_id.as_bytes(), project_id.as_bytes(), anchor],
+        |row| row.get(0),
+    )?;
+    Ok((u64::try_from(newer).unwrap_or(0), anchor))
+}
+
+/// Record that the cross-session pass ran for a scope now.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statements fail.
+pub fn mark_experience_pass_run(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> StoreResult<()> {
+    let now = Timestamp::now().as_microsecond();
+    conn.execute(
+        "UPDATE auto_improve_scheduler_state          SET last_experience_run_at = ?3, updated_at = ?3          WHERE workspace_id = ?1 AND project_id = ?2",
+        params![workspace_id.as_bytes(), project_id.as_bytes(), now],
+    )?;
+    Ok(())
+}
+
+/// How many failures ATTRIBUTABLE TO THE SESSION a scheduler claim absorbs
+/// before the session stops being a candidate. Lane-unavailable failures
+/// ([`SchedulerFailureKind::LaneUnavailable`]) never count: a three-tick 429
+/// quota wall must not exhaust every session at the head of the FIFO queue,
+/// which is exactly the loss measured 2026-09-24. The bound exists for a
+/// session that fails on its own (a response the model cannot shape, a
+/// request too large for the lane) so it does not hold a model slot — and,
+/// with a metered runtime fallback, spend money — on every tick forever.
+///
+/// The candidate query and the claim upsert both read this one constant, so
+/// "eligible" means the same thing on both sides.
+pub const SCHEDULER_MAX_FAILED_ATTEMPTS: i64 = 3;
+
+/// Longest `last_error` kept on a released claim.
+const SCHEDULER_LAST_ERROR_MAX_CHARS: usize = 500;
+
+/// Whether a failed scheduled review says anything about the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerFailureKind {
+    /// The lane could not be asked at all (quota 429, connection refused,
+    /// auth, no provider). The session was never judged, so it is released
+    /// without spending its failure budget — an unknown inherits no verdict.
+    LaneUnavailable,
+    /// The failure may be caused by this session (5xx, timeout, malformed
+    /// or truncated output, a store/eval error on its proposals). Released,
+    /// and one attempt of [`SCHEDULER_MAX_FAILED_ATTEMPTS`] is spent.
+    SessionAttributable,
+}
+
+/// Result of releasing a scheduler claim after a failed run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasedSchedulerClaim {
+    /// Session-attributable failures recorded so far, this one included.
+    pub failed_attempts: i64,
+    /// True when the bound is reached: the session will not be claimed
+    /// again, and `last_error` on the claim row names why.
+    pub exhausted: bool,
+}
+
 /// Atomically claim one ended session for background review. Returns `true`
 /// only for the first claimer: the insert requires the session to be past
 /// the scope's watermark and not already covered by a run, so concurrent
 /// schedulers and restarts cannot double-review a session.
+///
+/// A claim a failed run RELEASED ([`release_scheduler_claim`]) is taken
+/// again here while its failure budget lasts; a held claim (in flight, or
+/// its run succeeded) is never taken twice.
 ///
 /// # Errors
 /// Returns an error when the underlying SQLite statements fail.
@@ -527,7 +619,7 @@ pub fn claim_scheduler_session(
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     let inserted = tx.execute(
-        "INSERT OR IGNORE INTO auto_improve_scheduler_claims \
+        "INSERT INTO auto_improve_scheduler_claims \
          (workspace_id, project_id, session_id, claimed_at) \
          SELECT ?1, ?2, ?3, ?4 \
          WHERE EXISTS ( \
@@ -546,13 +638,19 @@ pub fn claim_scheduler_session(
                WHERE r.workspace_id = ?1 \
                  AND r.project_id = ?2 \
                  AND r.session_id = ?3 \
-           )",
+           ) \
+         ON CONFLICT(session_id) DO UPDATE SET \
+             claimed_at = excluded.claimed_at, \
+             released_at = NULL \
+         WHERE auto_improve_scheduler_claims.released_at IS NOT NULL \
+           AND auto_improve_scheduler_claims.failed_attempts < ?6",
         params![
             workspace_id.as_bytes(),
             project_id.as_bytes(),
             session_id.as_bytes(),
             now,
             ended_at,
+            SCHEDULER_MAX_FAILED_ATTEMPTS,
         ],
     )?;
     if inserted == 1 {
@@ -565,6 +663,90 @@ pub fn claim_scheduler_session(
     }
     tx.commit()?;
     Ok(inserted == 1)
+}
+
+/// Release the held claim of a scheduled run that FAILED, so a later tick
+/// can review the session. Before this, a failed run kept its claim and wrote
+/// no run row, and the candidate query excludes claimed sessions: every
+/// provider failure silently removed a real session from the backlog
+/// (32 in 24h, measured 2026-09-24).
+///
+/// `kind` decides whether the failure spends the session's budget; `error`
+/// is kept (bounded) so an exhausted claim names its terminal reason.
+/// Returns `None` when there is no held claim to release (already released,
+/// or never claimed) — nothing is changed in that case.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statement fails.
+pub fn release_scheduler_claim(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    kind: SchedulerFailureKind,
+    error: &str,
+) -> StoreResult<Option<ReleasedSchedulerClaim>> {
+    let now = Timestamp::now().as_microsecond();
+    let increment: i64 = match kind {
+        SchedulerFailureKind::LaneUnavailable => 0,
+        SchedulerFailureKind::SessionAttributable => 1,
+    };
+    let last_error: String = error.chars().take(SCHEDULER_LAST_ERROR_MAX_CHARS).collect();
+    let failed_attempts: Option<i64> = conn
+        .query_row(
+            "UPDATE auto_improve_scheduler_claims \
+             SET released_at = ?4, \
+                 failed_attempts = failed_attempts + ?5, \
+                 last_error = ?6 \
+             WHERE workspace_id = ?1 \
+               AND project_id = ?2 \
+               AND session_id = ?3 \
+               AND released_at IS NULL \
+             RETURNING failed_attempts",
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                session_id.as_bytes(),
+                now,
+                increment,
+                last_error,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(
+        failed_attempts.map(|failed_attempts| ReleasedSchedulerClaim {
+            failed_attempts,
+            exhausted: failed_attempts >= SCHEDULER_MAX_FAILED_ATTEMPTS,
+        }),
+    )
+}
+
+/// Release every held claim that has no run row. Only safe while no
+/// scheduled review is in flight, i.e. at server startup under the
+/// single-instance lock: a held claim without a run there is a review that
+/// failed or was interrupted, never one still running. Does not spend any
+/// failure budget — why those runs ended was never recorded. Returns the
+/// number of claims released.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statement fails.
+pub fn release_orphan_scheduler_claims(conn: &mut Connection) -> StoreResult<usize> {
+    let now = Timestamp::now().as_microsecond();
+    let released = conn.execute(
+        "UPDATE auto_improve_scheduler_claims \
+         SET released_at = ?1, \
+             last_error = COALESCE(last_error, 'claim held without a run at startup') \
+         WHERE released_at IS NULL \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM auto_improve_runs r \
+               WHERE r.workspace_id = auto_improve_scheduler_claims.workspace_id \
+                 AND r.project_id = auto_improve_scheduler_claims.project_id \
+                 AND r.session_id = auto_improve_scheduler_claims.session_id \
+           )",
+        params![now],
+    )?;
+    Ok(released)
 }
 
 /// Persist one review run and stage its proposals as `pending`, all in one

@@ -122,6 +122,75 @@ fn systemd_units_use_explicit_native_paths() {
     assert!(!user.contains("/var/lib/ai-memory"));
 }
 
+const LAUNCHD_AGENT_PLIST: &str = "packaging/launchd/com.github.akitaonrails.ai-memory.plist";
+
+#[test]
+fn launchd_agent_plist_is_home_independent_and_unthrottled() {
+    let agent = read_repo(LAUNCHD_AGENT_PLIST);
+
+    // launchd expands nothing: no %h, no $HOME, no ~. Every path in a plist is
+    // a literal, so the two the template cannot know stay placeholders.
+    assert!(agent.contains("__AI_MEMORY_BIN__"));
+    assert!(agent.contains("__HOME__/Library/Logs/ai-memory/"));
+    for unexpandable in ["%h", "$HOME", "${HOME}", "~/"] {
+        assert!(
+            !agent.contains(unexpandable),
+            "launchd would take {unexpandable} literally instead of expanding it"
+        );
+    }
+
+    // The macOS data dir and the config file inside it are already the binary's
+    // defaults, so passing them would only reintroduce a home-dependent path.
+    assert!(!agent.contains("--data-dir"));
+    assert!(!agent.contains("--config"));
+
+    // An unset ProcessType makes launchd throttle CPU and I/O bandwidth, which
+    // the hook ingress budget cannot absorb. Adaptive keys off XPC
+    // transactions, which ai-memory never opens, so it decays to Background.
+    assert!(agent.contains("<key>ProcessType</key>\n  <string>Interactive</string>"));
+
+    assert!(agent.contains("<key>RunAtLoad</key>\n  <true/>"));
+    assert!(agent.contains("<key>KeepAlive</key>\n  <true/>"));
+
+    // launchctl addresses the job by Label, so a Label that disagrees with the
+    // filename silently invalidates every bootout/kickstart command we publish.
+    let label = Path::new(LAUNCHD_AGENT_PLIST)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("the plist path has a file stem");
+    assert!(agent.contains(&format!("<key>Label</key>\n  <string>{label}</string>")));
+}
+
+// Substring assertions cannot see malformed XML, and a plist launchd refuses to
+// parse fails at bootstrap time with no useful diagnostic.
+#[cfg(target_os = "macos")]
+#[test]
+fn launchd_agent_plist_is_a_valid_property_list() {
+    let path = repo_root().join(LAUNCHD_AGENT_PLIST);
+    let output = Command::new("plutil")
+        .arg("-lint")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "plutil -lint rejected {}: {}{}",
+        path.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn macos_release_tarball_ships_the_launchd_agent_plist() {
+    let release = read_repo(".github/workflows/release.yml");
+    assert!(release.contains("cp -a packaging/launchd \"dist/$artifact/packaging/launchd\""));
+    assert!(
+        release.contains(LAUNCHD_AGENT_PLIST),
+        "the macOS tarball smoke test must prove the plist actually shipped"
+    );
+}
+
 #[test]
 fn aur_packages_install_all_native_assets() {
     for path in ["packaging/aur/PKGBUILD", "packaging/aur/PKGBUILD-bin"] {
@@ -166,7 +235,7 @@ fn aur_packages_install_all_native_assets() {
 #[test]
 fn docker_source_build_uses_vendored_tailwind() {
     let dockerfile = read_repo("docker/Dockerfile");
-    assert!(dockerfile.contains("TAILWIND_SKIP=1 cargo build --release -p ai-memory-cli"));
+    assert!(dockerfile.contains("TAILWIND_SKIP=1 cargo build --locked --release -p ai-memory-cli"));
 }
 
 #[test]
@@ -205,11 +274,18 @@ fn docker_publish_jobs_use_prebuilt_binaries() {
 
     let ci = read_repo(".github/workflows/ci.yml");
     assert!(ci.contains("ci-ai-memory-${{ matrix.artifact }}"));
-    assert!(ci.contains("artifact: linux-x86_64"));
-    assert!(ci.contains("artifact: macos-aarch64"));
-    assert!(ci.contains("artifact: macos-x86_64"));
-    assert!(ci.contains("runner: macos-15"));
-    assert!(ci.contains("runner: macos-15-intel"));
+    // The release-build matrix is a conditional expression since the
+    // fast-CI split: Linux always, the macOS legs on full-ci/dispatch.
+    // The full branch must keep every release artifact and runner.
+    assert!(ci.contains(r#"{"artifact": "linux-x86_64", "runner": "ubuntu-22.04"}"#));
+    assert!(ci.contains(r#"{"artifact": "macos-aarch64", "runner": "macos-15"}"#));
+    assert!(ci.contains(r#"{"artifact": "macos-x86_64", "runner": "macos-15-intel"}"#));
+    // and the reduced branch still builds the Linux artifact docker uses
+    assert!(
+        ci.matches(r#"{"artifact": "linux-x86_64", "runner": "ubuntu-22.04"}"#)
+            .count()
+            >= 2
+    );
     assert!(ci.contains("--target runtime-prebuilt-amd64"));
 }
 
@@ -835,6 +911,9 @@ fn managed_host_commands_use_native_path_and_remote_server_without_docker() {
         &["run", "codex", "--yolo", "resume"],
         &["show", "--json", "--no-scan"],
         &["continue", "--workspace", "work", "--yolo"],
+        &["resume", "--workspace", "work", "--limit", "5"],
+        &["workstreams", "--limit", "5", "--json"],
+        &["rename-workstream", "--from", "old", "--to", "new"],
     ];
     for args in commands {
         let output = shell_script_command(&repo_root().join("bin/ai-memory"))

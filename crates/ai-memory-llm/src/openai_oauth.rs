@@ -22,7 +22,7 @@ use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited, response_text_limited};
 use crate::stored_token::{StoredOAuthToken, refresh_grant};
 use crate::text::truncate_with_ellipsis;
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use crate::types::{ChatRequest, ChatResponse, ReasoningEffort, Usage};
 
 /// OpenAI OAuth issuer used by Codex/OpenCode.
 pub const OPENAI_OAUTH_ISSUER: &str = "https://auth.openai.com";
@@ -139,6 +139,57 @@ pub struct OpenAiOAuthProvider {
     token_path: PathBuf,
     token: Mutex<OpenAiOAuthToken>,
     timeout: Duration,
+    reasoning_effort: Option<ReasoningEffort>,
+    /// The token belongs to the Codex CLI (`~/.codex/auth.json`): read it
+    /// fresh on every request, never refresh it, never write the file.
+    /// Refreshing would rotate the refresh token out from under the CLI seat.
+    codex_cli: bool,
+    responses_url: String,
+}
+
+/// Read the Codex CLI's `auth.json` (`{"tokens": {"access_token", "refresh_token",
+/// "id_token", "account_id"}}`) into a token. Expiry comes from the access
+/// token's own `exp` claim.
+fn load_codex_cli_token(path: &Path) -> LlmResult<OpenAiOAuthToken> {
+    let raw = std::fs::read(path).map_err(|e| {
+        LlmError::NotConfigured(format!("codex CLI auth file {} unreadable: {e}", path.display()))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|_| {
+        LlmError::NotConfigured(format!("codex CLI auth file {} is not JSON", path.display()))
+    })?;
+    let tokens = value.get("tokens");
+    let field = |k: &str| {
+        tokens
+            .and_then(|t| t.get(k))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let access = field("access_token").ok_or_else(|| {
+        LlmError::NotConfigured(format!(
+            "codex CLI auth file {} holds no ChatGPT sign-in",
+            path.display()
+        ))
+    })?;
+    let expires_at_ms = jwt_exp_ms(&access).unwrap_or(0);
+    let account_id = field("account_id")
+        .or_else(|| field("id_token").as_deref().and_then(extract_account_id_from_jwt))
+        .or_else(|| extract_account_id_from_jwt(&access));
+    Ok(OpenAiOAuthToken {
+        access: SecretString::from(access),
+        refresh: SecretString::from(field("refresh_token").unwrap_or_default()),
+        expires_at_ms,
+        extra: OpenAiExtras { account_id },
+    })
+}
+
+/// The `exp` claim of a JWT, in milliseconds.
+fn jwt_exp_ms(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("exp")?.as_u64().map(|s| s.saturating_mul(1000))
 }
 
 impl OpenAiOAuthProvider {
@@ -160,7 +211,41 @@ impl OpenAiOAuthProvider {
             token_path,
             token: Mutex::new(token),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
+            codex_cli: false,
+            responses_url: CODEX_RESPONSES_URL.to_string(),
         })
+    }
+
+    /// The ChatGPT seat the Codex CLI is signed in with, read from its
+    /// `auth.json` (normally `~/.codex/auth.json`). Read-only: the file is
+    /// re-read on every request and never refreshed or written, so the CLI
+    /// keeps sole ownership of its refresh token. An expired access token is
+    /// [`LlmError::Auth`] without a request; running `codex` refreshes it.
+    ///
+    /// # Errors
+    /// [`LlmError::NotConfigured`] when the file is missing, unreadable, or
+    /// holds no ChatGPT sign-in.
+    pub fn from_codex_cli_auth(path: PathBuf, model: impl Into<String>) -> LlmResult<Self> {
+        let token = load_codex_cli_token(&path)?;
+        let client = reqwest::Client::builder().build().map_err(LlmError::from)?;
+        Ok(Self {
+            client,
+            model: model.into(),
+            token_path: path,
+            token: Mutex::new(token),
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
+            codex_cli: true,
+            responses_url: CODEX_RESPONSES_URL.to_string(),
+        })
+    }
+
+    /// Point the provider at another Responses endpoint (tests).
+    #[must_use]
+    pub fn with_responses_url(mut self, url: impl Into<String>) -> Self {
+        self.responses_url = url.into();
+        self
     }
 
     /// Override the per-request timeout (default
@@ -171,7 +256,26 @@ impl OpenAiOAuthProvider {
         self
     }
 
+    /// Set Responses API `reasoning.effort`. `None` omits the field so the
+    /// model default applies.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
     async fn current_token(&self) -> LlmResult<OpenAiOAuthToken> {
+        if self.codex_cli {
+            let token = load_codex_cli_token(&self.token_path)?;
+            if token.needs_refresh() {
+                return Err(LlmError::Auth(format!(
+                    "codex CLI sign-in at {} has expired; ai-memory never refreshes it — run `codex` to renew it",
+                    self.token_path.display()
+                )));
+            }
+            *self.token.lock().await = token.clone();
+            return Ok(token);
+        }
         let mut guard = self.token.lock().await;
         if guard.needs_refresh() {
             info!("openai-oauth token expired or near-expiry, refreshing");
@@ -185,12 +289,12 @@ impl OpenAiOAuthProvider {
     async fn post(&self, body: &CodexResponsesRequest<'_>) -> LlmResult<CodexResponsesResponse> {
         let token = self.current_token().await?;
         debug!(
-            url = CODEX_RESPONSES_URL,
+            url = %self.responses_url,
             "POST openai-oauth codex responses"
         );
         let mut request = self
             .client
-            .post(CODEX_RESPONSES_URL)
+            .post(&self.responses_url)
             .timeout(self.timeout)
             .bearer_auth(token.access.expose_secret())
             .header("content-type", "application/json")
@@ -218,11 +322,17 @@ impl OpenAiOAuthProvider {
                 body,
             });
         }
-        if body.stream {
-            parse_sse_response(&response_text_limited(resp).await?)
+        let response = if body.stream {
+            parse_sse_response(&response_text_limited(resp).await?)?
         } else {
-            response_json_limited::<CodexResponsesResponse>(resp).await
+            response_json_limited::<CodexResponsesResponse>(resp).await?
+        };
+        // Book the tokens on the call ledger (subscription flat: cost 0.00).
+        match &response.usage {
+            Some(u) => crate::usage::report(u.input_tokens, u.output_tokens),
+            None => crate::usage::report(0, 0),
         }
+        Ok(response)
     }
 }
 
@@ -238,7 +348,12 @@ impl LlmProvider for OpenAiOAuthProvider {
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
         let response = self
-            .post(&build_request(&self.model, &request, None))
+            .post(&build_request(
+                &self.model,
+                &request,
+                None,
+                self.reasoning_effort,
+            ))
             .await?;
         Ok(into_chat_response(response))
     }
@@ -257,7 +372,12 @@ impl LlmProvider for OpenAiOAuthProvider {
             },
         };
         let response = self
-            .post(&build_request(&self.model, &request, Some(response_format)))
+            .post(&build_request(
+                &self.model,
+                &request,
+                Some(response_format),
+                self.reasoning_effort,
+            ))
             .await?;
         let text = extract_output_text(&response).unwrap_or_default();
         serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
@@ -292,15 +412,13 @@ fn build_request<'a>(
     model: &'a str,
     request: &'a ChatRequest,
     text: Option<CodexText>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> CodexResponsesRequest<'a> {
     let input = request
         .messages
         .iter()
         .map(|msg| CodexInputMessage {
-            role: match msg.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            },
+            role: msg.role.as_str(),
             content: vec![CodexInputContent {
                 kind: "input_text",
                 text: &msg.content,
@@ -322,6 +440,9 @@ fn build_request<'a>(
         store: false,
         stream: true,
         text,
+        reasoning: reasoning_effort.map(|effort| CodexReasoning {
+            effort: effort.openai_wire_effort(),
+        }),
     }
 }
 
@@ -444,6 +565,13 @@ struct CodexResponsesRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<CodexText>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<CodexReasoning>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexReasoning {
+    effort: ReasoningEffort,
 }
 
 #[derive(Debug, Serialize)]
@@ -566,7 +694,7 @@ fn extract_account_id_from_jwt(token: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::ExposeSecret as _;
+    use rstest::rstest;
     use serde_json::json;
 
     use super::*;
@@ -700,20 +828,34 @@ mod tests {
     fn codex_request_moves_system_to_instructions_and_omits_gpt5_temperature() {
         let request = ChatRequest {
             system: Some("sys".into()),
-            messages: vec![crate::types::ChatMessage {
-                role: Role::User,
-                content: "hello".into(),
-            }],
+            messages: vec![crate::types::ChatMessage::user("hello")],
             temperature: Some(0.2),
             max_tokens: 123,
         };
-        let value = serde_json::to_value(build_request("gpt-5.5", &request, None)).unwrap();
+        let value = serde_json::to_value(build_request("gpt-5.5", &request, None, None)).unwrap();
         assert_eq!(value["instructions"], "sys");
         assert_eq!(value["input"][0]["content"][0]["type"], "input_text");
         assert!(value.get("max_output_tokens").is_none());
         assert!(value.get("temperature").is_none());
+        assert!(value.get("reasoning").is_none());
         assert_eq!(value["store"], false);
         assert_eq!(value["stream"], true);
+    }
+
+    #[rstest]
+    #[case::omitted(None, None)]
+    #[case::low(Some(ReasoningEffort::Low), Some("low"))]
+    #[case::persistent_clamps_max(Some(ReasoningEffort::Persistent), Some("max"))]
+    fn codex_request_reasoning_effort(
+        #[case] effort: Option<ReasoningEffort>,
+        #[case] expected: Option<&str>,
+    ) {
+        let request = ChatRequest::user_prompt("hello");
+        let value = serde_json::to_value(build_request("gpt-5.5", &request, None, effort)).unwrap();
+        match expected {
+            Some(effort) => assert_eq!(value["reasoning"]["effort"], effort),
+            None => assert!(value.get("reasoning").is_none()),
+        }
     }
 
     #[test]
@@ -862,7 +1004,8 @@ mod tests {
                 strict: true,
             },
         };
-        let value = serde_json::to_value(build_request("gpt-5.5", &request, Some(text))).unwrap();
+        let value =
+            serde_json::to_value(build_request("gpt-5.5", &request, Some(text), None)).unwrap();
         assert_eq!(value["text"]["format"]["type"], "json_schema");
         assert_eq!(value["text"]["format"]["name"], "Result");
         assert_eq!(value["text"]["format"]["strict"], true);

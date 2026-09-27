@@ -1803,7 +1803,13 @@ async fn copy_purge_rerun_is_idempotent() {
     .await;
     assert_eq!(r1.status(), StatusCode::OK);
 
-    // Re-create the source identically and run the merge again.
+    // Re-create the source identically and run the merge again — across
+    // a full second boundary, so the re-seeded page's `generated.at`
+    // provably differs from the copy the first merge landed. Identical
+    // CONTENT with a different write instant must not be a merge
+    // conflict (this was the timing flake: sub-second reruns passed,
+    // second-crossing reruns 409'd).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let s2 = build_state(&store, &tmp);
     seed_page(&store, &s2.wiki, "src", "proj", "notes/a.md", "body a").await;
     let r2 = post(
@@ -1812,7 +1818,19 @@ async fn copy_purge_rerun_is_idempotent() {
         json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
     )
     .await;
-    assert_eq!(r2.status(), StatusCode::OK);
+    // Flaky under heavy parallel load / on Windows (observed in the 2.0
+    // full-matrix run); keep the body in the failure so the next
+    // occurrence is diagnosable instead of a bare status assert.
+    let r2_status = r2.status();
+    if r2_status != StatusCode::OK {
+        let body = axum::body::to_bytes(r2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        panic!(
+            "second move-project failed: {r2_status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 
     // Destination still holds exactly one of each path — no duplicates.
     let mut paths: Vec<String> = store

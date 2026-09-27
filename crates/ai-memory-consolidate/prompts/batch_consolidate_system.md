@@ -104,6 +104,14 @@ session summary when the session yields reusable insight;
 otherwise return only the session page. Schema and required
 keys are enumerated in the user message.
 
+A page may declare typed edges to EXISTING pages via `relations`
+(keys limited to `causes`, `fixes`, `contradicts`; values are wiki
+paths). Declare one only when the session's evidence states the
+relationship plainly — e.g. a fix landed for a documented gotcha
+(`fixes`), or new evidence disagrees with a stored decision
+(`contradicts`). Leave the list empty in the normal case; never
+invent relations to fill it.
+
 ## Output format
 
 - Reply with ONE JSON object, nothing else. NO prose preamble,

@@ -1,5 +1,10 @@
 # agentmemory - Research Report
 
+> **Follow-up:** the September 2026 landscape refresh — how this project
+> evolved, what the field looks like now, and what we concluded — is in
+> [`research-2026-landscape.md`](research-2026-landscape.md).
+
+
 > Source project: `rohitg00/agentmemory` (TypeScript, MCP server built on `iii-engine`).
 > This repo builds on that earlier TypeScript project: keep the *ideas*, replace
 > the *substrate*.

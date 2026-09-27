@@ -18,6 +18,7 @@
 //! External writes drive store updates; internal writes drive disk +
 //! store updates via [`Wiki::write_page`].
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
@@ -146,6 +147,7 @@ async fn run_loop(
     // addition to the per-failure error log. Without this, a broken
     // disk → store bridge can stay broken indefinitely with only a
     // line per 30s in the warn stream — easy to miss in busy logs.
+    let mut reconcile_cache: HashMap<String, PageStamp> = HashMap::new();
     let mut consecutive_failures: u32 = 0;
     const DEGRADED_AFTER: u32 = 5;
 
@@ -160,8 +162,8 @@ async fn run_loop(
                 handle_event(&wiki, event).await;
             }
             _ = tick.tick() => {
-                match reconcile(&wiki).await {
-                    Ok(()) => {
+                match reconcile_with_cache(&wiki, &mut reconcile_cache).await.map(|_| ()) {
+                    Ok(_) => {
                         if consecutive_failures > 0 {
                             tracing::info!(
                                 prior_failures = consecutive_failures,
@@ -244,21 +246,39 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
     }
 }
 
+/// Returns `false` when the directory was skipped because the store has no
+/// row for it — the same orphan case `reconcile` counts as `skipped_orphans`,
+/// surfaced here so the skip is testable on this path too.
 async fn reindex_project_dir(
     wiki: &Wiki,
     ws: WorkspaceId,
     proj: ProjectId,
     proj_root: std::path::PathBuf,
-) {
+) -> bool {
+    // Same orphan guard `reconcile` applies (#613), for the other way a
+    // project directory reaches the indexer. A filesystem event on a rowless
+    // directory would otherwise walk it and warn once per page, which is the
+    // behaviour that pass was about — quieter here only because it needs an
+    // event rather than firing every 30s. Checking once per directory also
+    // saves walking a tree whose every page is going to fail scope resolution.
+    if let Err(e) = wiki.ensure_project_workspace(ws, proj).await {
+        debug!(
+            workspace = %ws,
+            project = %proj,
+            error = %e,
+            "skipping directory event for a project directory with no store row",
+        );
+        return false;
+    }
     let pages = match tokio::task::spawn_blocking(move || walk_markdown(&proj_root)).await {
         Ok(Ok(pages)) => pages,
         Ok(Err(e)) => {
             warn!(error = %e, "watcher directory walk failed");
-            return;
+            return true;
         }
         Err(e) => {
             warn!(error = %e, "watcher directory walk task failed");
-            return;
+            return true;
         }
     };
 
@@ -268,29 +288,131 @@ async fn reindex_project_dir(
             Err(e) => warn!(path = %path, error = %e, "watcher directory reindex failed"),
         }
     }
+    true
 }
 
-async fn reconcile(wiki: &Wiki) -> WikiResult<()> {
+/// Outcome of one reconciliation pass, for the caller's telemetry and tests.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ReconcileStats {
+    /// Pages successfully (re)indexed from resolvable project directories.
+    pub indexed: usize,
+    /// Project directories present on disk that the store has no row for.
+    /// These are skipped wholesale rather than failing scope resolution on
+    /// every page, every pass, forever (see #613).
+    pub skipped_orphans: usize,
+    /// Pages walked but already current: the stat stamp matched the previous pass.
+    /// Without this gate every pass re-indexed every page (measured 2026-09-20:
+    /// 2,890 pages every 30s for zero changes, ~1.15s of CPU per minute).
+    pub skipped_unchanged: usize,
+}
+
+/// A page's change stamp: modification time and size. The 30-second reconciliation walk exists
+/// to catch writes the platform watcher MISSED (offline edits, dropped events) — not to re-index
+/// the whole tree. Measured 2026-09-20: without this gate every pass re-indexed all 2,890 pages,
+/// ~1.15s of CPU per minute for zero changes. The debounced notify path handles live same-second
+/// edits; this loop is the safety net behind it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PageStamp {
+    mtime_nanos: i64,
+    size: u64,
+}
+
+fn page_stamp(metadata: &std::fs::Metadata) -> PageStamp {
+    use std::time::UNIX_EPOCH;
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    PageStamp {
+        mtime_nanos,
+        size: metadata.len(),
+    }
+}
+
+/// True when the page must be re-indexed: never seen, or its stamp changed.
+pub(crate) fn should_reindex(previous: Option<PageStamp>, current: PageStamp) -> bool {
+    previous != Some(current)
+}
+
+/// The gated reconciliation pass. The caller owns the stamp cache: the 30s loop keeps one
+/// across ticks (unchanged pages are skipped, not re-indexed); one-shot callers pass a fresh
+/// one, which preserves the index-everything-once semantics of the old shape.
+pub(crate) async fn reconcile_with_cache(
+    wiki: &Wiki,
+    cache: &mut HashMap<String, PageStamp>,
+) -> WikiResult<ReconcileStats> {
     let root = wiki.root().to_path_buf();
     // Walk all per-project subdirectories: <ws_uuid>/<proj_uuid>/
     let project_dirs = tokio::task::spawn_blocking(move || walk_project_dirs(&root))
         .await
         .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
 
-    let mut total = 0_usize;
+    let mut stats = ReconcileStats::default();
+    let mut seen: HashSet<String> = HashSet::new();
     for (ws, proj, proj_root) in project_dirs {
-        let pages = tokio::task::spawn_blocking(move || walk_markdown(&proj_root))
+        // The directory name parses as a valid UUID pair, but that does not
+        // mean the store knows the project. An orphan directory (e.g. a shell
+        // the OKF migration seeded an index.md into, or a leftover from older
+        // history) can never reconcile: every page in it fails scope
+        // resolution identically on every pass. Check the scope once per
+        // directory and skip the whole thing at debug, instead of warning per
+        // page indefinitely. If the row later appears (project recreated), the
+        // check passes and the directory indexes normally on the next pass.
+        if let Err(e) = wiki.ensure_project_workspace(ws, proj).await {
+            debug!(
+                workspace = %ws,
+                project = %proj,
+                error = %e,
+                "skipping reconcile for a project directory with no store row",
+            );
+            stats.skipped_orphans += 1;
+            continue;
+        }
+        let walk_root = proj_root.clone();
+        let pages = tokio::task::spawn_blocking(move || walk_markdown(&walk_root))
             .await
             .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
-        total += pages.len();
-        for path in pages {
-            if let Err(e) = wiki.reindex_page(ws, proj, path.clone()).await {
-                warn!(path = %path, error = %e, "reconcile reindex failed");
+        for page in pages {
+            let key = page.as_str().to_string();
+            seen.insert(key.clone());
+            let fs_path = proj_root.join(page.as_str());
+            let stamp = match std::fs::metadata(&fs_path) {
+                Ok(metadata) => page_stamp(&metadata),
+                Err(_) => {
+                    // Raced with a deletion; drop it so a re-add re-indexes.
+                    cache.remove(&key);
+                    continue;
+                }
+            };
+            if !should_reindex(cache.get(&key).copied(), stamp) {
+                stats.skipped_unchanged += 1;
+                continue;
+            }
+            if let Err(e) = wiki.reindex_page(ws, proj, page.clone()).await {
+                warn!(path = %fs_path.display(), error = %e, "reconcile reindex failed");
+            } else {
+                stats.indexed += 1;
+                cache.insert(key, stamp);
             }
         }
     }
-    info!(count = total, "reconciliation pass complete");
-    Ok(())
+    cache.retain(|key, _| seen.contains(key));
+    info!(
+        indexed = stats.indexed,
+        skipped_orphans = stats.skipped_orphans,
+        skipped_unchanged = stats.skipped_unchanged,
+        "reconciliation pass complete",
+    );
+    Ok(stats)
+}
+
+/// Compatibility wrapper for one-shot callers and tests: a fresh cache indexes everything once.
+#[allow(dead_code)] // exercised only by #[cfg(test)] callers, invisible to the lib build
+pub(crate) async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
+    let mut cache = HashMap::new();
+    reconcile_with_cache(wiki, &mut cache).await
 }
 
 /// Walk `<wiki_root>` and return all `(WorkspaceId, ProjectId, proj_root)` tuples
@@ -741,6 +863,94 @@ mod tests {
         handle.shutdown().await;
     }
 
+    /// #613: a project directory the store has no row for must be skipped
+    /// wholesale, not retried page-by-page on every pass. Regression: the OKF
+    /// migration seeded `index.md` into orphan directories, and the watcher
+    /// then logged a scope-resolution failure for each such file every 30s,
+    /// forever, burying real warnings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_skips_project_dirs_with_no_store_row() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        let wiki_root = tmp.path().join("wiki");
+
+        // A resolvable project (row created by setup) with a real page.
+        let valid_dir = wiki_root.join(ws.to_string()).join(proj.to_string());
+        std::fs::create_dir_all(&valid_dir).unwrap();
+        std::fs::write(valid_dir.join("kept.md"), "validtoken content\n").unwrap();
+
+        // An orphan directory: a well-formed UUID pair the store knows nothing
+        // about, shaped like a migration-seeded shell (an `index.md` plus a
+        // stale page). Nothing should index it, and it must not warn per page.
+        let orphan = ProjectId::new();
+        let orphan_dir = wiki_root.join(ws.to_string()).join(orphan.to_string());
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("index.md"), "seeded shell\n").unwrap();
+        std::fs::write(orphan_dir.join("stale.md"), "orphantoken content\n").unwrap();
+
+        let stats = reconcile(&wiki).await.unwrap();
+
+        assert_eq!(
+            stats.skipped_orphans, 1,
+            "the rowless directory must be skipped as an orphan"
+        );
+        assert!(
+            stats.indexed >= 1,
+            "the resolvable project's page must still index, got {}",
+            stats.indexed
+        );
+
+        let kept = store
+            .reader
+            .search_pages("validtoken".into(), 5)
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 1, "the valid project's page must be indexed");
+
+        let stranded = store
+            .reader
+            .search_pages("orphantoken".into(), 5)
+            .await
+            .unwrap();
+        assert!(
+            stranded.is_empty(),
+            "an orphan directory's page must not be indexed"
+        );
+    }
+
+    /// The sibling of `reconcile_skips_project_dirs_with_no_store_row` (#613):
+    /// a directory event reaches the indexer through `reindex_project_dir`,
+    /// which had no orphan guard. Rarer than the 30s pass, same defect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn directory_events_skip_project_dirs_with_no_store_row() {
+        let (tmp, store, wiki, ws, _proj) = setup().await;
+        let wiki_root = tmp.path().join("wiki");
+
+        let orphan = ProjectId::new();
+        let orphan_dir = wiki_root.join(ws.to_string()).join(orphan.to_string());
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("index.md"), "seeded shell\n").unwrap();
+        std::fs::write(orphan_dir.join("stale.md"), "eventtoken content\n").unwrap();
+
+        // Exactly what a Create/Modify event on the directory triggers.
+        let indexed = reindex_project_dir(&wiki, ws, orphan, orphan_dir).await;
+        assert!(
+            !indexed,
+            "a rowless directory must be skipped before the walk, not walked \
+             and failed page by page"
+        );
+
+        let stranded = store
+            .reader
+            .search_pages("eventtoken".into(), 5)
+            .await
+            .unwrap();
+        assert!(
+            stranded.is_empty(),
+            "a rowless directory must not index through a directory event, got {}",
+            stranded.len()
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ignores_own_atomic_tempfiles() {
         // Quick unit test: tempfile prefix detection.
@@ -998,5 +1208,62 @@ mod tests {
             .await
             .unwrap();
         assert!(hits.is_empty(), "direct symlink event must not be indexed");
+    }
+
+    #[test]
+    fn should_reindex_only_on_change() {
+        let a = PageStamp {
+            mtime_nanos: 1,
+            size: 10,
+        };
+        let b = PageStamp {
+            mtime_nanos: 2,
+            size: 10,
+        };
+        let c = PageStamp {
+            mtime_nanos: 1,
+            size: 11,
+        };
+        assert!(should_reindex(None, a), "a never-seen page must be indexed");
+        assert!(
+            !should_reindex(Some(a), a),
+            "an unchanged stamp must be skipped"
+        );
+        assert!(should_reindex(Some(a), b), "an mtime change must re-index");
+        assert!(should_reindex(Some(a), c), "a size change must re-index");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_with_cache_skips_unchanged_pages_and_reindexes_edits() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        let proj_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let target = proj_dir.join("gated.md");
+        std::fs::write(&target, "the gated revision\n").unwrap();
+
+        let mut cache = HashMap::new();
+        let first = reconcile_with_cache(&wiki, &mut cache).await.unwrap();
+        assert!(first.indexed >= 1, "a brand-new page must be indexed");
+
+        let second = reconcile_with_cache(&wiki, &mut cache).await.unwrap();
+        assert_eq!(
+            second.indexed, 0,
+            "an unchanged tree must index nothing on the next pass"
+        );
+        assert!(
+            second.skipped_unchanged >= 1,
+            "the skipped pages must be counted"
+        );
+
+        std::fs::write(&target, "the gated second revision, longer\n").unwrap();
+        let third = reconcile_with_cache(&wiki, &mut cache).await.unwrap();
+        assert_eq!(third.indexed, 1, "an edited page must be re-indexed");
+
+        let hits = store.reader.search_pages("gated".into(), 5).await.unwrap();
+        assert!(!hits.is_empty(), "the edited content must be searchable");
     }
 }

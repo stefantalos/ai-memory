@@ -1,4 +1,42 @@
-# Optional Auto-Improvement Loop Research
+# Auto-improvement
+
+## The 60-second version (read this first)
+
+When an LLM provider is configured, the server periodically reviews
+newly completed sessions and proposes small wiki edits — a new gotcha,
+a rule promotion, a patch to a stale concept page. Every proposal is
+validated (schema, confidence floor, size caps, eval gate) and staged
+into `_pending/auto-improve/` with a human-readable sidecar, then
+**auto-approved by default** through the normal wiki write path.
+
+What that means for you:
+
+- **Solo, zero-LLM install**: this never runs. Nothing to decide.
+- **Solo with an LLM**: the default is fine — proposals are small,
+  bounded, audited (every one lands in the pending-writes trail with
+  evidence quotes and a confidence score), and reversible via wiki
+  history. Run `ai-memory pending-writes list` for a week if you want to
+  build trust — that (and SQLite) is the source of truth for a proposal's
+  status. The `_pending/auto-improve/` sidecar files are a human-readable
+  snapshot frozen at staging time; they do not track a proposal to
+  approved/applied/rejected.
+- **Shared / team server**: set `[auto_improve] require_approval =
+  true`. On a server several people trust, an LLM should not
+  auto-apply edits nobody reviewed — proposals then wait in
+  `_pending/` until a human approves each one.
+- **Cost**: one bounded LLM call per completed session that passes the
+  preflight filters (minimum observations/duration); prompt and output
+  sizes are capped in `[auto_improve]`.
+
+A typical staged proposal sidecar looks like: the target path, the
+operation (create or patch), a confidence like `0.86`, the rationale,
+bounded evidence quotes from the session, and the exact body or edits
+— enough to approve or reject without opening anything else.
+
+The rest of this page is the original design research plus
+implementation notes, kept for depth.
+
+---
 
 > Status: research plus implemented production notes. The server schedules
 > auto-improvement for newly completed sessions in every project when an LLM provider is

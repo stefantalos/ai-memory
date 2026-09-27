@@ -7,8 +7,10 @@
 
 use std::sync::Arc;
 
-use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
+use ai_memory_core::{AgentKind, Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+};
 use ai_memory_store::{ReaderPool, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use thiserror::Error;
@@ -141,6 +143,7 @@ impl Consolidator {
         }
 
         let (ws, proj) = self.resolve_target(session_id).await?;
+        let agent_kind = self.resolve_agent_origin(session_id).await?;
         let path = PagePath::new(format!("sessions/{session_id}.md"))?;
 
         // Run the blocking admission chain BEFORE the LLM so a rejected
@@ -186,9 +189,13 @@ impl Consolidator {
             model = self.llm.model(),
             "consolidating session"
         );
-        let page: ConsolidatedPage = complete_structured(&*self.llm, request).await?;
+        let page: ConsolidatedPage = ai_memory_llm::with_caller(
+            "consolidate",
+            complete_structured_with_operation_id(&*self.llm, request, session_id.into()),
+        )
+        .await?;
 
-        let frontmatter = build_frontmatter(&page);
+        let frontmatter = build_frontmatter(&page, session_id, agent_kind);
         let id = self
             .wiki
             .write_page(WritePageRequest {
@@ -276,6 +283,16 @@ impl Consolidator {
             .session_project_ids(session_id)
             .await?
             .unwrap_or((self.workspace_id, self.project_id)))
+    }
+
+    /// Resolve the session's creating harness from the persisted session row.
+    /// This is deliberately independent of the actor or client performing the
+    /// consolidation: `agent` in page frontmatter means origin, not writer.
+    async fn resolve_agent_origin(&self, session_id: SessionId) -> ConsolidatorResult<AgentKind> {
+        self.reader
+            .session_agent_kind(session_id)
+            .await?
+            .ok_or(ConsolidatorError::SessionNotFound(session_id))
     }
 
     fn should_skip_high_resistance_slot_update(
@@ -426,6 +443,7 @@ impl Consolidator {
         // Resolve the target from where the observations landed — see
         // `resolve_target` / `consolidate_session` for the rationale.
         let (ws, proj) = self.resolve_target(session_id).await?;
+        let agent_kind = self.resolve_agent_origin(session_id).await?;
 
         // Preflight admission BEFORE the LLM (see `consolidate_session`). The
         // session page is the canonical episodic anchor, so it stands in for
@@ -468,8 +486,11 @@ impl Consolidator {
             provider = self.llm.name(),
             "consolidating session (multi-page)",
         );
-        let batch: ConsolidatedBatch =
-            ai_memory_llm::complete_structured(&*self.llm, request).await?;
+        let batch: ConsolidatedBatch = ai_memory_llm::with_caller(
+            "consolidate_multi",
+            complete_structured_with_operation_id(&*self.llm, request, session_id.into()),
+        )
+        .await?;
 
         // `dry_run` is always false past the early return above, so every
         // update here is a real write.
@@ -477,6 +498,9 @@ impl Consolidator {
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
             let (mut req, mut outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
+            if req.path == anchor {
+                stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
+            }
             // A slot the engine writes belongs to the operator whose session
             // produced it, and `build_update` keeps the model's path verbatim
             // for every non-Rule kind — so the path here is attacker-reachable
@@ -587,8 +611,22 @@ fn build_update(
     actor: &ai_memory_core::ActorContext,
     author_id: Option<ai_memory_core::UserId>,
 ) -> ConsolidatorResult<(WritePageRequest, ConsolidationOutcome)> {
+    // Never store an empty title: when a proposal omits one, fall back to
+    // the body's H1 (then the path stem), the same derivation the wiki
+    // write path uses — otherwise the page lands with `title: ""` in
+    // frontmatter, reads back titleless, and trips the duplicate-title
+    // lint (#599). `derive_title` returns the frontmatter title when
+    // present, so passing a null frontmatter here means "derive from the
+    // body/path".
+    let effective_title = if upd.title.trim().is_empty() {
+        let probe_path = PagePath::new(upd.path.clone())
+            .unwrap_or_else(|_| PagePath::new("notes/untitled.md").expect("static path is valid"));
+        ai_memory_wiki::derive_title(&serde_json::Value::Null, &upd.body_markdown, &probe_path)
+    } else {
+        upd.title.clone()
+    };
     let final_path = if upd.kind == crate::types::PageKind::Rule {
-        let slug = slugify_for_rule(&upd.title);
+        let slug = slugify_for_rule(&effective_title);
         format!("_rules/{slug}.md")
     } else {
         upd.path.clone()
@@ -597,7 +635,10 @@ fn build_update(
     let tier = upd.tier;
 
     let mut fm = serde_json::Map::new();
-    fm.insert("title".into(), serde_json::Value::String(upd.title.clone()));
+    fm.insert(
+        "title".into(),
+        serde_json::Value::String(effective_title.clone()),
+    );
     fm.insert(
         "tier".into(),
         serde_json::Value::String(tier_as_str(tier).into()),
@@ -609,6 +650,9 @@ fn build_update(
         "kind".into(),
         serde_json::Value::String(upd.kind.as_str().into()),
     );
+    if let Some(summary) = usable_summary(upd.summary.as_deref(), &effective_title) {
+        fm.insert("summary".into(), serde_json::Value::String(summary));
+    }
     if !upd.tags.is_empty() {
         fm.insert(
             "tags".into(),
@@ -650,7 +694,7 @@ fn build_update(
         body: upd.body_markdown.clone(),
         tier,
         pinned: false,
-        title: Some(upd.title.clone()),
+        title: Some(effective_title.clone()),
         admission_ctx: Some(AdmissionContext {
             op: AdmissionOp::Consolidate,
             actor: actor.clone(),
@@ -662,7 +706,7 @@ fn build_update(
     let outcome = ConsolidationOutcome {
         path,
         dry_run,
-        new_title: upd.title.clone(),
+        new_title: effective_title.clone(),
         new_body_markdown: upd.body_markdown.clone(),
         page_id: None,
         tags: upd.tags.clone(),
@@ -847,7 +891,8 @@ fn build_batch_request_with_slots(
          - \"tags\"            (array of string)  required — may be empty `[]`, but the key must be present\n\
          - \"entities\"        (array of string)  required — may be empty `[]`, but the key must be present; see below\n\
          - \"slot_kind\"       (string) optional — ONLY for `_slots/*`; one of \"state\" or \"invariant\"; this is the SLOT WRITE REGIME, NOT a tier value\n\
-         No other keys except optional `slot_kind` on `_slots/*`. No `body`, no `content`, no `summary`. Field names \
+         - \"summary\"         (string) optional — ONE line of plain prose saying what the page covers, shown beside the title in listings. NOT a heading, NOT a `- **key:** value` bullet, NOT a list item, NOT a repeat of the title: a summary shaped like any of those is discarded and the page ends up described worse than if you had omitted it. Omit the key rather than guessing.\n\
+         No other keys except optional `slot_kind` on `_slots/*` and optional `summary`. No `body`, no `content`. Field names \
          are case-sensitive and the `_markdown` suffix matters.\n\
          \n## `entities` field — the specific nouns the page is about\n\
          Up to 10 short names (max 64 chars each), lowercase, taken from \
@@ -892,14 +937,16 @@ fn build_batch_request_with_slots(
     let projected = project_observations(
         observations,
         &ObservationProjectionConfig::new(
-            observation_chars,
+            observation_chars.saturating_sub(ai_memory_llm::CHUNKABLE_MARKER_CHARS),
             MAX_PROJECTED_OBSERVATIONS,
             MAX_PROJECTED_OBSERVATION_BODY_CHARS,
         )
         .with_context_label("batch consolidation"),
     );
     let mut buf = prefix;
-    buf.push_str(&projected.text);
+    // The observation log is the part a small-budget lane may read in
+    // pieces (the Laguna contract map-reduces it above 12k tokens).
+    buf.push_str(&ai_memory_llm::mark_chunkable(&projected.text));
     buf.push_str(&suffix);
 
     ChatRequest {
@@ -969,14 +1016,16 @@ fn build_request(
     let projected = project_observations(
         observations,
         &ObservationProjectionConfig::new(
-            observation_chars,
+            observation_chars.saturating_sub(ai_memory_llm::CHUNKABLE_MARKER_CHARS),
             MAX_PROJECTED_OBSERVATIONS,
             MAX_PROJECTED_OBSERVATION_BODY_CHARS,
         )
         .with_context_label("single-page consolidation"),
     );
     let mut buf = prefix;
-    buf.push_str(&projected.text);
+    // The observation log is the part a small-budget lane may read in
+    // pieces (the Laguna contract map-reduces it above 12k tokens).
+    buf.push_str(&ai_memory_llm::mark_chunkable(&projected.text));
     buf.push_str(&suffix);
 
     ChatRequest {
@@ -1183,13 +1232,52 @@ fn clip_current_body_for_prompt(s: &str, max_chars: usize) -> String {
     out
 }
 
-fn build_frontmatter(page: &ConsolidatedPage) -> serde_json::Value {
+/// Accept a model-supplied `summary` only when the reader can actually use it.
+///
+/// The store prefers `summary` over the page body and then runs it through the
+/// same line filter it applies to a body: headings, `- **key:** value`
+/// metadata bullets, other list markers, and lines repeating the title are all
+/// dropped, and when nothing survives the filter echoes its raw input. So a
+/// structurally wrong summary is not ignored — it is reproduced verbatim as
+/// the descriptor, in place of the body text that would otherwise have been
+/// used, and nothing reports an error.
+///
+/// A JSON schema cannot express that constraint, and this value is
+/// model-controlled, so it is enforced here: anything the reader would discard
+/// is dropped at the boundary and the page keeps its body-derived descriptor.
+fn usable_summary(raw: Option<&str>, title: &str) -> Option<String> {
+    let text = raw?.trim();
+    if text.is_empty() || text.contains('\n') {
+        return None;
+    }
+    if text.starts_with('#')
+        || text.starts_with("---")
+        || text.starts_with("___")
+        || text.starts_with("***")
+        || text.starts_with("- ")
+        || text.starts_with("* ")
+        || text.starts_with("+ ")
+    {
+        return None;
+    }
+    if text == title.trim() {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+fn build_frontmatter(
+    page: &ConsolidatedPage,
+    session_id: SessionId,
+    agent_kind: AgentKind,
+) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     map.insert(
         "title".into(),
         serde_json::Value::String(page.title.clone()),
     );
     map.insert("tier".into(), serde_json::Value::String("episodic".into()));
+    stamp_session_origin_map(&mut map, session_id, agent_kind);
     if !page.tags.is_empty() {
         let tags = page
             .tags
@@ -1198,8 +1286,57 @@ fn build_frontmatter(page: &ConsolidatedPage) -> serde_json::Value {
             .collect();
         map.insert("tags".into(), serde_json::Value::Array(tags));
     }
+    if let Some(summary) = usable_summary(page.summary.as_deref(), &page.title) {
+        map.insert("summary".into(), serde_json::Value::String(summary));
+    }
+    // Typed edges (2.0 item 3): only vocabulary keys survive — an LLM
+    // inventing `blames:` must not mint a new edge kind. The wiki write
+    // boundary parses this frontmatter into typed links.
+    let relations: serde_json::Map<String, serde_json::Value> = page
+        .relations
+        .non_empty()
+        .map(|(relation, targets)| {
+            (
+                relation.as_str().to_string(),
+                serde_json::Value::Array(
+                    targets
+                        .iter()
+                        .map(|t| serde_json::Value::String(t.clone()))
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
+    if !relations.is_empty() {
+        map.insert("relations".into(), serde_json::Value::Object(relations));
+    }
     map.insert("consolidated".into(), serde_json::Value::Bool(true));
     serde_json::Value::Object(map)
+}
+
+fn stamp_session_origin(
+    frontmatter: &mut serde_json::Value,
+    session_id: SessionId,
+    agent_kind: AgentKind,
+) {
+    if let Some(map) = frontmatter.as_object_mut() {
+        stamp_session_origin_map(map, session_id, agent_kind);
+    }
+}
+
+fn stamp_session_origin_map(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    session_id: SessionId,
+    agent_kind: AgentKind,
+) {
+    map.insert(
+        "session_id".into(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    map.insert(
+        "agent".into(),
+        serde_json::Value::String(agent_kind.as_str().into()),
+    );
 }
 
 fn one_line(s: &str) -> String {
@@ -1275,6 +1412,7 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.m
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Relations;
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
 
@@ -1582,6 +1720,171 @@ mod tests {
         assert!(!slug.ends_with('-'));
     }
 
+    fn update_with_summary(summary: Option<&str>) -> crate::types::ConsolidatedPageUpdate {
+        crate::types::ConsolidatedPageUpdate {
+            path: "concepts/queue.md".into(),
+            tier: Tier::Semantic,
+            kind: crate::types::PageKind::Fact,
+            title: "Bound the scheduler queue".into(),
+            body_markdown: "Body prose.".into(),
+            summary: summary.map(str::to_owned),
+            tags: Vec::new(),
+            slot_kind: SlotKind::State,
+            entities: Vec::new(),
+        }
+    }
+
+    fn frontmatter_for(summary: Option<&str>) -> serde_json::Value {
+        let (req, _) = build_update(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            &update_with_summary(summary),
+            true,
+            &ai_memory_core::ActorContext::default(),
+            None,
+        )
+        .expect("build_update");
+        req.frontmatter
+    }
+
+    #[test]
+    fn a_usable_summary_reaches_the_frontmatter_trimmed() {
+        let fm = frontmatter_for(Some("  Bounded the queue so backpressure is testable.  "));
+        assert_eq!(
+            fm["summary"],
+            "Bounded the queue so backpressure is testable."
+        );
+    }
+
+    #[test]
+    fn summaries_the_reader_would_discard_are_not_written() {
+        // Each of these is legal JSON and legal per the schema, and each one
+        // would be echoed verbatim as the descriptor — replacing the page's
+        // body-derived one — because the reader's filter drops every line and
+        // then falls back to its raw input. Dropping them here keeps the page
+        // on the body text instead.
+        for bad in [
+            "",
+            "   ",
+            "- **session_id:** `9f2c`",
+            "## What this page covers",
+            "- bounded the queue",
+            "* bounded the queue",
+            "first line\nsecond line",
+            "Bound the scheduler queue", // identical to the title
+        ] {
+            assert!(
+                frontmatter_for(Some(bad)).get("summary").is_none(),
+                "should not have been written: {bad:?}"
+            );
+        }
+        assert!(frontmatter_for(None).get("summary").is_none());
+    }
+
+    #[test]
+    fn the_single_page_builder_surfaces_a_summary_too() {
+        // `consolidate_session` — the default path, and the one the serve
+        // worker uses — goes through `ConsolidatedPage`, not the batch type.
+        let page = ConsolidatedPage {
+            title: "Bound the scheduler queue".into(),
+            body_markdown: "Body prose.".into(),
+            tags: Vec::new(),
+            summary: Some("Bounded the queue so backpressure is testable.".into()),
+            relations: Relations::default(),
+        };
+        let session_id = SessionId::new();
+        let frontmatter = build_frontmatter(&page, session_id, AgentKind::Codex);
+        assert_eq!(
+            frontmatter["summary"],
+            "Bounded the queue so backpressure is testable."
+        );
+        assert_eq!(frontmatter["session_id"], session_id.to_string());
+        assert_eq!(frontmatter["agent"], "codex");
+
+        let unusable = ConsolidatedPage {
+            summary: Some("- **session_id:** `9f2c`".into()),
+            ..page
+        };
+        assert!(
+            build_frontmatter(&unusable, SessionId::new(), AgentKind::Codex)
+                .get("summary")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn both_prompts_ask_for_the_summary_and_describe_its_shape() {
+        // The batch prompt used to say "no `summary`" outright; a model
+        // obeying that never supplies the field, and the whole write path is
+        // dead code. Assert both prompts request it, so that cannot regress
+        // back into silence.
+        for prompt in [BATCH_SYSTEM_PROMPT, SYSTEM_PROMPT] {
+            assert!(prompt.contains("summary"), "prompt must request `summary`");
+            assert!(
+                !prompt.contains("no `summary`"),
+                "prompt must not forbid `summary`"
+            );
+        }
+        assert!(SYSTEM_PROMPT.contains("ONE line of plain prose"));
+    }
+
+    /// Only non-empty, closed-vocabulary edges reach `relations:` frontmatter.
+    /// The vocabulary is now enforced by the `Relations` type (#630) — there is
+    /// no field for an invented `blames:`, so a bogus edge kind is unrepresentable
+    /// rather than filtered — and an empty kind is omitted.
+    #[test]
+    fn relations_frontmatter_keeps_only_non_empty_vocabulary() {
+        let page = ConsolidatedPage {
+            title: "T".into(),
+            body_markdown: "b".into(),
+            tags: vec![],
+            summary: None,
+            relations: Relations {
+                fixes: vec!["gotchas/g.md".into()],
+                causes: vec![], // empty -> omitted
+                contradicts: vec![],
+            },
+        };
+        let fm = build_frontmatter(&page, SessionId::new(), AgentKind::ClaudeCode);
+        let relations = fm["relations"].as_object().unwrap();
+        assert_eq!(relations.len(), 1, "{relations:?}");
+        assert_eq!(relations["fixes"][0], "gotchas/g.md");
+    }
+
+    /// #630: the `relations` schema must be a FIXED object with named fields,
+    /// not an open `additionalProperties` map — otherwise OpenAI strict mode
+    /// closes it and the model can never emit an edge on any OpenAI-family
+    /// provider. Pin the shape so a revert to `BTreeMap` fails here.
+    #[test]
+    fn relations_schema_is_a_fixed_object_not_an_open_map() {
+        let schema = serde_json::to_value(schemars::schema_for!(Relations)).unwrap();
+        let props = schema["properties"]
+            .as_object()
+            .expect("relations must be a fixed object with named properties, not an open map");
+        assert!(props.contains_key("causes"));
+        assert!(props.contains_key("fixes"));
+        assert!(props.contains_key("contradicts"));
+        // An open map renders `additionalProperties` as a *schema object*; a
+        // fixed struct renders it as absent or `false`. It must not be a schema.
+        assert!(
+            !schema["additionalProperties"].is_object(),
+            "relations must not carry a schema-valued additionalProperties (open map)"
+        );
+    }
+
+    #[test]
+    fn pages_without_relations_omit_the_key() {
+        let page = ConsolidatedPage {
+            title: "T".into(),
+            body_markdown: "b".into(),
+            tags: vec![],
+            summary: None,
+            relations: Relations::default(),
+        };
+        let fm = build_frontmatter(&page, SessionId::new(), AgentKind::ClaudeCode);
+        assert!(fm.get("relations").is_none());
+    }
+
     #[test]
     fn slot_update_defaults_to_state_frontmatter() {
         let update = crate::types::ConsolidatedPageUpdate {
@@ -1590,6 +1893,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "Current focus".into(),
             body_markdown: "Ship the slot-kind PR.".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
             entities: Vec::new(),
@@ -1614,6 +1918,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "X".into(),
             body_markdown: "body".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
             entities: Vec::new(),
@@ -1644,6 +1949,38 @@ mod tests {
     }
 
     #[test]
+    fn build_update_derives_title_from_h1_when_proposal_title_is_empty() {
+        // A proposal with no title must not store `title: ""` — it derives
+        // from the body's H1, matching the wiki write path (#599).
+        let update = crate::types::ConsolidatedPageUpdate {
+            path: "concepts/thing.md".into(),
+            tier: Tier::Semantic,
+            kind: crate::types::PageKind::Fact,
+            title: "   ".into(), // blank
+            body_markdown: "# The Real Title\n\nbody text".into(),
+            summary: None,
+            tags: Vec::new(),
+            slot_kind: SlotKind::State,
+            entities: Vec::new(),
+        };
+        let (req, outcome) = build_update(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            &update,
+            false,
+            &ai_memory_core::ActorContext::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            req.frontmatter["title"], "The Real Title",
+            "empty proposal title must derive from the body H1, not persist as \"\""
+        );
+        assert_eq!(req.title.as_deref(), Some("The Real Title"));
+        assert_eq!(outcome.new_title, "The Real Title");
+    }
+
+    #[test]
     fn build_update_persists_only_normalized_bounded_entities() {
         let update = crate::types::ConsolidatedPageUpdate {
             path: "notes/entities.md".into(),
@@ -1651,6 +1988,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "Entities".into(),
             body_markdown: "body".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
             entities: vec![
@@ -1686,6 +2024,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "Project context".into(),
             body_markdown: "This repo uses a markdown wiki as source of truth.".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::Invariant,
             entities: Vec::new(),
@@ -2007,6 +2346,103 @@ mod tests {
         seed_session(store.db_path(), session, ws, proj);
         let wiki = Wiki::new(tmp, store.writer.clone()).unwrap();
         (store, wiki, session, ws, proj)
+    }
+
+    /// Attribution follows the persisted session, not the operator or client
+    /// that happens to request consolidation. Re-running the write supersedes
+    /// the page with the same immutable origin.
+    #[tokio::test]
+    async fn single_page_consolidation_stamps_and_preserves_session_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let response = serde_json::json!({
+            "title": "Queue decision",
+            "body_markdown": "The queue is bounded.",
+            "tags": [],
+        });
+        let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+
+        for actor in [actor_named("alice"), actor_named("bob")] {
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(ScriptedLlm(response.clone())),
+                ws,
+                proj,
+            )
+            .consolidate_session(session, false, actor, None, None)
+            .await
+            .unwrap();
+
+            let stored = wiki.read_page(ws, proj, &path).unwrap();
+            assert_eq!(stored.frontmatter["session_id"], session.to_string());
+            assert_eq!(
+                stored.frontmatter["agent"], "claude-code",
+                "origin comes from sessions.agent_kind, never the requesting actor"
+            );
+        }
+    }
+
+    /// The multi-page provider path uses the same provenance contract for its
+    /// canonical session anchor, while non-session pages remain outside item 1
+    /// of #494.
+    #[tokio::test]
+    async fn batch_consolidation_stamps_only_the_session_anchor_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let session_path = format!("sessions/{session}.md");
+        let response = serde_json::json!({
+            "rationale": "test provenance",
+            "updates": [
+                {
+                    "path": session_path,
+                    "tier": "episodic",
+                    "kind": "fact",
+                    "title": "Session narrative",
+                    "body_markdown": "Session body.",
+                    "tags": []
+                },
+                {
+                    "path": "concepts/queue.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Queue",
+                    "body_markdown": "Concept body.",
+                    "tags": []
+                }
+            ]
+        });
+
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let session_page = wiki
+            .read_page(ws, proj, &PagePath::new(session_path).unwrap())
+            .unwrap();
+        assert_eq!(session_page.frontmatter["session_id"], session.to_string());
+        assert_eq!(session_page.frontmatter["agent"], "claude-code");
+
+        let concept = wiki
+            .read_page(ws, proj, &PagePath::new("concepts/queue.md").unwrap())
+            .unwrap();
+        assert!(concept.frontmatter.get("agent").is_none());
+        assert!(concept.frontmatter.get("session_id").is_none());
     }
 
     /// A batch whose single update targets `path` — the model chooses this

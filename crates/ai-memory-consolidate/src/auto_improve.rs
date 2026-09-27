@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role};
 use ai_memory_store::{AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoredPageBody};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de};
@@ -46,7 +46,11 @@ pub const DEFAULT_AUTO_IMPROVE_MAX_FINAL_BODY_CHARS: usize = MAX_PROPOSAL_BODY_C
 pub const DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS: usize = 2_000;
 /// Default approximate token budget for one procedure page.
 pub const DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS: usize = 2_000;
-const DEFAULT_REVIEW_MAX_TOKENS: u32 = 16_000;
+/// Default output-token budget for one review call (operator decision
+/// 2026-09-24: raise Gemini's limit). Was a fixed 16,000; Poolside clamps it
+/// to its own 14,000 ceiling, Gemini 2.5 Flash's documented output limit is
+/// 65,536 (<https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash>).
+pub const DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS: u32 = 32_768;
 const MAX_SESSION_PAGE_CHARS: usize = 32_000;
 const SAMPLE_LIMIT_WITH_SESSION_PAGE: usize = 48;
 const SAMPLE_LIMIT_WITHOUT_SESSION_PAGE: usize = 72;
@@ -57,7 +61,7 @@ const SAMPLE_LIMIT_WITHOUT_SESSION_PAGE: usize = 72;
 // this window to influence the reviewer.
 const MAX_OBSERVATION_BODY_CHARS: usize = 1_500;
 const PROMPT_SCAFFOLD_RESERVE_CHARS: usize = 4_000;
-const MAX_REJECTION_CONTEXT_CHARS: usize = 12_000;
+pub(crate) const MAX_REJECTION_CONTEXT_CHARS: usize = 12_000;
 const MAX_REJECTION_PATH_CHARS: usize = 256;
 const MAX_REJECTION_REASON_CHARS: usize = 512;
 const MAX_REJECTION_FINGERPRINT_CHARS: usize = 128;
@@ -156,6 +160,9 @@ pub struct AutoImproveReviewConfig {
     pub max_procedure_page_tokens: usize,
     /// Optional executable eval gate settings.
     pub eval: AutoImproveEvalConfig,
+    /// Output-token budget for the review call. Providers clamp it to their
+    /// own ceiling (Poolside 14,000; Gemini 2.5 Flash accepts up to 65,536).
+    pub review_max_output_tokens: u32,
 }
 
 impl Default for AutoImproveReviewConfig {
@@ -181,6 +188,7 @@ impl Default for AutoImproveReviewConfig {
             max_rule_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS,
             max_procedure_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
             eval: AutoImproveEvalConfig::default(),
+            review_max_output_tokens: DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS,
         }
     }
 }
@@ -279,6 +287,9 @@ pub struct AutoImproveProposal {
     pub title: String,
     /// Semantic kind: gotcha, decision, concept, procedure, rule, fact, note, or slot.
     #[serde(default)]
+    #[schemars(extend(
+        "enum" = ["gotcha", "decision", "concept", "procedure", "rule", "fact", "note", "slot"]
+    ))]
     pub kind: String,
     /// Model confidence from 0.0 to 1.0.
     #[serde(default)]
@@ -294,6 +305,7 @@ pub struct AutoImproveProposal {
     pub body_markdown: String,
     /// `full_page` (default) or `patch`.
     #[serde(default = "default_edit_mode")]
+    #[schemars(extend("enum" = ["full_page", "patch"]))]
     pub edit_mode: String,
     /// Patch edits for existing _rules/ or procedures/ pages.
     #[serde(default)]
@@ -381,16 +393,24 @@ pub struct AutoImproveRejectedCandidate {
 
 /// Structured response requested from the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+///
+/// Field ORDER is load-bearing: the schema, the prompt's field contract and
+/// Gemini's pinned `propertyOrdering` all follow it. The payload comes first
+/// and the free-text `summary` last — measured 2026-09-24, Gemini wrote a
+/// leading `summary` into a 65 KB repetition loop and never reached
+/// `proposals`. With `summary` last, a runaway tail costs only the summary,
+/// and [`salvage_truncated_response`] recovers the complete proposals.
 pub struct AutoImproveLlmResponse {
-    /// Short summary of the review.
-    #[serde(default)]
-    pub summary: String,
     /// Candidate edits.
     #[serde(default)]
     pub proposals: Vec<AutoImproveProposal>,
     /// Candidates the model chose not to promote.
     #[serde(default)]
     pub rejected_candidates: Vec<AutoImproveRejectedCandidate>,
+    /// One or two sentences summarising the review, written last. Never
+    /// restate the proposals here.
+    #[serde(default)]
+    pub summary: String,
 }
 
 /// Report returned by the reviewer.
@@ -505,17 +525,79 @@ pub async fn run_auto_improve_review(
         ExistingPageIndex::from_pages(&briefing.recent_pages, &prompt_patchable_pages);
     let estimated_input_tokens = estimate_tokens(&prompt_input.prompt);
     let request = ChatRequest {
-        system: Some(AUTO_IMPROVE_SYSTEM_PROMPT.to_string()),
+        system: Some(auto_improve_system_prompt()),
         messages: vec![ChatMessage {
             role: Role::User,
             content: prompt_input.prompt,
         }],
-        max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
+        max_tokens: cfg.review_max_output_tokens,
         temperature: Some(0.1),
     };
-    let raw: AutoImproveLlmResponse = complete_structured(llm, request).await?;
+    let response_schema = serde_json::to_value(schemars::schema_for!(AutoImproveLlmResponse))
+        .map_err(LlmError::from)?;
+    // A fallback-wrapped provider may answer from its secondary lane; record
+    // the lane that actually answered, not the configured one (FN8-8120).
+    let (raw_result, responder) = ai_memory_llm::capture_responder(ai_memory_llm::with_caller(
+        "auto_improve",
+        llm.complete_structured_raw_with_operation_id(request, response_schema, session_id.into()),
+    ))
+    .await;
+    let (answered_provider, answered_model) = match responder {
+        Some(r) => (r.provider.to_string(), r.model),
+        None => (llm.name().to_string(), llm.model().to_string()),
+    };
+    let mut parse_warnings = Vec::new();
+    let raw = match raw_result {
+        Ok(value) => parse_llm_response(&value, &mut parse_warnings),
+        Err(LlmError::Truncated {
+            finish_reason,
+            partial: Some(ai_memory_llm::PartialText(text)),
+        }) if salvage_truncated_response(&text).is_some() => {
+            // The cut landed after at least one complete proposal: keep
+            // those, run them through the normal validation, and say so.
+            let salvaged = salvage_truncated_response(&text).unwrap_or_default();
+            let recovered = salvaged["proposals"].as_array().map_or(0, Vec::len);
+            parse_warnings.push(format!(
+                "llm response truncated (finish_reason={finish_reason}); {recovered} complete \
+                 proposal(s) recovered from the valid prefix"
+            ));
+            parse_llm_response(&salvaged, &mut parse_warnings)
+        }
+        Err(LlmError::Truncated { finish_reason, .. }) => {
+            // #FN8-8120: previously this same truncation surfaced as a
+            // generic Serde parse error, propagated via `?`, and the whole
+            // run vanished — no DB row, only a `tracing::warn!` (see
+            // `auto_improve_schedule.rs`'s `Err(e) => outcome.errors += 1`).
+            // Returning `Ok` here with the truncation named in `warnings`
+            // is what makes `warnings_json` say "truncated" instead of the
+            // run being invisible. This does not change scheduler retry
+            // behaviour either way: `claim_auto_improve_scheduler_session`
+            // claims the session BEFORE calling this function and is never
+            // released on error, so the session was already never retried
+            // on failure.
+            return Ok(AutoImproveReport {
+                session_id: session_id.to_string(),
+                observations_considered: observations.len(),
+                session_duration_secs: duration,
+                estimated_input_tokens,
+                provider: answered_provider,
+                model: answered_model,
+                min_confidence: cfg.min_confidence,
+                proposal_actor: cfg.proposal_actor,
+                pending_path: cfg.pending_path,
+                summary: "review truncated by provider output limit; no proposals produced".into(),
+                proposals: Vec::new(),
+                rejected_candidates: Vec::new(),
+                warnings: vec![format!(
+                    "llm response truncated (finish_reason={finish_reason}); 0 proposals recovered"
+                )],
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
     let (mut proposals, mut rejected_candidates, mut warnings) =
         validate_response(raw, &cfg, &existing_index);
+    warnings.extend(parse_warnings);
     rejected_candidates.extend(prompt_input.rejected_candidates);
     warnings.extend(prompt_input.warnings);
     apply_eval_gate(
@@ -534,8 +616,8 @@ pub async fn run_auto_improve_review(
         observations_considered: observations.len(),
         session_duration_secs: duration,
         estimated_input_tokens,
-        provider: llm.name().to_string(),
-        model: llm.model().to_string(),
+        provider: answered_provider,
+        model: answered_model,
         min_confidence: cfg.min_confidence,
         proposal_actor: cfg.proposal_actor,
         pending_path: cfg.pending_path,
@@ -565,6 +647,10 @@ struct AutoImproveEvalRequest<'a> {
     before_body: &'a str,
     after_body: &'a str,
     expected_base_body_sha256: Option<&'a str>,
+    /// The quotes the proposal rests on, so an external judge can check the page's claims against
+    /// them (measured 2026-09-23: a form-only judge approved 37 of 40 pages with one falsified
+    /// fact; truth needs the evidence). Additive field; judges that ignore it are unaffected.
+    evidence: &'a [AutoImproveEvidence],
 }
 
 #[derive(Debug, Deserialize)]
@@ -576,7 +662,7 @@ struct AutoImproveEvalResponse {
     reason: Option<String>,
 }
 
-async fn apply_eval_gate(
+pub(crate) async fn apply_eval_gate(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -694,6 +780,7 @@ async fn run_eval_for_proposal(
         before_body,
         after_body: &proposal.body_markdown,
         expected_base_body_sha256: proposal.expected_base_body_sha256.as_deref(),
+        evidence: &proposal.evidence,
     };
     let stdin = serde_json::to_vec(&input).map_err(|e| EvalRunError::Error(e.to_string()))?;
     let mut child = tokio::process::Command::new(program)
@@ -853,29 +940,29 @@ fn eval_rejection(
     }
 }
 
-struct PromptInput {
-    prompt: String,
-    patchable_paths: BTreeSet<String>,
-    rejected_candidates: Vec<AutoImproveRejectedCandidate>,
-    warnings: Vec<String>,
+pub(crate) struct PromptInput {
+    pub(crate) prompt: String,
+    pub(crate) patchable_paths: BTreeSet<String>,
+    pub(crate) rejected_candidates: Vec<AutoImproveRejectedCandidate>,
+    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Debug, Default)]
-struct RenderedPatchablePages {
-    text: String,
-    included_paths: BTreeSet<String>,
+pub(crate) struct RenderedPatchablePages {
+    pub(crate) text: String,
+    pub(crate) included_paths: BTreeSet<String>,
 }
 
 #[derive(Debug, Default)]
-struct ExistingPageIndex {
+pub(crate) struct ExistingPageIndex {
     paths: BTreeSet<String>,
     titles: BTreeSet<String>,
     patchable: BTreeMap<String, PatchablePageContext>,
 }
 
 #[derive(Debug, Clone)]
-struct PatchablePageContext {
-    path: String,
+pub(crate) struct PatchablePageContext {
+    pub(crate) path: String,
     title: String,
     kind: String,
     body: String,
@@ -893,7 +980,10 @@ struct MarkdownSection {
 }
 
 impl ExistingPageIndex {
-    fn from_pages(pages: &[BriefingPage], patchable_pages: &[PatchablePageContext]) -> Self {
+    pub(crate) fn from_pages(
+        pages: &[BriefingPage],
+        patchable_pages: &[PatchablePageContext],
+    ) -> Self {
         Self {
             paths: pages.iter().map(|page| page.path.clone()).collect(),
             titles: pages
@@ -930,7 +1020,7 @@ fn normalize_title(title: &str) -> String {
         .to_lowercase()
 }
 
-async fn load_patchable_pages(
+pub(crate) async fn load_patchable_pages(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -961,7 +1051,7 @@ async fn load_patchable_pages(
     Ok(out)
 }
 
-async fn load_rejection_context(
+pub(crate) async fn load_rejection_context(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -1034,14 +1124,15 @@ fn build_prompt_input(
     let projected_observations = project_observations(
         observations,
         &ObservationProjectionConfig::new(
-            observation_budget,
+            observation_budget.saturating_sub(ai_memory_llm::CHUNKABLE_MARKER_CHARS),
             selected_limit,
             MAX_OBSERVATION_BODY_CHARS,
         )
         .with_context_label("auto-improve"),
     );
     warnings.extend(projected_observations.warnings.iter().cloned());
-    let rendered_observations = projected_observations.text;
+    // Marked so a small-budget lane may map-reduce it (Laguna contract).
+    let rendered_observations = ai_memory_llm::mark_chunkable(&projected_observations.text);
     let selected_count = projected_observations.selected_count;
     let patchable_text = &patchable.text;
 
@@ -1100,7 +1191,7 @@ fn rejection_context_char_budget(usable_chars: usize) -> usize {
     (usable_chars / 8).min(MAX_REJECTION_CONTEXT_CHARS)
 }
 
-fn render_rejection_context(
+pub(crate) fn render_rejection_context(
     rejections: &[AutoImproveRejectionSummary],
     max_total_chars: usize,
 ) -> String {
@@ -1187,7 +1278,7 @@ fn render_session_page(
     )
 }
 
-fn render_recent_pages(pages: &[BriefingPage]) -> String {
+pub(crate) fn render_recent_pages(pages: &[BriefingPage]) -> String {
     if pages.is_empty() {
         return "(none)".into();
     }
@@ -1201,7 +1292,7 @@ fn render_recent_pages(pages: &[BriefingPage]) -> String {
     out
 }
 
-fn render_patchable_pages(
+pub(crate) fn render_patchable_pages(
     pages: &[PatchablePageContext],
     max_body_chars: usize,
     max_total_chars: usize,
@@ -1397,7 +1488,7 @@ fn preflight_rejection(
     None
 }
 
-fn validate_response(
+pub(crate) fn validate_response(
     raw: AutoImproveLlmResponse,
     cfg: &AutoImproveReviewConfig,
     existing_index: &ExistingPageIndex,
@@ -1491,9 +1582,20 @@ fn normalize_kind(proposal: &mut AutoImproveProposal, warnings: &mut Vec<String>
     let alias = canonical_kind_alias(&original);
     if !alias.is_empty() && kind_matches_path(&alias, &proposal.path) {
         proposal.kind = alias;
-    } else if original.trim().is_empty()
+    } else if alias.is_empty()
         && let Some(kind) = canonical_kind_for_path(&proposal.path)
     {
+        // `alias.is_empty()` (not `original.trim().is_empty()`, #FN8-8120):
+        // a non-empty but UNRECOGNIZED kind — most commonly an `edit_mode`
+        // value ("full_page", "patch") landing in the `kind` field, the
+        // dominant real-world Laguna failure mode (4 of 5 failed production
+        // runs, 2026-09-19..22) — is treated the same as an empty kind and
+        // derived from the path, rather than left to fail validation as
+        // `kind_path_mismatch`. A kind that IS recognized but genuinely
+        // disagrees with the path (e.g. "gotcha" on a decisions/ page) is
+        // deliberately left alone: that mismatch is real signal, not a
+        // field-name mixup, and `validate_full_page_proposal` still rejects
+        // it as `kind_path_mismatch`.
         proposal.kind = kind.into();
     }
 
@@ -1539,6 +1641,250 @@ fn canonical_kind_for_path(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Keys whose ABSENCE from a raw proposal object is treated as
+/// `schema_not_honoured` rather than let flow into `validate_proposal`,
+/// where it would surface as one of `invalid_path`,
+/// `confidence_below_threshold`, `missing_rationale`, `missing_evidence`,
+/// or `empty_body` — technically correct (an absent key defaults to `""`
+/// / `0.0` / `[]`) but misleading: it reads as "the model tried and this
+/// field was thin", not "the model did not use our schema at all".
+///
+/// `body_markdown` is handled separately (aliases + patch-mode exemption,
+/// see [`proposal_has_body_markdown`]). `operation` and `edit_mode` are
+/// deliberately EXCLUDED: both have a `#[serde(default = ...)]` that is
+/// already the single correct value (`"create_or_update"`,
+/// `"full_page"`), so a missing key there is not a defect. `kind` is also
+/// excluded: `normalize_kind` already recovers it from `path` (including,
+/// as of this same change, a non-canonical value). `title` is cosmetic.
+/// A missing key in any of those four produces a warning, not a rejection.
+const REQUIRED_PROPOSAL_KEYS: &[&str] = &["path", "confidence", "rationale", "evidence"];
+
+/// `body_markdown`'s serde aliases (`#[serde(alias = ...)]` on the field) —
+/// any one of these counts as "body_markdown present".
+const BODY_MARKDOWN_ALIASES: &[&str] = &["body_markdown", "body", "markdown", "content"];
+
+/// Keys whose absence gets a warning (the field silently takes its
+/// existing, already-correct recovery — a serde default or
+/// `normalize_kind`'s path derivation) rather than a rejection.
+const SOFT_DEFAULT_PROPOSAL_KEYS: &[&str] = &["operation", "edit_mode", "kind", "title"];
+
+fn proposal_has_body_markdown(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    BODY_MARKDOWN_ALIASES.iter().any(|k| obj.contains_key(*k))
+}
+
+/// Parse the raw LLM response into [`AutoImproveLlmResponse`], isolating
+/// each proposal so one malformed item cannot discard proposals that
+/// parsed fine (#FN8-8120: a single bad `evidence` field — a bare string
+/// where an array was required — previously poisoned the entire
+/// `serde_json::from_value::<AutoImproveLlmResponse>` call, losing every
+/// proposal in that response, not just the bad one; measured in production
+/// logs 2026-09-22 01:41).
+///
+/// Also flags (via `warnings`) evidence items the lenient
+/// [`AutoImproveEvidence`] deserializer would silently coerce into
+/// `page:"unspecified"` — measured in BOTH of Laguna's "successful"
+/// production runs (6/6 staged evidence entries had `page:"unspecified"`,
+/// meaning the model never emitted a real `{page,quote}` object in ANY
+/// observed run, success or failure) — without rejecting them: silently
+/// discarding those proposals would zero out the only two runs that have
+/// ever produced a validated proposal.
+/// Recover the COMPLETE proposal objects from a response cut at the output
+/// limit.
+///
+/// Walks the partial text to the top-level `"proposals"` array and parses
+/// its elements one by one; the first element that does not parse (the one
+/// the cut landed in) ends the walk. Returns `None` when no complete
+/// proposal precedes the cut — a truncated response is never allowed to
+/// look like a legitimate "found nothing". The recovered proposals go
+/// through exactly the same validation as a whole response.
+pub(crate) fn salvage_truncated_response(partial: &str) -> Option<serde_json::Value> {
+    let start = top_level_key_value_offset(partial, "proposals")?;
+    let rest = partial[start..].trim_start();
+    let mut rest = rest.strip_prefix('[')?;
+    let mut items = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix(',') {
+            rest = r.trim_start();
+        }
+        if rest.starts_with(']') || rest.is_empty() {
+            break;
+        }
+        let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(v)) => {
+                let used = stream.byte_offset();
+                items.push(v);
+                rest = &rest[used..];
+            }
+            _ => break,
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "proposals": items }))
+}
+
+/// Byte offset just past `"key":` for a key of the top-level JSON object,
+/// skipping strings and nested containers so a quoted `"proposals"` inside a
+/// summary or body never matches.
+fn top_level_key_value_offset(text: &str, key: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let needle = format!("\"{key}\"");
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let string_start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                let string_end = (i + 1).min(bytes.len());
+                if depth == 1 && text[string_start..string_end] == needle {
+                    let after = text[string_end..].trim_start();
+                    if let Some(value) = after.strip_prefix(':') {
+                        return Some(text.len() - value.len());
+                    }
+                }
+            }
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_llm_response(
+    value: &serde_json::Value,
+    warnings: &mut Vec<String>,
+) -> AutoImproveLlmResponse {
+    let summary = value
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let mut rejected_candidates: Vec<AutoImproveRejectedCandidate> = value
+        .get("rejected_candidates")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let Some(raw_proposals) = value.get("proposals").and_then(|v| v.as_array()) else {
+        // Measured live (FN8-8120 call 1, 2026-09-22): Laguna returned a
+        // flat object sharing none of our field names at all, not even a
+        // `proposals` wrapper. `Vec::new()` would silently look identical
+        // to "the model legitimately found nothing to propose" — name it.
+        warnings.push("schema_not_honoured: response missing top-level \"proposals\" array".into());
+        return AutoImproveLlmResponse {
+            summary,
+            proposals: Vec::new(),
+            rejected_candidates,
+        };
+    };
+
+    let mut proposals = Vec::new();
+    for item in raw_proposals {
+        match parse_one_proposal(item, warnings) {
+            Ok(proposal) => proposals.push(proposal),
+            Err(rejected) => rejected_candidates.push(rejected),
+        }
+    }
+
+    AutoImproveLlmResponse {
+        summary,
+        proposals,
+        rejected_candidates,
+    }
+}
+
+// `AutoImproveRejectedCandidate` (144 bytes) is already the type
+// `validate_response`/`AutoImproveReport` carry rejected proposals in
+// throughout this module; boxing it here alone would just move the cost
+// to every call site's `Err(rejected) => rejected_candidates.push(*rejected)`.
+#[allow(clippy::result_large_err)]
+fn parse_one_proposal(
+    item: &serde_json::Value,
+    warnings: &mut Vec<String>,
+) -> Result<AutoImproveProposal, AutoImproveRejectedCandidate> {
+    let best_effort_str = |key: &str| item.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let Some(obj) = item.as_object() else {
+        return Err(AutoImproveRejectedCandidate {
+            reason: "schema_not_honoured".into(),
+            evidence: "proposal candidate was not a JSON object".into(),
+            target_path: None,
+            kind: None,
+            operation: None,
+            edit_mode: None,
+        });
+    };
+
+    let is_patch = best_effort_str("edit_mode").as_deref() == Some("patch");
+    let mut missing: Vec<&str> = REQUIRED_PROPOSAL_KEYS
+        .iter()
+        .copied()
+        .filter(|k| !obj.contains_key(*k))
+        .collect();
+    if !is_patch && !proposal_has_body_markdown(obj) {
+        missing.push("body_markdown");
+    }
+    if !missing.is_empty() {
+        return Err(AutoImproveRejectedCandidate {
+            reason: "schema_not_honoured".into(),
+            evidence: format!("missing required field(s): [{}]", missing.join(", ")),
+            target_path: best_effort_str("path"),
+            kind: best_effort_str("kind"),
+            operation: best_effort_str("operation"),
+            edit_mode: best_effort_str("edit_mode"),
+        });
+    }
+
+    for key in SOFT_DEFAULT_PROPOSAL_KEYS {
+        if !obj.contains_key(*key) {
+            warnings.push(format!(
+                "proposal for {:?} omitted {key:?}; used the field default",
+                best_effort_str("path").unwrap_or_default()
+            ));
+        }
+    }
+    if let Some(evidence_items) = obj.get("evidence").and_then(|v| v.as_array()) {
+        for (i, e) in evidence_items.iter().enumerate() {
+            let coerced_to_unspecified = match e {
+                serde_json::Value::String(_) => true,
+                serde_json::Value::Object(m) => m
+                    .get("page")
+                    .and_then(|p| p.as_str())
+                    .is_none_or(|p| p.trim().is_empty()),
+                _ => false,
+            };
+            if coerced_to_unspecified {
+                warnings.push(format!(
+                    "proposal for {:?} evidence[{i}] had no page; coerced to \"unspecified\"",
+                    best_effort_str("path").unwrap_or_default()
+                ));
+            }
+        }
+    }
+
+    serde_json::from_value::<AutoImproveProposal>(item.clone()).map_err(|err| {
+        AutoImproveRejectedCandidate {
+            reason: "proposal_deserialize_failed".into(),
+            evidence: err.to_string(),
+            target_path: best_effort_str("path"),
+            kind: best_effort_str("kind"),
+            operation: best_effort_str("operation"),
+            edit_mode: best_effort_str("edit_mode"),
+        }
+    })
+}
+
 fn validate_proposal(
     proposal: &mut AutoImproveProposal,
     cfg: &AutoImproveReviewConfig,
@@ -1554,6 +1900,18 @@ fn validate_proposal(
     proposal.operation = normalize_operation(&proposal.operation);
     if proposal.operation != CANONICAL_OPERATION {
         return Err("unsupported_operation".into());
+    }
+    // The same reasoning for `kind`: it is a label, and the path already
+    // decides where the page lands. Measured live 2026-09-23 on
+    // poolside/laguna-s-2.1: schema-conformant proposals with a sound path
+    // were rejected as `kind_path_mismatch` in 2 of 4 runs. When the path
+    // prefix names exactly one kind, the path wins; an unknown prefix still
+    // fails below as `unsupported_path_prefix` / `kind_path_mismatch`.
+    if !kind_matches_path(&proposal.kind, &proposal.path)
+        && let Some(kind) = kind_for_path(&proposal.path)
+    {
+        tracing::debug!(from = %proposal.kind, to = kind, path = %proposal.path, "auto_improve: kind normalised from path");
+        proposal.kind = kind.to_string();
     }
     if proposal.confidence < cfg.min_confidence {
         return Err("confidence_below_threshold".into());
@@ -1808,6 +2166,23 @@ fn allowed_target_path(path: &str) -> bool {
         || path == "_slots/current-focus.md"
 }
 
+/// The one kind a path prefix implies, or `None` when the prefix is shared
+/// (`concepts/` holds concept, fact and note) or unknown.
+fn kind_for_path(path: &str) -> Option<&'static str> {
+    [
+        ("gotchas/", "gotcha"),
+        ("decisions/", "decision"),
+        ("concepts/", "concept"),
+        ("procedures/", "procedure"),
+        ("_rules/", "rule"),
+        ("_slots/", "slot"),
+        ("notes/", "note"),
+    ]
+    .into_iter()
+    .find(|(prefix, _)| path.starts_with(prefix))
+    .map(|(_, kind)| kind)
+}
+
 fn kind_matches_path(kind: &str, path: &str) -> bool {
     match kind {
         "gotcha" => path.starts_with("gotchas/"),
@@ -1832,8 +2207,169 @@ fn session_duration_secs(observations: &[Observation]) -> u64 {
     u64::try_from(diff_us / 1_000_000).unwrap_or(0)
 }
 
-fn estimate_tokens(text: &str) -> usize {
+pub(crate) fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(CHARS_PER_TOKEN)
+}
+
+/// [`AutoImproveProposal`] fields the model supplies that ai-memory computes
+/// or fills in itself, and so are deliberately left OUT of the prompt's
+/// field contract (#FN8-8120's `render_proposal_field_contract`). Every
+/// other property on the type is rendered. This split, rather than a
+/// hand-picked "core fields" allowlist, is what `proposal_field_contract_
+/// partitions_every_struct_field` checks: a field added to the struct and
+/// left off both this list and the renderer fails that test.
+const PROPOSAL_PROMPT_EXCLUDED_FIELDS: &[&str] = &["expected_base_body_sha256"];
+
+fn auto_improve_proposal_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(AutoImproveProposal))
+        .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn auto_improve_evidence_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(AutoImproveEvidence))
+        .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn auto_improve_patch_edit_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(AutoImprovePatchEdit))
+        .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn auto_improve_llm_response_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(AutoImproveLlmResponse))
+        .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// Render one `- name (type[, one of: ...]): description` line from a
+/// schemars-generated field schema. Falls back gracefully when a shape
+/// (e.g. `Vec<T>`, `Option<T>`) doesn't carry a flat top-level `"type"`.
+fn render_field_line(name: &str, field_schema: &serde_json::Value) -> String {
+    let ty = field_schema
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| {
+            if field_schema.get("items").is_some() {
+                "array"
+            } else {
+                "string"
+            }
+        });
+    let desc = field_schema
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let enum_suffix = field_schema
+        .get("enum")
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            let rendered: Vec<String> = values
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| format!("\"{s}\""))
+                .collect();
+            format!(", one of: {}", rendered.join(" | "))
+        })
+        .unwrap_or_default();
+    format!("{name} ({ty}{enum_suffix}): {desc}")
+}
+
+/// Render the field-by-field contract for [`AutoImproveLlmResponse`] /
+/// [`AutoImproveProposal`] as prompt text, generated from the
+/// `schemars`-derived schemas rather than hand-copied prose — the field
+/// names, types, descriptions, and enum constraints below are the SAME
+/// data `enforce_strict_object_schemas` builds the `response_format`
+/// schema from, so this text cannot silently drift from the struct the way
+/// a second, hand-maintained field list could.
+///
+/// Exists because Poolside/Laguna S 2.1 was measured (FN8-8120,
+/// 2026-09-22, live) ignoring `response_format=json_schema strict:true`
+/// for this schema shape entirely — returning a completely different key
+/// set — while the SAME model, SAME endpoint, SAME token budget produced a
+/// fully schema-conformant object once the contract was spelled out in
+/// plain prompt text instead. Appended unconditionally (not just for
+/// `openai-compat`): it is redundant for a provider that already honours
+/// `response_format`, and load-bearing for one that doesn't.
+fn render_proposal_field_contract() -> String {
+    let envelope_schema = auto_improve_llm_response_schema();
+    let proposal_schema = auto_improve_proposal_schema();
+    let evidence_schema = auto_improve_evidence_schema();
+    let edit_schema = auto_improve_patch_edit_schema();
+
+    let mut lines = vec!["Return exactly one JSON object with these top-level fields:".to_string()];
+    if let Some(props) = envelope_schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+    {
+        for (name, schema) in props {
+            lines.push(format!("- {}", render_field_line(name, schema)));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "Each element of `proposals` MUST be a JSON object with exactly these fields \
+         (no others, no renamed fields):"
+            .to_string(),
+    );
+    if let Some(props) = proposal_schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+    {
+        for name in props.keys() {
+            if PROPOSAL_PROMPT_EXCLUDED_FIELDS.contains(&name.as_str()) {
+                continue;
+            }
+            if let Some(field_schema) = props.get(name) {
+                lines.push(format!("- {}", render_field_line(name, field_schema)));
+            }
+        }
+    }
+    lines.push(
+        "`edits` is only used, and only required, when edit_mode=\"patch\"; omit it (or leave \
+         it empty) for edit_mode=\"full_page\"."
+            .to_string(),
+    );
+
+    lines.push(String::new());
+    lines.push(format!(
+        "`evidence` items are objects shaped exactly like {{\"page\": <string>, \"quote\": \
+         <string>}} ({})",
+        evidence_schema
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("bounded quote supporting the proposal")
+    ));
+    lines.push(format!(
+        "`edits` items are objects shaped exactly like {{\"op\": <string>, \"anchor\": \
+         <string>, \"content\": <string>, \"section_sha256\": <string, optional>, \"context\": \
+         <string, optional>}} ({})",
+        edit_schema
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("one anchored patch edit")
+    ));
+
+    lines.push(String::new());
+    lines.push(
+        "kind and edit_mode are UNRELATED fields: kind names the KIND OF KNOWLEDGE (gotcha, \
+         decision, concept, procedure, rule, fact, note, or slot); edit_mode names HOW to \
+         write it (full_page or patch). NEVER put an edit_mode value (\"full_page\", \"patch\") \
+         into the kind field, and never put a kind value into edit_mode."
+            .to_string(),
+    );
+
+    lines.join("\n")
+}
+
+/// [`AUTO_IMPROVE_SYSTEM_PROMPT`] plus the generated field contract. The
+/// only place the two are joined, so every prompt actually sent to an LLM
+/// (strict or tolerant path — this text is provider-agnostic) carries the
+/// contract; see [`render_proposal_field_contract`].
+fn auto_improve_system_prompt() -> String {
+    format!(
+        "{AUTO_IMPROVE_SYSTEM_PROMPT}\n\n{}",
+        render_proposal_field_contract()
+    )
 }
 
 const AUTO_IMPROVE_SYSTEM_PROMPT: &str = r#"You are ai-memory's review-gated auto-improvement reviewer.
@@ -1936,6 +2472,7 @@ mod tests {
             max_rule_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS,
             max_procedure_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
             eval: AutoImproveEvalConfig::default(),
+            review_max_output_tokens: DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS,
         }
     }
 
@@ -1956,6 +2493,33 @@ mod tests {
             edits: Vec::new(),
             expected_base_body_sha256: None,
         }
+    }
+
+    #[test]
+    fn a_kind_that_contradicts_a_known_path_prefix_is_normalised_from_the_path() {
+        let cfg = AutoImproveReviewConfig::default();
+        let idx = ExistingPageIndex::from_pages(&[], &[]);
+        let mut p = proposal("concepts/sqlite-microseconds.md", "gotcha", 0.9);
+        assert!(validate_proposal(&mut p, &cfg, &idx).is_ok());
+        assert_eq!(p.kind, "concept");
+        let mut leaked = proposal("gotchas/shell-grep.md", "full_page", 0.9);
+        assert!(validate_proposal(&mut leaked, &cfg, &idx).is_ok());
+        assert_eq!(leaked.kind, "gotcha");
+        let mut kept = proposal("concepts/x.md", "fact", 0.9);
+        assert!(validate_proposal(&mut kept, &cfg, &idx).is_ok());
+        assert_eq!(
+            kept.kind, "fact",
+            "a kind the prefix already allows is untouched"
+        );
+    }
+
+    #[test]
+    fn an_unknown_path_prefix_is_still_rejected() {
+        let cfg = AutoImproveReviewConfig::default();
+        let idx = ExistingPageIndex::from_pages(&[], &[]);
+        let mut p = proposal("misc/x.md", "gotcha", 0.9);
+        assert!(validate_proposal(&mut p, &cfg, &idx).is_err());
+        assert_eq!(p.kind, "gotcha");
     }
 
     fn eval_cfg(command: String) -> AutoImproveEvalConfig {
@@ -2034,6 +2598,32 @@ mod tests {
         assert_eq!(proposals.len(), 1);
         assert!(rejected.is_empty());
         assert!(warnings.is_empty());
+    }
+
+    /// The judge receives the proposal's evidence quotes (2026-09-23): it passes only when the
+    /// quote from `proposal()` ("quote") reaches its stdin inside an `evidence` array.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eval_request_carries_the_evidence_quotes() {
+        let script = write_eval_script(
+            "#!/bin/sh\nif grep -q '\"evidence\":\\[{\"page\":\"sessions/abc.md\",\"quote\":\"quote\"}' ; then printf '%s' '{\"passed\":true}'; else printf '%s' '{\"passed\":false,\"reason\":\"no evidence\"}'; fi\n",
+        );
+        let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
+        let mut rejected = Vec::new();
+        let mut warnings = Vec::new();
+        apply_eval_gate_with_before_bodies(
+            &eval_cfg(script),
+            &mut proposals,
+            &mut rejected,
+            &mut warnings,
+            &BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(
+            proposals.len(),
+            1,
+            "the evidence array must reach the judge: {rejected:?}"
+        );
     }
 
     #[tokio::test]
@@ -3346,6 +3936,789 @@ mod tests {
         assert!(rejected.iter().any(|r| r.reason == "duplicate_anchor"));
         assert!(rejected.iter().any(|r| r.reason == "patch_extra_h1"));
     }
+
+    // ── FN8-8120: Laguna schema-contract fixtures + isolation/recovery ──
+    //
+    // Fixture content captured live 2026-09-22 against poolside/laguna-s-2.1
+    // (see crates/ai-memory-llm/src/openai.rs's LIVE_CALL_1/2_RESPONSE for
+    // the raw HTTP bodies these were decoded from). Embedded here as the
+    // already-decoded `message.content` JSON value, since that is the
+    // layer `parse_llm_response`/`parse_one_proposal` operate on.
+
+    /// Live call 1's decoded content: Laguna, given a schema built from
+    /// `AutoImproveProposal`'s fields, returned an object sharing NONE of
+    /// them (`edit_type`, `page_path`, `content` vs. `operation`, `path`,
+    /// ..., `body_markdown`). Wrapped in a `proposals` envelope, this is
+    /// the most faithful replay of that fixture through
+    /// `parse_llm_response`.
+    fn live_call_1_proposal_json() -> serde_json::Value {
+        serde_json::json!({
+            "edit_type": "create_or_update",
+            "page_path": "gotchas/npm-ci-without-lockfile.md",
+            "content": "# npm ci Without a Lockfile Falls Back to npm install\n\nRunning `npm ci` without a lockfile falls back to `npm install`. Always commit `"
+        })
+    }
+
+    /// Live call 2's decoded content, byte-for-byte: a clean, fully
+    /// schema-conformant `AutoImproveProposal` (all 9 core fields, correct
+    /// types, `kind="gotcha"` with no edit_mode/kind swap).
+    fn live_call_2_proposal_json() -> serde_json::Value {
+        serde_json::json!({
+            "operation": "create_or_update",
+            "path": "gotchas/npm-ci-without-lockfile.md",
+            "title": "npm ci silently falls back to npm install without a lockfile",
+            "kind": "gotcha",
+            "confidence": 0.95,
+            "rationale": "This is documented behavior and consistently causes dependency drift across environments, making it durable and actionable guidance.",
+            "evidence": [{
+                "page": "source-citation-redacted-for-test",
+                "quote": "If there is no lockfile present, the tool falls back to a plain install, which creates one."
+            }],
+            "body_markdown": "# npm ci silently falls back to npm install without a lockfile\n\nRunning `npm ci` without a committed lockfile silently falls back to `npm install`, causing dependency versions to drift across machines; always commit the lockfile.",
+            "edit_mode": "full_page"
+        })
+    }
+
+    /// FIRST assertion, on the OLD (pre-fix) behaviour: dropped straight
+    /// into `AutoImproveLlmResponse` via the whole-envelope
+    /// `serde_json::from_value` that `run_auto_improve_review` used before
+    /// this change, live call 1's content deserialises "successfully"
+    /// (every field is `#[serde(default)]`) into a proposal with every
+    /// field empty/zero, which `validate_proposal` then rejects as
+    /// `missing_rationale` — a confusing reason that hides the real cause
+    /// (the model never used our schema at all).
+    #[test]
+    fn old_behaviour_reproduced_live_call_1_rejects_as_missing_rationale_not_schema_not_honoured() {
+        let envelope = serde_json::json!({
+            "summary": "",
+            "proposals": [live_call_1_proposal_json()],
+            "rejected_candidates": []
+        });
+        let raw: AutoImproveLlmResponse = serde_json::from_value(envelope).unwrap();
+        let (accepted, rejected, _) = validate_response(raw, &cfg(), &existing_index_for_test());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(
+            rejected[0].reason, "confidence_below_threshold",
+            "documents the OLD, confusing behaviour this change replaces: \
+             validate_proposal checks confidence before rationale, so an absent \
+             key (defaulted to 0.0) is rejected under a reason that says \
+             nothing about the schema being ignored"
+        );
+    }
+
+    /// NEW behaviour: the same fixture, through `parse_llm_response`
+    /// (which runs BEFORE `validate_response`), is rejected with a precise
+    /// `schema_not_honoured` reason naming every core field Laguna's
+    /// response was missing — no silent default-into-`missing_rationale`.
+    #[test]
+    fn live_call_1_is_rejected_as_schema_not_honoured() {
+        let envelope = serde_json::json!({
+            "summary": "",
+            "proposals": [live_call_1_proposal_json()],
+            "rejected_candidates": []
+        });
+        let mut warnings = Vec::new();
+        let raw = parse_llm_response(&envelope, &mut warnings);
+        assert!(raw.proposals.is_empty());
+        assert_eq!(raw.rejected_candidates.len(), 1);
+        let rejected = &raw.rejected_candidates[0];
+        assert_eq!(rejected.reason, "schema_not_honoured");
+        // This fixture's stray "content" key coincidentally satisfies the
+        // body_markdown alias (content/body/markdown/body_markdown), so it
+        // is NOT in the missing list even though the model never emitted a
+        // real body_markdown field — the other 4 core fields are.
+        for field in ["path", "confidence", "rationale", "evidence"] {
+            assert!(
+                rejected.evidence.contains(field),
+                "expected missing-field list to name {field:?}, got {:?}",
+                rejected.evidence
+            );
+        }
+    }
+
+    /// Live call 2's fixture validates end-to-end through the SAME
+    /// parse_llm_response -> validate_response path production uses,
+    /// unmodified: a proposal Laguna actually produced once the field
+    /// contract was spelled out in the prompt.
+    #[test]
+    fn live_call_2_validates_end_to_end() {
+        let envelope = serde_json::json!({
+            "summary": "reviewed one observation",
+            "proposals": [live_call_2_proposal_json()],
+            "rejected_candidates": []
+        });
+        let mut warnings = Vec::new();
+        let raw = parse_llm_response(&envelope, &mut warnings);
+        assert_eq!(raw.proposals.len(), 1, "warnings: {warnings:?}");
+        let (accepted, rejected, _) = validate_response(raw, &cfg(), &existing_index_for_test());
+        assert!(rejected.is_empty(), "unexpected rejection(s): {rejected:?}");
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].kind, "gotcha");
+        assert_eq!(accepted[0].edit_mode, "full_page");
+    }
+
+    /// A response with no top-level `proposals` array at all (live call
+    /// 1's ACTUAL raw shape before this test wraps it for the two tests
+    /// above) must not silently look like "zero proposals found" — it
+    /// gets a `schema_not_honoured` warning instead.
+    #[test]
+    fn envelope_missing_proposals_array_warns_instead_of_silently_empty() {
+        let mut warnings = Vec::new();
+        let raw = parse_llm_response(&live_call_1_proposal_json(), &mut warnings);
+        assert!(raw.proposals.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("schema_not_honoured") && w.contains("proposals")),
+            "warnings: {warnings:?}"
+        );
+    }
+
+    fn existing_index_for_test() -> ExistingPageIndex {
+        ExistingPageIndex::from_pages(&[], &[])
+    }
+
+    // ── normalize_kind: non-canonical values treated like empty (fix 5) ──
+
+    #[test]
+    fn normalize_kind_recovers_edit_mode_value_swapped_into_kind() {
+        let mut p = proposal("gotchas/foo.md", "full_page", 0.9);
+        let mut warnings = Vec::new();
+        normalize_kind(&mut p, &mut warnings);
+        assert_eq!(p.kind, "gotcha");
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn normalize_kind_recovers_patch_value_swapped_into_kind() {
+        let mut p = proposal("_rules/foo.md", "patch", 0.9);
+        let mut warnings = Vec::new();
+        normalize_kind(&mut p, &mut warnings);
+        assert_eq!(p.kind, "rule");
+    }
+
+    /// A RECOGNIZED kind that genuinely disagrees with the path is left
+    /// alone — that is real signal (`kind_path_mismatch`), not a
+    /// field-name mixup, so normalize_kind must not paper over it.
+    #[test]
+    fn normalize_kind_does_not_override_a_real_mismatch() {
+        let mut p = proposal("decisions/foo.md", "gotcha", 0.9);
+        let mut warnings = Vec::new();
+        normalize_kind(&mut p, &mut warnings);
+        assert_eq!(
+            p.kind, "gotcha",
+            "a recognized-but-mismatched kind is untouched"
+        );
+    }
+
+    // ── per-proposal isolation (fix 4) ──
+
+    /// One malformed proposal (evidence is a bare string where an array
+    /// was required — the exact production shape from log evidence
+    /// 2026-09-22 01:41) must not discard a good proposal in the same
+    /// batch.
+    #[test]
+    fn one_bad_proposal_does_not_discard_a_good_one_in_the_same_batch() {
+        let good = live_call_2_proposal_json();
+        let mut bad = live_call_2_proposal_json();
+        bad["evidence"] = serde_json::json!("a lone string, not an array");
+        bad["path"] = serde_json::json!("gotchas/other.md");
+        let envelope = serde_json::json!({
+            "summary": "",
+            "proposals": [good, bad],
+            "rejected_candidates": []
+        });
+        let mut warnings = Vec::new();
+        let raw = parse_llm_response(&envelope, &mut warnings);
+        assert_eq!(raw.proposals.len(), 1, "the good proposal must survive");
+        assert_eq!(raw.proposals[0].path, "gotchas/npm-ci-without-lockfile.md");
+        assert_eq!(raw.rejected_candidates.len(), 1);
+        assert_eq!(
+            raw.rejected_candidates[0].reason,
+            "proposal_deserialize_failed"
+        );
+    }
+
+    // ── evidence "unspecified" fallback becomes a warning, not silent (fix 3) ──
+
+    #[test]
+    fn bare_string_evidence_is_accepted_but_warned_not_silently_fabricated() {
+        let mut item = live_call_2_proposal_json();
+        item["evidence"] = serde_json::json!(["just a quote, no page object"]);
+        let mut warnings = Vec::new();
+        let parsed = parse_one_proposal(&item, &mut warnings).expect("still parses");
+        assert_eq!(parsed.evidence[0].page, "unspecified");
+        assert!(
+            warnings.iter().any(|w| w.contains("unspecified")),
+            "warnings: {warnings:?}"
+        );
+    }
+
+    // ── prompt field contract (fix 1) ──
+
+    #[test]
+    fn rendered_field_contract_names_every_core_field_and_the_anti_swap_rule() {
+        let rendered = render_proposal_field_contract();
+        for field in [
+            "operation",
+            "path",
+            "title",
+            "kind",
+            "confidence",
+            "rationale",
+            "evidence",
+            "body_markdown",
+            "edit_mode",
+            "edits",
+        ] {
+            assert!(
+                rendered.contains(field),
+                "missing field {field:?} in:\n{rendered}"
+            );
+        }
+        assert!(rendered.contains("full_page"));
+        assert!(rendered.contains("patch"));
+        assert!(rendered.to_lowercase().contains("never put"));
+    }
+
+    /// The anti-drift property: every property `AutoImproveProposal`
+    /// actually has is either rendered into the prompt contract or is on
+    /// the documented internal-field exclusion list. A field added to the
+    /// struct without a decision either way fails this test.
+    #[test]
+    fn proposal_field_contract_partitions_every_struct_field() {
+        let schema = auto_improve_proposal_schema();
+        let props = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("AutoImproveProposal schema has properties");
+        for name in props.keys() {
+            assert!(
+                !PROPOSAL_PROMPT_EXCLUDED_FIELDS.contains(&name.as_str())
+                    || name == "expected_base_body_sha256",
+                "field {name:?} is excluded from the prompt contract by a name other than \
+                 the documented expected_base_body_sha256 — update PROPOSAL_PROMPT_EXCLUDED_FIELDS deliberately"
+            );
+        }
+        let rendered = render_proposal_field_contract();
+        for name in props.keys() {
+            if PROPOSAL_PROMPT_EXCLUDED_FIELDS.contains(&name.as_str()) {
+                continue;
+            }
+            assert!(
+                rendered.contains(name.as_str()),
+                "field {name:?} exists on AutoImproveProposal but is not in the rendered \
+                 prompt contract — it was added to the struct without deciding whether the \
+                 model needs to see it"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_and_edit_mode_schemas_carry_their_enum_constraints() {
+        let schema = auto_improve_proposal_schema();
+        let kind_enum = schema
+            .pointer("/properties/kind/enum")
+            .and_then(|v| v.as_array())
+            .expect("kind carries an enum constraint");
+        assert_eq!(kind_enum.len(), 8);
+        let edit_mode_enum = schema
+            .pointer("/properties/edit_mode/enum")
+            .and_then(|v| v.as_array())
+            .expect("edit_mode carries an enum constraint");
+        assert_eq!(
+            edit_mode_enum,
+            &vec![serde_json::json!("full_page"), serde_json::json!("patch")]
+        );
+    }
+
+    // ── fix 1 mutation-proof: the call site must actually use the ──
+    // ── generated contract, not just the renderer in isolation.    ──
+
+    struct RecordingLlm {
+        last_system: std::sync::Mutex<Option<String>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingLlm {
+        fn new() -> Self {
+            Self {
+                last_system: std::sync::Mutex::new(None),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RecordingLlm {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn model(&self) -> &str {
+            "recording-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            unreachable!("run_auto_improve_review only calls the structured path")
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.last_system.lock().unwrap() = request.system.clone();
+            Ok(serde_json::json!({
+                "summary": "",
+                "proposals": [],
+                "rejected_candidates": []
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_auto_improve_review_sends_the_generated_field_contract() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        let session_id = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        let llm = RecordingLlm::new();
+        let _report = run_auto_improve_review(
+            &store.reader,
+            &llm,
+            ws,
+            proj,
+            session_id,
+            AutoImproveReviewConfig {
+                min_session_duration_secs: 0,
+                ..cfg()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(llm.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let sent = llm
+            .last_system
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("system prompt sent");
+        for field in [
+            "operation",
+            "path",
+            "kind",
+            "confidence",
+            "rationale",
+            "evidence",
+            "body_markdown",
+            "edit_mode",
+        ] {
+            assert!(
+                sent.contains(field),
+                "sent prompt missing {field:?}:\n{sent}"
+            );
+        }
+        assert!(sent.to_lowercase().contains("never put"));
+    }
+
+    // ── fix 2 mutation-proof + no-retry: truncation surfaces as a typed,
+    // ── logged report instead of a silent Err with zero DB visibility,
+    // ── and the provider is called exactly once (no same-shape retry).
+
+    struct TruncatingLlm {
+        calls: std::sync::atomic::AtomicUsize,
+        partial: Option<String>,
+        seen_max_tokens: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for TruncatingLlm {
+        fn name(&self) -> &'static str {
+            "truncating"
+        }
+
+        fn model(&self) -> &str {
+            "truncating-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            unreachable!()
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.seen_max_tokens
+                .store(request.max_tokens, std::sync::atomic::Ordering::SeqCst);
+            Err(LlmError::Truncated {
+                finish_reason: "length".into(),
+                partial: self.partial.clone().map(ai_memory_llm::PartialText),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn truncation_produces_a_report_with_a_truncated_warning_and_no_retry() {
+        let (report, calls) = truncated_review(None).await;
+        assert_eq!(calls, 1);
+        assert!(report.proposals.is_empty());
+        assert!(
+            report.warnings.iter().any(|w| w.contains("truncated")),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    const SALVAGE_PROPOSAL: &str = r##"{"path": "procedures/release.md", "title": "Release Procedure", "kind": "procedure", "confidence": 0.91, "rationale": "The session repeated a release workflow with verification.", "evidence": [{"page": "sessions/test.md", "quote": "run the full gate before release"}], "body_markdown": "# Release Procedure\n\nRun the full gate before release."}"##;
+
+    /// The measured 2026-09-24 shape, with the order fixed: proposals first,
+    /// then a runaway summary cut by the output limit.
+    #[tokio::test]
+    async fn truncation_after_a_complete_proposal_recovers_it() {
+        let partial = format!(
+            "{{\n  \"proposals\": [{SALVAGE_PROPOSAL}, {{\"path\": \"gotchas/cut.md\", \"rationale\": \"The sess"
+        );
+        let (report, calls) = truncated_review(Some(partial)).await;
+        assert_eq!(calls, 1);
+        assert_eq!(report.proposals.len(), 1, "report: {report:?}");
+        assert_eq!(report.proposals[0].path, "procedures/release.md");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("1 complete proposal(s) recovered")),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    /// The measured failure itself: summary first, looping, never reaching
+    /// proposals. Nothing is recoverable and the run still says truncated.
+    #[tokio::test]
+    async fn truncation_inside_a_leading_summary_recovers_nothing() {
+        let looping = "The session also identified a thing. ".repeat(50);
+        let partial = format!("{{\n  \"summary\": \"{looping} \\\"proposals\\\": [");
+        let (report, _) = truncated_review(Some(partial)).await;
+        assert!(report.proposals.is_empty());
+        assert!(
+            report.warnings.iter().any(|w| w.contains("0 proposals recovered")),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn salvage_stops_at_the_cut_and_ignores_quoted_keys() {
+        let two = format!(
+            "{{\"summary\": \"says \\\"proposals\\\": [1]\", \"proposals\": [{SALVAGE_PROPOSAL},{SALVAGE_PROPOSAL}, {{\"path\": \"x"
+        );
+        let v = salvage_truncated_response(&two).expect("two complete proposals");
+        assert_eq!(v["proposals"].as_array().unwrap().len(), 2);
+        assert!(salvage_truncated_response("{\"proposals\": [{\"path\": \"x").is_none());
+        assert!(salvage_truncated_response("{\"summary\": \"x").is_none());
+        // A nested "proposals" key (inside a proposal) is not the top-level array.
+        assert!(salvage_truncated_response("{\"a\": {\"proposals\": [{}]").is_none());
+    }
+
+    async fn truncated_review(partial: Option<String>) -> (AutoImproveReport, usize) {
+        let (report, calls, _) =
+            truncated_review_with_budget(partial, DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS)
+                .await;
+        (report, calls)
+    }
+
+    /// Operator decision 2026-09-24: the review budget is configurable and the
+    /// configured value is what the provider is asked for.
+    #[tokio::test]
+    async fn the_review_asks_for_the_configured_output_budget() {
+        let (_, _, seen) = truncated_review_with_budget(None, 40_000).await;
+        assert_eq!(seen, 40_000);
+        assert_eq!(AutoImproveReviewConfig::default().review_max_output_tokens, 32_768);
+    }
+
+    async fn truncated_review_with_budget(
+        partial: Option<String>,
+        budget: u32,
+    ) -> (AutoImproveReport, usize, u32) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        let session_id = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        let llm = TruncatingLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            partial,
+            seen_max_tokens: std::sync::atomic::AtomicU32::new(0),
+        };
+        let report = run_auto_improve_review(
+            &store.reader,
+            &llm,
+            ws,
+            proj,
+            session_id,
+            AutoImproveReviewConfig {
+                min_session_duration_secs: 0,
+                review_max_output_tokens: budget,
+                ..cfg()
+            },
+        )
+        .await
+        .expect("truncation must surface as Ok(report), not Err");
+        let calls = llm.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let seen = llm
+            .seen_max_tokens
+            .load(std::sync::atomic::Ordering::SeqCst);
+        (report, calls, seen)
+    }
+
+    // ── FN8-8120 runtime fallback: a report must name the lane that actually
+    // ── answered. The provider stack mirrors production: health wrapper
+    // ── around FallbackProvider(primary, secondary).
+
+    struct QuotaLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for QuotaLlm {
+        fn name(&self) -> &'static str {
+            "openai-compat"
+        }
+
+        fn model(&self) -> &str {
+            "poolside/laguna-s-2.1"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            unreachable!()
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Err(LlmError::Provider {
+                status: 429,
+                body: r#"{"error":"usage limit exceeded"}"#.into(),
+            })
+        }
+    }
+
+    async fn seeded_session() -> (
+        TempDir,
+        Store,
+        ai_memory_core::WorkspaceId,
+        ai_memory_core::ProjectId,
+        ai_memory_core::SessionId,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        let session_id = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        (tmp, store, ws, proj, session_id)
+    }
+
+    fn production_stack(
+        secondary: std::sync::Arc<dyn LlmProvider>,
+    ) -> std::sync::Arc<dyn LlmProvider> {
+        let fallback =
+            ai_memory_llm::FallbackProvider::new(std::sync::Arc::new(QuotaLlm), secondary);
+        ai_memory_llm::ProviderHealth::default().wrap_llm_provider(
+            std::sync::Arc::new(fallback),
+            "openai-compat",
+            "poolside/laguna-s-2.1",
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn fallback_answer_is_recorded_as_the_secondary_provider() {
+        let (_tmp, store, ws, proj, session_id) = seeded_session().await;
+        let llm = production_stack(std::sync::Arc::new(FakeLlm));
+        let report = run_auto_improve_review(
+            &store.reader,
+            llm.as_ref(),
+            ws,
+            proj,
+            session_id,
+            AutoImproveReviewConfig {
+                min_session_duration_secs: 0,
+                ..cfg()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.provider, "fake",
+            "429 on the primary: the fallback answered"
+        );
+        assert_eq!(report.model, "fake-model");
+        assert_eq!(report.proposals.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_truncation_is_recorded_as_the_secondary_provider() {
+        let (_tmp, store, ws, proj, session_id) = seeded_session().await;
+        let llm = production_stack(std::sync::Arc::new(TruncatingLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            partial: None,
+            seen_max_tokens: std::sync::atomic::AtomicU32::new(0),
+        }));
+        let report = run_auto_improve_review(
+            &store.reader,
+            llm.as_ref(),
+            ws,
+            proj,
+            session_id,
+            AutoImproveReviewConfig {
+                min_session_duration_secs: 0,
+                ..cfg()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.provider, "truncating");
+        assert_eq!(report.model, "truncating-model");
+    }
 }
 
 #[cfg(test)]
@@ -3414,5 +4787,77 @@ mod operation_normalization_tests {
             serde_json::from_value(serde_json::json!({ "operation": "create" }))
                 .expect("must not fail to parse; normalisation happens in validation");
         assert_eq!(parsed.operation, "create");
+    }
+}
+
+/// Live check against the real Poolside endpoint (FN8-8120). Ignored by
+/// default; run with `LLM_API_KEY` set:
+/// `cargo test -p ai-memory-consolidate live_laguna -- --ignored --nocapture`.
+/// Uses the production system prompt, response schema and validator; only
+/// the user prompt is hand-written.
+#[cfg(test)]
+mod live_laguna_tests {
+    use super::*;
+    use ai_memory_llm::{LlmProvider, OpenAiCompatProvider};
+    use secrecy::SecretString;
+
+    #[tokio::test]
+    #[ignore = "calls the live Poolside API"]
+    async fn live_laguna_structured_review_passes_validation() {
+        let key = std::env::var("LLM_API_KEY").expect("LLM_API_KEY");
+        let llm = OpenAiCompatProvider::new(
+            "https://inference.poolside.ai/v1",
+            Some(SecretString::from(key)),
+            "poolside/laguna-s-2.1",
+        )
+        .unwrap()
+        .with_strict(true)
+        .with_timeout_secs(300);
+        let prompt = "Session observations (coding agent, project floo):\n\
+            [obs 1] tool Bash: `grep -c x file` returned 0 on a file with control bytes; `/usr/bin/grep -c x file` returned 8. The shell's grep is an overridden function.\n\
+            [obs 2] agent: switched every search to /usr/bin/grep; results now match.\n\
+            [obs 3] tool Bash: sqlite `datetime(staged_at/1000,'unixepoch')` returned empty; staged_at is microseconds.\n\
+            [obs 4] agent: `CAST(created_at AS INTEGER)/1000000` fixed the date; integer-vs-text comparison was silently false before the CAST.\n\
+            Existing wiki pages: none relevant.\n\
+            Propose durable wiki pages for reusable lessons. Evidence page = \"sessions/live-test.md\"; quote the observation text.";
+        let request = ChatRequest {
+            system: Some(auto_improve_system_prompt()),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: prompt.into(),
+            }],
+            max_tokens: DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS,
+            temperature: Some(0.1),
+        };
+        let schema = serde_json::to_value(schemars::schema_for!(AutoImproveLlmResponse)).unwrap();
+        let mut runs = 0;
+        let mut validated_runs = 0;
+        for i in 0..6 {
+            runs += 1;
+            match llm
+                .complete_structured_raw(request.clone(), schema.clone())
+                .await
+            {
+                Ok(value) => {
+                    let mut w = Vec::new();
+                    let raw = parse_llm_response(&value, &mut w);
+                    let cfg = AutoImproveReviewConfig::default();
+                    let idx = ExistingPageIndex::from_pages(&[], &[]);
+                    let (ok, rejected, warnings) = validate_response(raw, &cfg, &idx);
+                    let reasons: Vec<_> = rejected.iter().map(|r| r.reason.clone()).collect();
+                    eprintln!(
+                        "run {i}: validated={} rejected={reasons:?} warnings={:?}",
+                        ok.len(),
+                        [w, warnings].concat()
+                    );
+                    if !ok.is_empty() {
+                        validated_runs += 1;
+                    }
+                }
+                Err(e) => eprintln!("run {i}: ERROR {e}"),
+            }
+        }
+        eprintln!("validated runs: {validated_runs}/{runs}");
+        assert!(validated_runs > 0, "no run produced a validated proposal");
     }
 }

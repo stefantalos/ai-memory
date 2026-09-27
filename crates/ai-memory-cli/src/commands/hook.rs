@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
-use ai_memory_hooks::{CaptureDisposition, HookEvent, PolicyState};
+use ai_memory_hooks::{
+    CaptureDisposition, CaptureMode, HookEvent, PolicyState, repository_admits_capture,
+};
 use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
@@ -122,8 +124,8 @@ fn should_incremental_drain(event: &str, spool_len: usize, threshold: usize) -> 
     event == "post-tool-use" && spool_len >= threshold
 }
 
-fn spawn_background_drainer(data_dir: &Path) -> std::io::Result<()> {
-    hook_drain_process::spawn(data_dir)
+fn spawn_background_drainer(data_dir: &Path, live_token: Option<&str>) -> std::io::Result<()> {
+    hook_drain_process::spawn(data_dir, live_token)
 }
 
 fn should_spawn_background_drainer(event: &str) -> bool {
@@ -297,9 +299,10 @@ fn cwd_query_suffix(
 
 fn after_background_drain_event_enqueue(
     data_dir: &Path,
-    spawn: impl FnOnce(&Path) -> std::io::Result<()>,
+    live_token: Option<&str>,
+    spawn: impl FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    spawn(data_dir)
+    spawn(data_dir, live_token)
 }
 
 /// Hidden drain-only fast path. Reads no stdin and writes no stdout.
@@ -315,11 +318,57 @@ pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
     )
     .await
     {
-        Ok(hook_spool::LockedDrainResult::Drained(_))
-        | Ok(hook_spool::LockedDrainResult::LockBusy) => {}
+        Ok(outcome) => {
+            let _ = write_drain_report(&mut std::io::stderr(), &outcome);
+        }
         Err(err) => eprintln!("ai-memory hook-drain warning: failed to acquire drain lock: {err}"),
     }
     Ok(())
+}
+
+/// Report a drain pass on stderr when it ended with events undelivered.
+///
+/// Silent on a clean pass (nothing queued, or everything delivered) so
+/// `hook-drain.log` stays warning-only, matching the rotation budget in
+/// [`hook_drain_process`]. stderr, never stdout: the drainer's stdout is
+/// contractually empty and the detached helper redirects stderr into the log.
+///
+/// Without this the drain discarded its own [`hook_spool::DrainResult`], so a
+/// pass that dropped every queued event without sending it was byte-identical,
+/// on both streams and in the exit code, to one that delivered them all — and
+/// so was a pass that did nothing because another drainer held the lock (#493).
+fn write_drain_report<W: std::io::Write>(
+    w: &mut W,
+    outcome: &hook_spool::LockedDrainResult,
+) -> std::io::Result<()> {
+    match outcome {
+        // Says what this pass did, not what the spool holds: `LockBusy` is
+        // returned before `drain_until_quiescent` lists anything, so the count
+        // of queued events is unknown here. Asserting one would repeat, inside
+        // the fix, the confusion the fix is for.
+        hook_spool::LockedDrainResult::LockBusy => writeln!(
+            w,
+            "ai-memory hook-drain warning: another drainer holds the spool lock; \
+             this pass attempted no delivery and left the spool untouched"
+        ),
+        hook_spool::LockedDrainResult::Drained(result) => {
+            if result.remaining == 0 && result.dropped == 0 {
+                return Ok(());
+            }
+            // "acknowledged", not "delivered": `sent` counts what the server
+            // ACKed, and an ack also covers an item the server accepted and then
+            // dropped by capture policy (`accepted_indices` includes protocol
+            // drops). Reporting those as delivered would assert storage the
+            // drain cannot observe — the precise confusion #493 was written in.
+            writeln!(
+                w,
+                "ai-memory hook-drain warning: {} event(s) acknowledged by the server, \
+                 {} still queued, {} DROPPED undelivered (past the retry cap or \
+                 older than the spool TTL)",
+                result.sent, result.remaining, result.dropped
+            )
+        }
+    }
 }
 
 fn env_lookup(name: &str) -> Option<String> {
@@ -429,7 +478,7 @@ async fn run_with_payload<W, S>(
 ) -> anyhow::Result<()>
 where
     W: std::io::Write,
-    S: FnOnce(&Path) -> std::io::Result<()>,
+    S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 {
     let agent_kind = AgentKind::from_wire(&args.agent);
     let hook_event = HookEvent::parse(&args.event);
@@ -484,9 +533,24 @@ where
             inspection_cwd.as_deref().unwrap_or(""),
         )
     });
+    // Precedence: an explicit flag (tests, one-off runs) wins; otherwise the
+    // persisted per-install mode; otherwise the historical default.
+    let capture_mode = args.capture_mode.map_or_else(
+        || persisted_capture_mode(&resolve_data_dir(data_dir.as_deref())),
+        crate::cli::CaptureModeArg::mode,
+    );
+    // Marker presence is the opt-in signal under allowlist mode. Resolved from
+    // the same upward walk the policy uses, so opting in needs no new file.
+    let marker_present = policy_cwd
+        .as_deref()
+        .is_some_and(|cwd| crate::marker::find_marker(cwd).is_some());
+    let admits_capture = repository_admits_capture(capture_mode, marker_present);
     if args.check_capture {
         let protocol = decision.as_ref().map(|decision| decision.protocol());
         let output = serde_json::json!({
+            "capture_mode": capture_mode,
+            "marker_present": marker_present,
+            "admits_capture": admits_capture,
             "version": protocol.map_or(1, |protocol| protocol.version()),
             "policy_state": protocol.map_or(PolicyState::Inactive, |protocol| protocol.policy_state()),
             "tool_family": protocol.map_or(ai_memory_hooks::ToolFamily::Unknown, |protocol| protocol.tool_family()),
@@ -495,6 +559,15 @@ where
             "extraction_state": protocol.map_or(ai_memory_hooks::ExtractionState::NotApplicable, |protocol| protocol.extraction_state()),
         });
         writeln!(stdout, "{output}")?;
+        return Ok(());
+    }
+    // #446: under allowlist mode a repository that never opted in emits
+    // nothing. This sits outside the `tool_event` path on purpose — `decision`
+    // is `None` for UserPromptSubmit, SessionStart/End and Stop, so gating via
+    // `CaptureDisposition` alone would still spool prompt text from an
+    // opted-out repository while reporting it as excluded.
+    if !admits_capture {
+        write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
     if let Some(decision) = decision {
@@ -542,7 +615,14 @@ where
     // mode is decided without a round-trip: an explicit `--auth-token` is
     // stored inline; otherwise a present OIDC token marks the event `oidc`
     // (resolved + refreshed at drain time); otherwise anonymous.
-    let oidc_present = args.auth_token.is_none()
+    // #552: the bearer is no longer rendered onto the hook's command line, so
+    // fall back to the copy `install-hooks --apply` persisted under the data
+    // dir. An explicit `--auth-token` still wins, which keeps every config
+    // written before this change working exactly as it did.
+    let persisted_token = crate::config::read_hook_auth_token(&dd);
+    let effective_token = args.auth_token.as_deref().or(persisted_token.as_deref());
+
+    let oidc_present = effective_token.is_none()
         && OidcToken::load(&dd.join("auth.json"))
             .ok()
             .flatten()
@@ -565,12 +645,7 @@ where
         "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
         args.event, args.agent, hook_qs, capture_qs
     );
-    let entry = hook_spool::entry_for(
-        event_url,
-        payload.clone(),
-        args.auth_token.as_deref(),
-        oidc_present,
-    );
+    let entry = hook_spool::entry_for(event_url, payload.clone(), effective_token, oidc_present);
     if hook_spool::enqueue(&spool, &entry).is_err() {
         eprintln!(
             "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
@@ -617,7 +692,7 @@ where
         // handoff on demand via the MCP `memory_handoff_accept` tool.
         if agent_kind.session_start_injects_handoff() {
             let client = build_client();
-            let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id.as_deref().map_or_else(
                 || session_qs.clone(),
                 |session_id| format!("&session_id={}", url_encode(session_id)),
@@ -655,7 +730,7 @@ where
         && AgentKind::from_wire(&args.agent).user_prompt_injects_handoff()
     {
         let client = build_client();
-        let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
+        let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
         let native_session_qs = canonical_session_id
             .as_deref()
             .map_or_else(String::new, |session_id| {
@@ -722,7 +797,17 @@ where
     // but `stop` and `pre-compact` also trigger the helper so delivery does not
     // rely on the single hook most likely to be cancelled during agent shutdown.
     if should_spawn_background_drainer(&args.event)
-        && let Err(err) = after_background_drain_event_enqueue(&dd, spawn_background_drainer)
+        && let Err(err) = after_background_drain_event_enqueue(
+            &dd,
+            // The hook's own token, resolved the same way it authenticates
+            // its own request: `--auth-token`, else the environment, else the
+            // copy `install-hooks --apply` persisted under the data dir
+            // (#552). Current by construction either way. The drain uses it
+            // only to retry an entry the server has already rejected with 401
+            // (#542).
+            effective_token,
+            spawn_background_drainer,
+        )
     {
         eprintln!(
             "ai-memory hook warning: failed to start background spool drainer; event remains queued: {err}"
@@ -767,6 +852,26 @@ fn canonical_capture_cwd(cwd: &str) -> String {
         .unwrap_or_else(|| cwd.to_owned())
 }
 
+/// File under the data dir holding the per-install capture mode (#446).
+///
+/// Deliberately a standalone file rather than a flag baked into each agent's
+/// hook command: the mode then covers every agent and every render path at
+/// once, and `install-hooks --apply` cannot regenerate it away. The reporter's
+/// binding requirement was that the protection survive an upgrade — here it
+/// does so by construction rather than by preservation logic that a new render
+/// path could forget.
+pub(crate) const CAPTURE_MODE_FILE: &str = "capture-mode";
+
+/// Read the persisted capture mode. Anything unreadable, absent, or
+/// unrecognised means the historical default: this file can only ever tighten
+/// capture, never silently loosen it below what the operator already had.
+fn persisted_capture_mode(data_dir: &Path) -> CaptureMode {
+    match std::fs::read_to_string(data_dir.join(CAPTURE_MODE_FILE)) {
+        Ok(text) if text.trim().eq_ignore_ascii_case("allowlist") => CaptureMode::Allowlist,
+        _ => CaptureMode::Denylist,
+    }
+}
+
 fn is_tool_event(event: &str) -> bool {
     matches!(
         event.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
@@ -799,6 +904,50 @@ fn resolve_data_dir(data_dir: Option<&Path>) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The regression this whole change exists for. `inspect` runs only for
+    /// tool events, so a gate expressed through `CaptureDisposition` would
+    /// leave prompt bodies spooling from a repository that never opted in —
+    /// reporting it as excluded while writing the text to disk. Pin the fact
+    /// that the gate is event-independent.
+    #[test]
+    fn allowlist_gate_covers_events_that_never_reach_capture_policy() {
+        for event in ["user-prompt-submit", "session-start", "session-end", "stop"] {
+            assert!(
+                !is_tool_event(event),
+                "{event} must not be a tool event, or this test proves nothing"
+            );
+        }
+        // With no marker present, allowlist mode admits none of them.
+        assert!(!repository_admits_capture(CaptureMode::Allowlist, false));
+    }
+
+    #[test]
+    fn persisted_mode_defaults_to_denylist_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            persisted_capture_mode(tmp.path()),
+            CaptureMode::Denylist,
+            "a missing file must not change existing installs"
+        );
+    }
+
+    #[test]
+    fn persisted_mode_reads_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(CAPTURE_MODE_FILE), "allowlist\n").unwrap();
+        assert_eq!(persisted_capture_mode(tmp.path()), CaptureMode::Allowlist);
+    }
+
+    #[test]
+    fn unreadable_or_unknown_mode_falls_back_to_denylist_not_allowlist() {
+        // Failing "closed" here would be a denial of service: a corrupt file
+        // would silently stop all capture. Tightening is the operator's
+        // explicit choice, so garbage must read as the historical default.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(CAPTURE_MODE_FILE), "\u{0}not-a-mode").unwrap();
+        assert_eq!(persisted_capture_mode(tmp.path()), CaptureMode::Denylist);
+    }
+
     fn devin_hook_args(event: &str) -> HookArgs {
         HookArgs {
             event: event.into(),
@@ -808,6 +957,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         }
     }
 
@@ -931,6 +1081,88 @@ mod tests {
         }
     }
 
+    fn drain_report(outcome: &hook_spool::LockedDrainResult) -> String {
+        let mut out = Vec::new();
+        write_drain_report(&mut out, outcome).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// A pass with nothing left behind says nothing, so `hook-drain.log` keeps
+    /// receiving only warnings and a healthy instance never grows it.
+    #[test]
+    fn drain_report_is_silent_on_a_clean_pass() {
+        for result in [
+            hook_spool::DrainResult::default(),
+            hook_spool::DrainResult {
+                sent: 12,
+                remaining: 0,
+                dropped: 0,
+            },
+        ] {
+            let report = drain_report(&hook_spool::LockedDrainResult::Drained(result));
+            assert!(report.is_empty(), "clean pass emitted: {report}");
+        }
+    }
+
+    /// The regression #493 exists for. Three passes that mean opposite things —
+    /// everything delivered, everything discarded undelivered, and nothing even
+    /// attempted because another drainer held the lock — used to produce the
+    /// same empty output and the same exit 0, which is what left the reporter
+    /// unable to tell a working drain from a silently lossy one. Pin that each
+    /// one is now distinguishable from the other two.
+    #[test]
+    fn drain_report_separates_loss_and_contention_from_a_clean_pass() {
+        let clean = drain_report(&hook_spool::LockedDrainResult::Drained(
+            hook_spool::DrainResult {
+                sent: 5,
+                remaining: 0,
+                dropped: 0,
+            },
+        ));
+        let lossy = drain_report(&hook_spool::LockedDrainResult::Drained(
+            hook_spool::DrainResult {
+                sent: 0,
+                remaining: 0,
+                dropped: 7,
+            },
+        ));
+        let busy = drain_report(&hook_spool::LockedDrainResult::LockBusy);
+
+        assert!(clean.is_empty());
+        assert!(
+            lossy.contains("DROPPED") && lossy.contains('7'),
+            "a pass that discarded 7 undelivered events must name the loss: {lossy}"
+        );
+        assert!(
+            !busy.contains("queued"),
+            "LockBusy is returned before the spool is listed, so the report must \
+             not claim anything about queued events: {busy}"
+        );
+        assert!(
+            busy.contains("lock"),
+            "a contended pass must say it delivered nothing: {busy}"
+        );
+        assert_ne!(lossy, busy);
+        assert_ne!(lossy, clean);
+        assert_ne!(busy, clean);
+    }
+
+    /// Events merely still queued (server down, or the budget ran out) are a
+    /// warning too — they are the state that precedes the drop — but they must
+    /// not be reported as lost.
+    #[test]
+    fn drain_report_distinguishes_still_queued_from_dropped() {
+        let report = drain_report(&hook_spool::LockedDrainResult::Drained(
+            hook_spool::DrainResult {
+                sent: 1,
+                remaining: 4,
+                dropped: 0,
+            },
+        ));
+        assert!(report.contains("4 still queued"), "{report}");
+        assert!(report.contains("0 DROPPED"), "{report}");
+    }
+
     #[test]
     fn kiro_v3_live_lifecycle_fixtures_share_native_context() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -972,7 +1204,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -991,7 +1223,7 @@ mod tests {
             antigravity_hook_args("pre-tool-use", "http://127.0.0.1:1"),
             "not-json".into(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1119,7 +1351,7 @@ mod tests {
             devin_hook_args("session-start"),
             payload.to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1159,7 +1391,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1211,7 +1443,7 @@ mod tests {
             devin_hook_args("post-tool-use"),
             payload.to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1249,7 +1481,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1265,7 +1497,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1408,7 +1640,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1421,7 +1653,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1450,6 +1682,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         };
 
         run_with_payload(
@@ -1457,7 +1690,7 @@ mod tests {
             args,
             r#"{"session_id":"s","cwd":"/tmp"}"#.into(),
             &mut stdout,
-            |path| {
+            |path, _token| {
                 assert_eq!(path, data_dir.as_path());
                 assert_eq!(hook_spool::spool_len(&spool), 1, "spawn runs after enqueue");
                 called.set(called.get() + 1);
@@ -1492,6 +1725,7 @@ mod tests {
                 project_strategy: None,
                 check_capture: false,
                 capture_assistant: false,
+                capture_mode: None,
             };
 
             run_with_payload(
@@ -1499,7 +1733,7 @@ mod tests {
                 args,
                 r#"{"session_id":"s","cwd":"/tmp"}"#.into(),
                 &mut stdout,
-                |path| {
+                |path, _token| {
                     assert_eq!(path, data_dir.as_path());
                     assert_eq!(hook_spool::spool_len(&spool), 1, "spawn runs after enqueue");
                     called.set(called.get() + 1);
@@ -1533,11 +1767,16 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         };
 
-        run_with_payload(Some(data_dir), args, "{}".into(), &mut stdout, |_path| {
-            Err(std::io::Error::other("spawn failed"))
-        })
+        run_with_payload(
+            Some(data_dir),
+            args,
+            "{}".into(),
+            &mut stdout,
+            |_path, _token| Err(std::io::Error::other("spawn failed")),
+        )
         .await
         .unwrap();
 
@@ -1560,6 +1799,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         };
 
         run_with_payload(
@@ -1567,7 +1807,7 @@ mod tests {
             args,
             r#"{"hook_event_name":"SessionEnd"}"#.into(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1591,7 +1831,7 @@ mod tests {
     #[test]
     fn session_end_spawn_failure_is_returned_for_warning_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = after_background_drain_event_enqueue(tmp.path(), |_path| {
+        let err = after_background_drain_event_enqueue(tmp.path(), None, |_path, _token| {
             Err(std::io::Error::other("spawn failed"))
         })
         .unwrap_err();
@@ -1604,7 +1844,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let called = std::cell::Cell::new(false);
 
-        after_background_drain_event_enqueue(tmp.path(), |path| {
+        after_background_drain_event_enqueue(tmp.path(), None, |path, _token| {
             assert_eq!(path, tmp.path());
             called.set(true);
             Ok(())
@@ -1654,7 +1894,7 @@ mod tests {
         let called = std::cell::Cell::new(false);
         let mut args = devin_hook_args("post-tool-use");
         args.server_url = "http://127.0.0.1:1".into();
-        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"secret/SENTINEL"}}).to_string(), &mut stdout, |_| { called.set(true); Ok(()) }).await.unwrap();
+        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"secret/SENTINEL"}}).to_string(), &mut stdout, |_, _| { called.set(true); Ok(()) }).await.unwrap();
         assert_eq!(stdout, b"{}\n");
         assert!(!called.get());
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
@@ -1689,7 +1929,48 @@ mod tests {
             args,
             raw.to_string(),
             &mut stdout,
-            |_| {
+            |_, _| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        assert!(!called.get());
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[tokio::test]
+    async fn pool_file_exclusion_drops_before_spool_or_drain() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        let called = std::cell::Cell::new(false);
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "pool".into();
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "write",
+            "tool_input": {
+                "path": "secret/token.txt",
+                "content": "SENTINEL_MUST_NOT_BE_SPOOLED"
+            },
+            "session_id": "pool-session",
+            "cwd": tmp.path()
+        });
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            raw.to_string(),
+            &mut stdout,
+            |_, _| {
                 called.set(true);
                 Ok(())
             },
@@ -1729,7 +2010,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| {
+            |_, _| {
                 called.set(true);
                 Ok(())
             },
@@ -1752,7 +2033,7 @@ mod tests {
         .unwrap();
         let data_dir = tmp.path().join("data");
         let mut stdout = Vec::new();
-        run_with_payload(Some(data_dir.clone()), devin_hook_args("post-tool-use"), serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL_PATH","args":"SENTINEL_ARGS"},"output":"SENTINEL_OUTPUT","error":"SENTINEL_ERROR","nested":{"raw":"SENTINEL_NESTED"}}).to_string(), &mut stdout, |_| Ok(())).await.unwrap();
+        run_with_payload(Some(data_dir.clone()), devin_hook_args("post-tool-use"), serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL_PATH","args":"SENTINEL_ARGS"},"output":"SENTINEL_OUTPUT","error":"SENTINEL_ERROR","nested":{"raw":"SENTINEL_NESTED"}}).to_string(), &mut stdout, |_, _| Ok(())).await.unwrap();
         let entry = read_spooled_entries(&hook_spool::spool_dir(&data_dir))
             .pop()
             .unwrap();
@@ -1775,9 +2056,32 @@ mod tests {
         let mut args = devin_hook_args("post-tool-use");
         args.check_capture = true;
         let mut stdout = Vec::new();
-        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL"}}).to_string(), &mut stdout, |_| Err(std::io::Error::other("must not spawn"))).await.unwrap();
+        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL"}}).to_string(), &mut stdout, |_, _| Err(std::io::Error::other("must not spawn"))).await.unwrap();
         let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-        assert_eq!(output.as_object().unwrap().len(), 6);
+        // Pin the exact key set, not just its size: `--check-capture` is how an
+        // operator verifies an opt-out, so a field silently appearing or
+        // vanishing here is a defect in its own right.
+        let mut keys: Vec<&str> = output
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "admits_capture",
+                "capture_mode",
+                "disposition",
+                "extraction_state",
+                "marker_present",
+                "path_count",
+                "policy_state",
+                "tool_family",
+                "version",
+            ]
+        );
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
         assert!(!String::from_utf8(stdout).unwrap().contains("SENTINEL"));
     }
@@ -1795,7 +2099,7 @@ mod tests {
             devin_hook_args("post-tool-use"),
             inactive_payload.clone(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1816,7 +2120,7 @@ mod tests {
             serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"public"}})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1847,7 +2151,7 @@ mod tests {
             args,
             raw.to_string(),
             &mut stdout,
-            |_| Err(std::io::Error::other("must not spawn")),
+            |_, _| Err(std::io::Error::other("must not spawn")),
         )
         .await
         .unwrap();
@@ -1880,7 +2184,7 @@ mod tests {
                 devin_hook_args("post-tool-use"),
                 raw.to_string(),
                 &mut stdout,
-                |_| Ok(()),
+                |_, _| Ok(()),
             )
             .await
             .unwrap();
@@ -1901,6 +2205,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         }
     }
 
@@ -1913,6 +2218,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         }
     }
 
@@ -1925,6 +2231,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         }
     }
 
@@ -1984,7 +2291,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2032,7 +2339,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Err(std::io::Error::other("must not spawn")),
+            |_, _| Err(std::io::Error::other("must not spawn")),
         )
         .await
         .unwrap();
@@ -2056,7 +2363,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2091,7 +2398,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2122,7 +2429,7 @@ mod tests {
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2139,7 +2446,7 @@ mod tests {
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2159,7 +2466,7 @@ mod tests {
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2185,7 +2492,7 @@ mod tests {
             kimi_hook_args("session-start", &base),
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path()}).to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2210,7 +2517,7 @@ mod tests {
             args,
             serde_json::json!({"session_id": "claude-session", "cwd": tmp.path()}).to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2255,7 +2562,7 @@ mod tests {
             kimi_hook_args("user-prompt-submit", &base),
             payload.clone(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2276,7 +2583,7 @@ mod tests {
             kimi_hook_args("user-prompt-submit", &base),
             payload,
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2308,7 +2615,7 @@ mod tests {
             kimi_hook_args("user-prompt", &base),
             payload.clone(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2327,7 +2634,7 @@ mod tests {
             kimi_hook_args("user-prompt", &base),
             payload,
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2356,7 +2663,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();

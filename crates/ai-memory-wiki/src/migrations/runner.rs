@@ -55,6 +55,17 @@ pub async fn run_pending(
 
     let applied = applied_names(reader).await?;
 
+    // Generation guard (docs/okf.md): a name in `wiki_migrations` that
+    // this binary's registry does not know means the wiki was migrated
+    // by a NEWER ai-memory. Opening it read-write with an older binary
+    // would mix formats silently; refuse with the recovery options.
+    let known: Vec<&str> = registry.iter().map(|m| m.name()).collect();
+    if let Some(unknown) = applied.iter().find(|n| !known.contains(&n.as_str())) {
+        return Err(WikiError::NewerWikiFormat {
+            migration: unknown.clone(),
+        });
+    }
+
     for migration in registry {
         let name = migration.name();
         if applied.iter().any(|n| n == name) {

@@ -28,13 +28,154 @@ pub fn prepare_fts5_query(raw: &str) -> String {
             .any(|t| matches!(t, "OR" | "AND" | "NOT" | "NEAR"));
     let tokens: Vec<String> = raw
         .split_whitespace()
+        // Bare natural-language queries drop stopwords before the
+        // OR-join: with no tokenizer-level stopword list, "the/of/a"
+        // match nearly every page and BM25 term frequency lets a page
+        // with five "the"s outrank the page whose CONTENT matches (seen
+        // live: a release-procedure page beaten for a deploy question).
+        // Explicit-syntax queries and quoted phrases are untouched, and
+        // a query that is ONLY stopwords keeps them all — returning the
+        // user's literal terms beats returning nothing.
+        .filter(|t| explicit_syntax || !is_stopword(t))
         .flat_map(prepare_fts5_token)
         .collect();
+    let tokens = if tokens.is_empty() && !explicit_syntax {
+        raw.split_whitespace()
+            .flat_map(prepare_fts5_token)
+            .collect()
+    } else {
+        tokens
+    };
     if tokens.is_empty() {
         return String::new();
     }
     let separator = if explicit_syntax { " " } else { " OR " };
-    tokens.join(separator)
+    let candidate = tokens.join(separator);
+    // Natural language trips the explicit-syntax path constantly — `(MoMA)`,
+    // `'quoted phrases'`, a sentence that happens to contain OR — and a
+    // preserved-verbatim mix can be grammatically invalid FTS5 (a quoted
+    // OR-group adjacent to a bare term has no implicit AND, for one). The
+    // MATCH must never error on user text, so validate the candidate against
+    // a real FTS5 parser and degrade to the always-valid quoted bag of words
+    // when it does not parse. Deliberate, well-formed operator queries pass
+    // validation and are preserved.
+    if fts5_query_parses(&candidate) {
+        return candidate;
+    }
+    raw.split_whitespace()
+        .flat_map(|token| {
+            // Re-tokenize with every operator neutralised: strip quotes and
+            // parens, then quote what remains.
+            let cleaned: String = token
+                .chars()
+                .map(|c| if matches!(c, '"' | '(' | ')') { ' ' } else { c })
+                .collect();
+            cleaned
+                .split_whitespace()
+                .map(quote_fts5_token)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// Whether FTS5's own parser accepts `query`. Uses a throwaway in-memory
+/// table (microseconds; search-path frequency, not ingest-path) so the
+/// judgement is the engine's, not a re-implementation of its grammar.
+fn fts5_query_parses(query: &str) -> bool {
+    thread_local! {
+        // One probe connection per thread: opening a fresh in-memory
+        // database per search query was measurable overhead on the
+        // read-pool hot path (post-audit nit).
+        static PROBE: Option<rusqlite::Connection> = {
+            let conn = rusqlite::Connection::open_in_memory().ok();
+            if let Some(c) = &conn
+                && c.execute_batch("CREATE VIRTUAL TABLE fts_probe USING fts5(title, body)")
+                    .is_err()
+            {
+                None
+            } else {
+                conn
+            }
+        };
+    }
+    PROBE.with(|probe| {
+        probe.as_ref().is_some_and(|conn| {
+            conn.query_row(
+                "SELECT count(*) FROM fts_probe WHERE fts_probe MATCH ?1",
+                [query],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok()
+        })
+    })
+}
+
+/// English stopwords excluded from bare-query OR-joins. Deliberately
+/// small and boring: high-document-frequency function words that carry
+/// no retrieval signal but dominate BM25 through term frequency. Words
+/// inside quoted phrases and explicit-operator queries never pass
+/// through this filter.
+fn is_stopword(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "been"
+            | "but"
+            | "by"
+            | "can"
+            | "could"
+            | "did"
+            | "do"
+            | "does"
+            | "for"
+            | "from"
+            | "had"
+            | "has"
+            | "have"
+            | "how"
+            | "i"
+            | "if"
+            | "in"
+            | "is"
+            | "it"
+            | "its"
+            | "me"
+            | "my"
+            | "of"
+            | "on"
+            | "or"
+            | "our"
+            | "she"
+            | "should"
+            | "so"
+            | "that"
+            | "the"
+            | "their"
+            | "them"
+            | "they"
+            | "this"
+            | "to"
+            | "was"
+            | "we"
+            | "were"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "who"
+            | "why"
+            | "will"
+            | "with"
+            | "would"
+            | "you"
+            | "your"
+    )
 }
 
 fn prepare_fts5_token(token: &str) -> Vec<String> {
@@ -111,6 +252,70 @@ fn quote_fts5_token(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine, not this module, is the judge of validity: every
+    /// prepared query must MATCH without error on a real FTS5 table.
+    fn assert_parses(prepared: &str) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+            .unwrap();
+        let res = conn.query_row(
+            "SELECT count(*) FROM t WHERE t MATCH ?1",
+            [prepared],
+            |row| row.get::<_, i64>(0),
+        );
+        assert!(res.is_ok(), "FTS5 rejected {prepared:?}: {res:?}");
+    }
+
+    /// Regression (found by the LongMemEval harness): a natural-language
+    /// question containing parens and apostrophe-quotes tripped the
+    /// explicit-syntax path and produced invalid FTS5 — `fts5: syntax
+    /// error near "OR"` — failing the whole memory_query call.
+    #[test]
+    fn natural_language_with_parens_and_quotes_never_errors() {
+        let raw = "How many days passed between my visit to the Museum of \
+                   Modern Art (MoMA) and the 'Ancient Civilizations' exhibit \
+                   at the Metropolitan Museum of Art?";
+        let prepared = prepare_fts5_query(raw);
+        assert_parses(&prepared);
+        // and the degraded form still carries the searchable words
+        assert!(prepared.contains("MoMA"));
+        assert!(prepared.contains("Civilizations"));
+    }
+
+    #[test]
+    fn hostile_operator_soup_never_errors() {
+        for raw in [
+            "((",
+            "\"unclosed phrase",
+            "NEAR(",
+            "OR",
+            "a OR",
+            "OR b",
+            "NOT",
+            ") misplaced (",
+            "col:val:col ( OR \" NEAR",
+            "\"\"\"",
+        ] {
+            let prepared = prepare_fts5_query(raw);
+            if !prepared.is_empty() {
+                assert_parses(&prepared);
+            }
+        }
+    }
+
+    #[test]
+    fn deliberate_well_formed_syntax_is_preserved() {
+        let prepared = prepare_fts5_query("title:handoff OR body:deploy");
+        assert_parses(&prepared);
+        assert_eq!(prepared, "title:handoff OR body:deploy");
+        // Quoted phrases were re-tokenized into escaped-quote form long
+        // before the validation fallback existed; the contract here is
+        // "still valid FTS5 with AND preserved", not byte identity.
+        let phrase = prepare_fts5_query("\"exact phrase\" AND deploy");
+        assert_parses(&phrase);
+        assert!(phrase.contains(" AND deploy"), "{phrase}");
+    }
 
     #[test]
     fn colon_is_not_column_syntax() {

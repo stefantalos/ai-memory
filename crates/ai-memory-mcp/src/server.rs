@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Consolidator, projection::cap_text_with_marker,
-    run_auto_improve_review, run_lint, run_sweep_with_breadth,
+    AutoImproveReviewConfig, Consolidator, ObservationRetention, projection::cap_text_with_marker,
+    run_auto_improve_review, run_lint, run_sweep_with_options,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, FeedbackKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath,
@@ -67,6 +67,8 @@ fn default_auto_improve_review_config() -> AutoImproveReviewConfig {
         max_procedure_page_tokens:
             ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
         eval: ai_memory_consolidate::AutoImproveEvalConfig::default(),
+        review_max_output_tokens:
+            ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_REVIEW_MAX_OUTPUT_TOKENS,
     }
 }
 
@@ -295,7 +297,9 @@ should be proposed from a completed session, or at explicit wrap-up \
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
-  pages (idempotent, supports dry-run).\n\
+  pages. Three passes: expired pages are hard-deleted even when \
+  pinned, cold episodic pages decay to tombstones (pinned exempt), \
+  old tombstones are purged (idempotent, supports dry-run).\n\
 - `memory_install_self_routing` — when the user asks to 'install \
   ai-memory routing into this project' or 'add ai-memory to \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
@@ -318,7 +322,10 @@ search EVERY project in EVERY workspace at once when you don't know \
 where the knowledge lives — each hit then carries its workspace + \
 project name. `global=true` cannot be combined with \
 `scopes`/`project`/`workspace`. Don't conclude 'we never recorded \
-it' after one project misses. Note also that `memory_query` returns \
+it' after one project misses. For \"what did we know about X back \
+then\" questions, pass `as_of` (ISO-8601 instant) — the query becomes \
+an entity-timeline lookup returning the page versions valid at that \
+moment, including ones superseded since. Note also that `memory_query` returns \
 SNIPPETS, not full page bodies — an empty or short snippet does NOT \
 mean the page is empty (a large page can match outside the snippet \
 window); to read the whole page use `memory_read_page` (by `path`, \
@@ -379,6 +386,9 @@ pub struct AiMemoryServer {
     decay_params: DecayParams,
     /// Optional distinct-reader reinforcement coefficient.
     decay_breadth_weight: f64,
+    /// Opt-in bound on how long raw observations outlive their consolidation.
+    /// Default is disabled, so `memory_forget_sweep` deletes no raw capture.
+    observation_retention: ObservationRetention,
     /// M9 embedder for hybrid query. When `None`, `memory_query`
     /// still fuses FTS5 with entity matches and graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
@@ -502,6 +512,15 @@ struct QueryArgs {
     /// Default false.
     #[serde(default)]
     explain: Option<bool>,
+    /// Time-travel: an ISO-8601 instant (e.g. `2026-06-01T00:00:00Z`).
+    /// When set, the query becomes an ENTITY-TIMELINE lookup: it returns
+    /// the page versions whose entity-link validity windows contained
+    /// that instant — what the store knew about the named entities then,
+    /// including versions superseded since (docs/temporal.md). FTS /
+    /// vector / graph streams are skipped in this mode; cannot be
+    /// combined with `global` or `scopes`. Omit for a normal search.
+    #[serde(default)]
+    as_of: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -851,7 +870,7 @@ struct SweepArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct LintArgs {
-    /// If true, don't write wiki/_lint/<date>.md. Default false.
+    /// If true, don't write wiki/_lint/report.md. Default false.
     #[serde(default)]
     dry_run: Option<bool>,
     /// If true, skip the LLM contradiction pass (rule-based only).
@@ -1061,22 +1080,18 @@ struct ExploreArgs {
     workspace: Option<String>,
 }
 
-// The `anyOf` encodes the "you MUST pass exactly one of path/query"
-// contract in the machine-readable schema (issue #155): each branch
-// demands the key's PRESENCE via `required` AND a non-null `type`, because
-// clients that null-fill defaulted args (OpenCode) would satisfy a bare
-// `required` with `path: null` and still hit the runtime error. Encoding
-// it here lets schema-respecting clients refuse the invalid call before
-// it ever reaches the server.
-//
-// Moonshot ("moonshot flavored json schema") rejects this root-level
-// `anyOf`; Kimi Code sessions get a patched schema instead
-// (`moonshot_safe_tool_list`). Every other client keeps this exact shape.
+// The "you MUST pass exactly one of path/query" contract lives in the
+// field descriptions and the runtime validation, NOT in a root-level
+// `anyOf` (#577). The machine-readable encoding (#155) let
+// schema-respecting clients refuse a null-filled call pre-flight — but
+// the Anthropic Messages API rejects root-level `anyOf`/`oneOf`/`allOf`
+// outright, so ANY provider-agnostic client routing tools through it
+// (OpenCode with an Anthropic key, and every other Messages-API
+// consumer) had its WHOLE session 400 before a single tool ran. One
+// wasted round-trip for a null-filling client is a far smaller cost
+// than dead sessions on the most common upstream; the per-flavor strip
+// machinery (#412) stays for any future dialect that needs it.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[schemars(extend("anyOf" = [
-    {"required": ["path"], "properties": {"path": {"type": "string"}}},
-    {"required": ["query"], "properties": {"query": {"type": "string"}}},
-]))]
 struct ReadPageArgs {
     /// FTS5 query to find the page (searches and returns the top hit's full
     /// body). You MUST pass exactly one of `query` or `path` — never neither,
@@ -1256,6 +1271,7 @@ impl AiMemoryServer {
             wiki: None,
             decay_params: DecayParams::default(),
             decay_breadth_weight: 0.0,
+            observation_retention: ObservationRetention::default(),
             embedder: None,
             reranker: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
@@ -1768,6 +1784,14 @@ impl AiMemoryServer {
         self
     }
 
+    /// Set the opt-in observation prune bound used by `memory_forget_sweep`.
+    /// Unset, the sweep never deletes a raw observation.
+    #[must_use]
+    pub fn with_observation_retention(mut self, retention: ObservationRetention) -> Self {
+        self.observation_retention = retention;
+        self
+    }
+
     /// Attach the wiki handle. Without this, `memory_forget_sweep`
     /// and `memory_lint` cannot write their report pages.
     #[must_use]
@@ -1890,6 +1914,46 @@ impl AiMemoryServer {
                 "scopes cannot be combined with workspace/project",
                 None,
             ));
+        }
+
+        // Time-travel entity lookup (docs/temporal.md): entity stream
+        // only, against the ingestion-time validity windows.
+        if let Some(raw_as_of) = args.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
+            if args.global.unwrap_or(false) || !args.scopes.is_empty() {
+                return Err(McpError::internal_error(
+                    "as_of cannot be combined with global or scopes",
+                    None,
+                ));
+            }
+            let instant: jiff::Timestamp = raw_as_of.trim().parse().map_err(|e| {
+                McpError::internal_error(format!("as_of must be an ISO-8601 instant: {e}"), None)
+            })?;
+            let (ws, proj) = self
+                .effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                )
+                .await?;
+            let hits = self
+                .reader
+                .entity_hits_for_project_at(
+                    ws,
+                    proj,
+                    &args.query,
+                    limit,
+                    None,
+                    Some(instant.as_microsecond()),
+                )
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return ok_json(&MemoryQueryResponse {
+                hits: hits.into_iter().map(|h| QueryHit::from(h.hit)).collect(),
+                raw_hits: Vec::new(),
+                global_hits: Vec::new(),
+                global_scope_hits: Vec::new(),
+                streams_active: explain.then(|| vec!["entity"]),
+            });
         }
 
         let query = args.query.clone();
@@ -2373,12 +2437,26 @@ impl AiMemoryServer {
     }
 
     /// Run the M8 forget sweep over episodic pages.
-    #[tool(description = "Run the retention sweep: walk is_latest=1 \
-        episodic pages, score them with the agentmemory-style retention \
-        formula (salience * exp(-lambda * age) + sigma * log(1 + accesses) \
-        * exp(-mu * days_since_access)), and evict those below the cold \
-        threshold through the wiki layer. Semantic / procedural / pinned pages are exempt. \
-        Pass dry_run=true to preview.")]
+    #[tool(description = "Run the retention sweep. FOUR passes, and they \
+        differ on what they will delete. (1) TTL: pages whose frontmatter \
+        expires_at is in the past are hard-deleted (file + rows) REGARDLESS \
+        OF TIER OR PIN — an explicit expiry overrides a pin, so a pinned \
+        page CAN be deleted by this pass. (2) Decay: is_latest=1 episodic \
+        pages are scored with the agentmemory-style retention formula \
+        (salience * exp(-lambda * age) + sigma * log(1 + accesses) * \
+        exp(-mu * days_since_access)) and those below the cold threshold are \
+        evicted to a tombstone; only this pass exempts semantic / procedural \
+        / pinned pages. (3) Hard-delete: tombstones older than \
+        hard_delete_after_days and their supersession ancestry are removed \
+        permanently. (4) Observation prune: raw observations older than \
+        decay.observation_retention_days are deleted permanently, in bounded \
+        batches, but ONLY for sessions already consolidated into a summary \
+        page that is still live — an unconsolidated session, or one whose \
+        page pass 2 or 3 just removed, keeps every row. This pass is DISABLED \
+        by default (observation_retention_days = 0) and deletes nothing until \
+        an operator opts in; when off, observations_pruned is 0. The report's \
+        expired / hard_deleted / observations_pruned counts come from passes \
+        1, 3 and 4. Pass dry_run=true to preview.")]
     async fn memory_forget_sweep(
         &self,
         Parameters(args): Parameters<SweepArgs>,
@@ -2396,7 +2474,7 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
-        let report = run_sweep_with_breadth(
+        let report = run_sweep_with_options(
             &self.reader,
             &self.writer,
             self.wiki.as_ref(),
@@ -2404,6 +2482,7 @@ impl AiMemoryServer {
             proj,
             &self.decay_params,
             self.decay_breadth_weight,
+            self.observation_retention,
             args.dry_run.unwrap_or(false),
         )
         .await
@@ -2415,7 +2494,7 @@ impl AiMemoryServer {
     #[tool(description = "Audit the wiki for stale episodic pages, \
         duplicate titles, broken cross-references, and (if an LLM \
         provider is configured) contradictions across semantic pages. \
-        Findings land in wiki/_lint/<date>.md unless dry_run=true.")]
+        Findings land in wiki/_lint/report.md unless dry_run=true.")]
     async fn memory_lint(
         &self,
         Parameters(args): Parameters<LintArgs>,
@@ -2595,6 +2674,7 @@ impl AiMemoryServer {
             max_rule_page_tokens: defaults.max_rule_page_tokens,
             max_procedure_page_tokens: defaults.max_procedure_page_tokens,
             eval: defaults.eval.clone(),
+            review_max_output_tokens: defaults.review_max_output_tokens,
         };
 
         let report =
@@ -3030,11 +3110,12 @@ impl AiMemoryServer {
         // so operators can fix the disk source of truth.
         match wiki.read_page(ws, proj, &page_path) {
             Ok(md) => {
-                let title = md
-                    .frontmatter
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
+                // Derive the title so an empty/absent frontmatter `title`
+                // falls back to the body's H1 (then the path stem), instead
+                // of surfacing "" — auto-improve pages whose stored
+                // frontmatter title was never filled otherwise read back
+                // titleless despite a proper `# Heading` (#599).
+                let title = ai_memory_wiki::derive_title(&md.frontmatter, &md.body, &page_path);
                 ok_json(&serde_json::json!({
                     "path": page_path.to_string(),
                     "title": title,
@@ -4873,6 +4954,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: Some(true),
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4903,6 +4985,7 @@ mod tests {
                         global: Some(true),
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -5942,6 +6025,89 @@ mod tests {
         });
     }
 
+    /// `memory_forget_sweep` is admin-gated and destructive, and the surface
+    /// an agent reads is the only place it can learn what the tool will
+    /// delete. Both surfaces must name all four passes and must not claim a
+    /// blanket pin exemption.
+    ///
+    /// The description previously said "Semantic / procedural / pinned pages
+    /// are exempt" full stop, which is true of the decay pass and false of
+    /// the TTL pass: `sweep.rs` pushes any candidate whose `expires_at` has
+    /// passed into `expired` and `continue`s three lines *before* the only
+    /// pin check. An agent asked "is it safe to run, I have pinned pages?"
+    /// had no way to answer anything but yes (#485). The behaviour is
+    /// deliberate — an explicit expiry is a more specific instruction than a
+    /// pin, pinned by `lifecycle.rs` — so the surface is what had to change.
+    #[tokio::test]
+    async fn forget_sweep_surfaces_name_every_pass_and_scope_the_pin_exemption() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools = server.tool_router.list_all();
+        let sweep = tools
+            .iter()
+            .find(|t| t.name == "memory_forget_sweep")
+            .expect("memory_forget_sweep must be registered");
+        let desc = sweep
+            .description
+            .as_deref()
+            .expect("memory_forget_sweep must carry a description");
+
+        // The TTL pass must be named, and named as pin-overriding. This is
+        // the deletion-safety claim that was wrong.
+        assert!(
+            desc.contains("expires_at"),
+            "description must name the TTL pass trigger; got: {desc}"
+        );
+        assert!(
+            desc.contains("REGARDLESS OF TIER OR PIN"),
+            "description must state that TTL overrides a pin; got: {desc}"
+        );
+        // The decay pass keeps its exemption, but scoped to itself.
+        assert!(
+            desc.contains("only this pass exempts"),
+            "the pin exemption must be scoped to the decay pass; got: {desc}"
+        );
+        // The third pass, so `hard_deleted` in the report is interpretable.
+        assert!(
+            desc.contains("hard_delete_after_days"),
+            "description must name the hard-delete pass; got: {desc}"
+        );
+        // The fourth pass deletes raw capture, not pages, and can remove
+        // millions of rows on a real install. An agent that cannot read it
+        // here cannot know the tool touches observations at all — which is the
+        // exact regression this test was written to stop.
+        assert!(
+            desc.contains("observation_retention_days"),
+            "description must name the observation prune pass; got: {desc}"
+        );
+        assert!(
+            desc.contains("consolidated") && desc.contains("still live"),
+            "description must state that only consolidated sessions with a live \
+             page are pruned; got: {desc}"
+        );
+        assert!(
+            desc.contains("DISABLED"),
+            "description must state that observation pruning is off by default; \
+             got: {desc}"
+        );
+        assert!(
+            !desc.contains("THREE passes"),
+            "the three-pass wording must not come back now there are four; got: {desc}"
+        );
+        // A bare unqualified exemption sentence is exactly the regression
+        // this guards, so reject the old wording verbatim.
+        assert!(
+            !desc.contains("Semantic / procedural / pinned pages are exempt."),
+            "the unscoped pin-exemption claim must not come back; got: {desc}"
+        );
+
+        // MEMORY_INSTRUCTIONS is read before an agent ever inspects
+        // `tools/list`, so it carries the same obligation.
+        assert!(
+            MEMORY_INSTRUCTIONS.contains("hard-deleted even when"),
+            "MEMORY_INSTRUCTIONS must warn that expired pages delete despite a pin"
+        );
+    }
+
     /// All three prompt surfaces must steer agents toward the H1-in-body
     /// convention instead of passing the `title` argument. The `title`
     /// argument is a known source of `JSON parsing` errors when the LLM
@@ -6242,6 +6408,102 @@ mod tests {
         );
     }
 
+    /// `as_of` turns memory_query into an entity-timeline lookup
+    /// (docs/temporal.md): a superseded version answers for the instant
+    /// it was valid, the current version answers for now, and the mode
+    /// refuses to combine with global/scopes.
+    #[tokio::test]
+    async fn memory_query_as_of_travels_the_entity_timeline() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let mut v1 = ai_memory_core::NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: ai_memory_core::PagePath::new("notes/db.md").unwrap(),
+            title: "DB".into(),
+            body: "we use postgres".into(),
+            tier: ai_memory_core::Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: vec!["postgres".into()],
+        };
+        store.writer.upsert_page(v1.clone()).await.unwrap();
+        let between = jiff::Timestamp::now().to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        v1.body = "we migrated".into();
+        v1.entities = vec!["sqlite".into()];
+        store.writer.upsert_page(v1).await.unwrap();
+
+        let args = |as_of: Option<String>, global: Option<bool>| QueryArgs {
+            query: "postgres".into(),
+            limit: Some(5),
+            project: Some("scratch".into()),
+            scopes: Vec::new(),
+            workspace: Some("default".into()),
+            global,
+            include_expired: None,
+            explain: Some(true),
+            as_of,
+        };
+
+        // Historical instant → the superseded version answers.
+        let result = server
+            .memory_query(
+                Parameters(args(Some(between), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .unwrap()
+            .text
+            .clone();
+        assert!(text.contains("notes/db.md"), "{text}");
+        assert!(text.contains("\"entity\""), "entity-only mode: {text}");
+
+        // Same query without as_of → no postgres hit anymore... the FTS
+        // stream may still match old text? No: default searches latest
+        // pages only, whose body says "we migrated".
+        let now_result = server
+            .memory_query(
+                Parameters(args(None, None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let now_text = now_result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .unwrap()
+            .text
+            .clone();
+        assert!(!now_text.contains("notes/db.md"), "{now_text}");
+
+        // Refusal: as_of + global is ambiguous.
+        let err = server
+            .memory_query(
+                Parameters(args(Some("2026-06-01T00:00:00Z".into()), Some(true))),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(err.is_err(), "as_of+global must be refused");
+
+        // Garbage instant is a clear error, not a silent default.
+        let bad = server
+            .memory_query(
+                Parameters(args(Some("not-a-time".into()), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(bad.is_err());
+    }
+
     #[tokio::test]
     async fn memory_query_returns_hits_via_tool_method() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
@@ -6256,6 +6518,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6280,6 +6543,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: Some(true),
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6370,6 +6634,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: Some(true),
+                        as_of: None,
                     }),
                     OptionalParts(test_parts_default()),
                 )
@@ -6455,6 +6720,7 @@ mod tests {
             global: None,
             include_expired: None,
             explain: None,
+            as_of: None,
         };
 
         let result = server
@@ -6531,6 +6797,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6658,6 +6925,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6736,6 +7004,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 test_optional_parts(),
             )
@@ -6830,6 +7099,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -6895,6 +7165,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -6936,6 +7207,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 test_optional_parts(),
             )
@@ -7009,6 +7281,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -7073,6 +7346,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7092,23 +7366,49 @@ mod tests {
     // non-null type — a bare `required` is satisfied by OpenCode-style
     // `path: null` filling. Pins against a schemars upgrade silently
     // dropping the `extend` attribute.
+    /// #577's class fence: NO registered tool may carry a root-level
+    /// combinator — one bad tool 400s the entire session for every
+    /// Messages-API-routed client.
+    #[tokio::test]
+    async fn no_tool_schema_carries_root_combinators() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        for tool in server.tool_router.list_all() {
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            for key in ["anyOf", "oneOf", "allOf"] {
+                assert!(
+                    schema.get(key).is_none(),
+                    "tool `{}` carries root-level `{key}`; Anthropic-routed \
+                     clients reject the whole session over it",
+                    tool.name
+                );
+            }
+        }
+    }
+
     #[test]
-    fn read_page_schema_encodes_one_of_path_or_query() {
+    fn read_page_schema_carries_no_root_combinators() {
+        // #577: the Anthropic Messages API rejects root-level
+        // anyOf/oneOf/allOf on input_schema — a tool carrying one kills
+        // the WHOLE session for every Messages-API-routed client before
+        // any tool runs. The exactly-one contract lives in the field
+        // descriptions and runtime validation instead. This pins every
+        // tool schema, not just memory_read_page, so the class cannot
+        // come back through another tool.
         let schema = serde_json::to_value(schemars::schema_for!(ReadPageArgs)).unwrap();
-        let any_of = schema
-            .get("anyOf")
-            .and_then(|v| v.as_array())
-            .unwrap_or_else(|| panic!("schema must carry the anyOf constraint: {schema}"));
-        for key in ["path", "query"] {
-            let branch = any_of
-                .iter()
-                .find(|b| b["required"] == serde_json::json!([key]))
-                .unwrap_or_else(|| panic!("missing anyOf branch requiring `{key}`: {schema}"));
-            assert_eq!(
-                branch["properties"][key]["type"],
-                serde_json::json!("string"),
-                "`{key}` branch must demand a non-null string so null-filling \
-                 clients cannot satisfy it"
+        for key in ["anyOf", "oneOf", "allOf"] {
+            assert!(
+                schema.get(key).is_none(),
+                "root-level `{key}` breaks Anthropic-routed clients: {schema}"
+            );
+        }
+        // The contract itself is still declared to the model.
+        for field in ["path", "query"] {
+            let desc = schema["properties"][field]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                desc.contains("exactly one"),
+                "`{field}` description must state the exactly-one contract"
             );
         }
     }
@@ -8084,6 +8384,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: Some(true),
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8190,6 +8491,7 @@ mod tests {
                     global: Some(true),
                     include_expired: None,
                     explain: Some(true),
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8236,6 +8538,7 @@ mod tests {
                     global: Some(true),
                     include_expired: Some(true),
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8314,6 +8617,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8345,6 +8649,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8380,6 +8685,7 @@ mod tests {
                     global: Some(true),
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8768,18 +9074,17 @@ mod tests {
             .get_or_create_project(ws, "scratch", None)
             .await
             .unwrap();
-        let token = ai_memory_store::generate_token().unwrap();
-        let pepper = ai_memory_store::TokenPepper::new("test-pepper-author");
-        let token_hash = ai_memory_store::hash_token(&token, &pepper);
         let user_id = store
             .writer
-            .create_user(
+            .create_human_user(
                 NewUser {
                     username: "alice".into(),
                     name: Some("Alice Smith".into()),
                     email: Some("alice@example.com".into()),
                 },
-                token_hash,
+                ai_memory_core::UserRole::User,
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -8870,10 +9175,7 @@ mod tests {
         user.validate().unwrap();
         store
             .writer
-            .create_user(
-                user,
-                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
-            )
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
             .await
             .unwrap();
 
@@ -8970,10 +9272,7 @@ mod tests {
         user.validate().unwrap();
         store
             .writer
-            .create_user(
-                user,
-                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
-            )
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
             .await
             .unwrap();
 
@@ -10829,6 +11128,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10862,6 +11162,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

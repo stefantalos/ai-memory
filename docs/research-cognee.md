@@ -1,5 +1,10 @@
 # cognee - Research Report
 
+> **Follow-up:** the September 2026 landscape refresh — how this project
+> evolved, what the field looks like now, and what we concluded — is in
+> [`research-2026-landscape.md`](research-2026-landscape.md).
+
+
 > Source project: `topoteretes/cognee` (Python, knowledge-graph + vector + relational, MCP server).
 
 ## 1. Purpose & Scope

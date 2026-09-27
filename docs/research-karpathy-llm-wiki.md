@@ -1,5 +1,10 @@
 # Karpathy's "LLM Wiki" - Research Report
 
+> **Follow-up:** the September 2026 landscape refresh — how this project
+> evolved, what the field looks like now, and what we concluded — is in
+> [`research-2026-landscape.md`](research-2026-landscape.md).
+
+
 > The pattern this project is trying to implement faithfully. Primary source
 > below; related/competing ideas listed for honest contrast.
 

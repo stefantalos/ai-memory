@@ -1,7 +1,10 @@
 //! Shared "is another ai-memory process alive?" check.
 //!
-//! Used by every destructive command (`reset`, `backup`, `restore`) so
-//! we never race a live writer (lesson from basic-memory #765).
+//! Used by direct-disk lifecycle operations that must not race a live writer:
+//! `reset`, `restore`, `reindex`, and `uninstall` when `--purge-data` is set
+//! (lesson from basic-memory #765). `backup` is intentionally excluded: it is a
+//! thin HTTP client, and the server snapshots SQLite through its online backup
+//! API while the writer stays live.
 
 use std::ffi::OsStr;
 

@@ -120,7 +120,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / vscode-copilot / zed
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / vscode-copilot / zed
 > ```
 
 ---
@@ -446,7 +446,7 @@ capture path; `SessionStart` also fetches pending handoffs.
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via
 `ai-memory install-hooks --agent antigravity-cli --apply`.
 
-**Config file (MCP):** `~/.gemini/antigravity-cli/mcp_config.json`
+**Config file (MCP):** `~/.gemini/config/mcp_config.json`
 
 Antigravity CLI is the successor to Gemini CLI, built in Go with
 parallel subagent support. It uses a separate `mcp_config.json`
@@ -530,7 +530,7 @@ The rendered hooks config looks like:
 - Antigravity CLI uses `serverUrl` for HTTP MCP endpoints, not `url`
   or `httpUrl`. The `--apply` flag writes the correct key.
 - MCP and hooks use separate files: MCP belongs in
-  `~/.gemini/antigravity-cli/mcp_config.json`, while hooks belong in
+  `~/.gemini/config/mcp_config.json`, while hooks belong in
   `~/.gemini/config/hooks.json`.
 - Hook scripts are staged under `~/.local/share/ai-memory/hooks/antigravity-cli/`.
 - Native Windows Docker-wrapper installs render hook entries as
@@ -601,6 +601,45 @@ ai-memory's subagent events). Zero discards `sessionStart` hook stdout, so
 capture and session-end handoff *creation* work, but handoff *injection*
 does not — ask Zero to call `memory_handoff_accept` at the start of a
 resumed session.
+
+## ZCode (z.ai)
+
+**Status:** MCP supported. Lifecycle hooks are not installed by this command;
+they are tracked in issue #512, so until then capture is not active and
+ai-memory only sees the sessions where an agent calls its MCP tools.
+
+**Config file:** ZCode keeps its user-scope config at
+`~/.zcode/cli/config.json`, with servers under the nested `mcp.servers` map
+(the same shape Zero and OpenClaw use). Workspace scopes
+(`.zcode/config.json`, `zcode.json`, `.agents/mcp.json`) also exist; pass
+`--config-file` to target one of them explicitly.
+
+```bash
+ai-memory install-mcp --client zcode --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+```
+
+which merges:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "ai-memory": {
+        "type": "http",
+        "url": "http://homelab:49374/mcp",
+        "headers": { "Authorization": "Bearer <token>" }
+      }
+    }
+  }
+}
+```
+
+The entry schema is strict: an entry carrying any key outside
+`type`/`url`/`headers`/`enabled`/`timeoutMs` is dropped silently, so the
+generated registration carries exactly those keys. The default stateless
+`/mcp` endpoint needs no flavor marker; auth goes in the `headers` map.
+Servers from every scope auto-connect at session start.
 
 ## Swival CLI
 
@@ -791,6 +830,36 @@ rejects root-level `anyOf`/`oneOf`/`allOf` combinators — including the
 `tools/list`. The ai-memory server answers requests carrying this flavor
 with flat schemas; every other client keeps receiving the upstream schemas
 unchanged.
+
+> **Do not register ai-memory with Kimi's own `mcp add`.** Kimi Code's
+> documented command —
+>
+> ```bash
+> kimi mcp add --transport http ai-memory http://127.0.0.1:49374/mcp
+> ```
+>
+> writes the plain URL, with no `?flavor=moonshot`. The server then serves
+> the upstream schemas, Moonshot rejects `memory_read_page`'s root-level
+> `anyOf`, and **every model turn fails with a 400** — including turns that
+> use no tools at all, because tool schemas ship with each request. Use
+> `ai-memory install-mcp --client kimi-code --apply` instead, which writes
+> the flavored URL for you.
+>
+> The failure is unusually hard to attribute: `kimi mcp test ai-memory`
+> **passes**, because it only lists tools and never sends them upstream. The
+> server looks healthy while every real turn dies.
+>
+> Already registered that way? Either re-run `install-mcp` as above, or set
+> the server-side floor and leave the client entry alone:
+>
+> ```bash
+> AI_MEMORY_STRIP_ROOT_COMBINATORS=true   # or `strip_root_combinators = true`
+> ```
+>
+> That serves the restricted dialect on every `tools/list` regardless of the
+> `?flavor=` marker, so any strict client that skips the marker is covered —
+> not just Kimi. A request's marker can only raise the dialect further, never
+> lower it. Reported in #474.
 
 **Config file (hooks):** `~/.kimi-code/config.toml` (same `$KIMI_CODE_HOME`
 base). Kimi Code stores hooks as `[[hooks]]` array entries in the same TOML

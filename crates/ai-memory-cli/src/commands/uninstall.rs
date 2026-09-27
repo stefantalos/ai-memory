@@ -344,6 +344,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             Omp,
             AntigravityCli,
             Zero,
+            Zcode,
             VsCodeCopilot,
             Zed,
             Devin,
@@ -633,6 +634,16 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         apply_change(change, name.as_deref(), &url)?;
     }
 
+    // Removing the hooks removes the only readers of the stored bearer, so
+    // leaving it on disk would strand a live credential (#552). Best-effort:
+    // an unremovable file must not fail a teardown that otherwise succeeded.
+    if let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir) {
+        eprintln!(
+            "ai-memory uninstall warning: could not remove the stored auth token under {}: {error}",
+            config.data_dir.display()
+        );
+    }
+
     if args.purge_data {
         for path in data_purge::purge_data_dirs(&config.data_dir)? {
             println!("✓ purged {}", path.display());
@@ -712,9 +723,9 @@ fn strip_legacy_orphan_tail(tail: &str) -> &str {
 /// True when a hook command string was written by ai-memory. Legacy script
 /// commands carry the unconditional `AI_MEMORY_HOOK_URL=` env prefix; native
 /// commands invoke the `ai-memory hook --event ... --server-url ...` subcommand.
-/// Keep both signatures narrow so uninstall does not remove unrelated hooks that
-/// happen to use the same event names or script basenames.
-fn hook_command_is_ours(command: &str) -> bool {
+/// Keep both signatures narrow so hook overlays and uninstall do not remove
+/// unrelated hooks that happen to use the same event names or script basenames.
+pub(crate) fn hook_command_is_ours(command: &str) -> bool {
     if command.contains("AI_MEMORY_HOOK_URL=") {
         return true;
     }
@@ -1095,7 +1106,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::Swival
         | McpClient::Devin => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
-        McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
+        McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
         McpClient::Zed => Some(&["context_servers"]),
         McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
@@ -1482,6 +1493,16 @@ mod tests {
     #[test]
     fn hook_signature_matches_native_windows_command() {
         let cmd = r#""C:\Users\alice\bin\ai-memory.exe" --data-dir "C:\Users\alice\AppData\Local\ai-memory" hook --event session-start --agent claude-code --server-url "http://h:49374""#;
+        assert!(hook_command_is_ours(cmd));
+    }
+
+    /// #515 gave Codex's Windows command a leading `& ` call operator.
+    /// `hook_command_is_ours` matches on substrings, so the prefix is
+    /// harmless — but if that ever became a prefix match, uninstall would
+    /// silently stop finding Codex hooks and leave them behind.
+    #[test]
+    fn hook_signature_matches_a_powershell_call_operator_command() {
+        let cmd = r#"& "C:\Users\alice\bin\ai-memory.exe" --data-dir "C:\Users\alice\AppData\Local\ai-memory" hook --event session-start --agent codex --server-url "http://h:49374""#;
         assert!(hook_command_is_ours(cmd));
     }
 

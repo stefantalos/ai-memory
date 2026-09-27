@@ -251,6 +251,75 @@ pub struct ManagedRunStatus {
     pub state: String,
 }
 
+/// Checkout identity used by read-only managed-workstream discovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListManagedWorkstreamsRequest {
+    /// Workspace name resolved by the host CLI.
+    pub workspace: String,
+    /// Project name resolved by the host CLI.
+    pub project: String,
+    /// Stable repository identity hash.
+    pub repo_fingerprint: String,
+    /// Stable worktree identity hash (distinct across linked worktrees).
+    pub worktree_fingerprint: String,
+    /// Maximum number of workstreams to return.
+    pub limit: usize,
+}
+
+/// One checkout-local managed workstream returned by discovery reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedWorkstreamSummary {
+    /// Stable workstream identifier used by explicit ledger search.
+    pub workstream_id: WorkstreamId,
+    /// Human-readable name accepted by `ai-memory run --workstream`.
+    pub name: String,
+    /// Creation timestamp in RFC 3339 form.
+    pub created_at: String,
+    /// Most recent selection or transcript-import timestamp in RFC 3339 form.
+    pub last_active_at: String,
+    /// Whether bare `ai-memory run` currently selects this workstream.
+    pub current: bool,
+    /// Harnesses with a current native session linked to this workstream.
+    #[serde(default)]
+    pub linked_harnesses: Vec<AgentKind>,
+}
+
+/// Checkout identity and selector for retitling one managed workstream.
+///
+/// The two selectors are mutually exclusive and the CLI enforces that before
+/// the request is built; the server still rejects a body carrying both or
+/// neither, since it cannot assume a well-behaved client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameManagedWorkstreamRequest {
+    /// Workspace name resolved by the host CLI.
+    pub workspace: String,
+    /// Project name resolved by the host CLI.
+    pub project: String,
+    /// Stable repository identity hash.
+    pub repo_fingerprint: String,
+    /// Stable worktree identity hash (distinct across linked worktrees).
+    pub worktree_fingerprint: String,
+    /// Current name of the workstream to retitle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Stable id of the workstream to retitle, as printed by discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workstream_id: Option<WorkstreamId>,
+    /// Replacement name.
+    pub to: String,
+}
+
+/// Result of a successful managed-workstream rename.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenamedManagedWorkstream {
+    /// The workstream that was retitled.
+    pub workstream_id: WorkstreamId,
+    /// Name before the rename.
+    pub from: String,
+    /// Name after the rename, as stored.
+    pub to: String,
+}
+
 /// Stored workstream event returned by history reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkstreamEvent {

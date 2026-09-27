@@ -17,6 +17,9 @@ ai-memory-consolidate.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 jiff.workspace = true
 secrecy.workspace = true
 serde.workspace = true

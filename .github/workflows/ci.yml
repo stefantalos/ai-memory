@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  # Manual full run (macOS legs included) — dispatch on the
+  # release-candidate SHA right before a release.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,7 +35,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -40,14 +44,20 @@ jobs:
       fail-fast: false
       matrix:
         # macOS catches stat / SELinux / case-sensitivity assumptions
-        # that wouldn't show up on a Linux-only matrix. Stays in step
-        # with the homelab deploy which is Linux.
-        os: [ubuntu-latest, macos-latest]
+        # that wouldn't show up on a Linux-only matrix. It costs most of
+        # the wall clock, so during iteration only Linux runs; the macOS
+        # leg joins on a `full-ci` PR label or a manual dispatch, and is
+        # MANDATORY right before a release (see AGENTS.md).
+        os: >-
+          ${{ (github.event_name == 'workflow_dispatch' ||
+               contains(github.event.pull_request.labels.*.name, 'full-ci'))
+              && fromJSON('["ubuntu-latest", "macos-latest"]')
+              || fromJSON('["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo test --workspace --all-targets
 
   # Native Windows coverage lives in `.github/workflows/windows.yml`: it
@@ -72,7 +82,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           workspaces: companions/ai-memory-importer
       - run: cargo fmt --check --manifest-path companions/ai-memory-importer/Cargo.toml
@@ -88,19 +98,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Keep Linux on Debian bookworm so the prebuilt binary matches the
-          # Docker runtime image. macOS entries mirror the release assets.
-          - artifact: linux-x86_64
-            runner: ubuntu-22.04
-          - artifact: macos-aarch64
-            runner: macos-15
-          - artifact: macos-x86_64
-            runner: macos-15-intel
+        # Keep Linux on Debian bookworm so the prebuilt binary matches the
+        # Docker runtime image. macOS entries mirror the release assets;
+        # they run only on `full-ci` / dispatch (mandatory pre-release),
+        # like the macOS test leg above.
+        include: >-
+          ${{ (github.event_name == 'workflow_dispatch' ||
+               contains(github.event.pull_request.labels.*.name, 'full-ci'))
+              && fromJSON('[{"artifact": "linux-x86_64", "runner": "ubuntu-22.04"},
+                            {"artifact": "macos-aarch64", "runner": "macos-15"},
+                            {"artifact": "macos-x86_64", "runner": "macos-15-intel"}]')
+              || fromJSON('[{"artifact": "linux-x86_64", "runner": "ubuntu-22.04"}]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - env:
           TAILWIND_SKIP: "1"
         run: cargo build --release --bin ai-memory
@@ -120,7 +132,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.95
         with:
           toolchain: "1.95"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Install with a fresh dependency resolution
         env:
           TAILWIND_SKIP: "1"
@@ -145,7 +157,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `check-changelog-frozen.sh` diffs against the merge base, so it
+          # needs history rather than a shallow clone.
+          fetch-depth: 0
       - run: scripts/check-changelog-sections.sh
+      - name: released sections stay frozen
+        run: scripts/check-changelog-frozen.sh "origin/${{ github.base_ref || github.event.repository.default_branch }}"
 
   # End-to-end docker smoke: packages the release-build binary and confirms
   # the image runs. Catches Dockerfile drift (missing COPY, bad ENTRYPOINT)
@@ -160,7 +178,7 @@ jobs:
         with:
           name: ci-ai-memory-linux-x86_64
           path: dist/docker/ai-memory-linux-x86_64
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: build image (local tag only)
         run: docker build --target runtime-prebuilt-amd64 -f docker/Dockerfile -t ai-memory:ci .
       - name: --version smoke
@@ -191,7 +209,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo install cargo-audit --locked
       - run: >
           cargo audit

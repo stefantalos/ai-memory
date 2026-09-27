@@ -7,6 +7,7 @@
 
 pub mod admission;
 mod atomic;
+pub mod backup;
 mod error;
 mod git;
 mod markdown;

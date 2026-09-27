@@ -10,7 +10,7 @@
 //!    semantic pages, feeds them to the LLM with a structured-output
 //!    prompt asking for contradictions / stale claims.
 //!
-//! Findings are written to `wiki/_lint/<YYYY-MM-DD>.md` so they're
+//! Findings are written to `wiki/_lint/report.md` so they're
 //! grep-able and tracked in git.
 
 /// System prompt for the contradiction-detection lint pass. Loaded
@@ -105,8 +105,10 @@ const STALE_SCORE_LN: f64 = 0.6;
 ///
 /// Concretely, at `lambda = 0.008` real eviction lands near day 201 while a
 /// fixed threshold still called the page stale on day 31 — and because the
-/// lint writes `_lint/<date>.md` whenever any finding exists, one page
+/// lint wrote `_lint/<date>.md` whenever any finding exists, one page
 /// nobody intends to read produced a new page every day, forever (#426).
+/// (The report now supersedes a single `_lint/report.md`, so even a
+/// permanently-stale page costs one page, not one per day.)
 ///
 /// `lambda = 0.02` (the default) yields exactly 30 days, so an operator who
 /// never touched decay sees no change.
@@ -129,7 +131,8 @@ pub fn stale_days_for(lambda: f64) -> f64 {
 /// input has to travel alongside them.
 #[derive(Debug, Clone, Copy)]
 pub struct LintOptions {
-    /// When `true`, no `_lint/<date>.md` page is written.
+    /// When `true`, no `_lint/report.md` page is written (and no legacy
+    /// dated reports are pruned).
     pub dry_run: bool,
     /// When `false`, the LLM contradiction pass is skipped even if a
     /// provider was supplied.
@@ -210,6 +213,32 @@ pub async fn run_lint(
         });
     }
 
+    // Declared contradictions (typed `contradicts` edges, 2.0 item 3):
+    // an author or the consolidator explicitly said two pages disagree —
+    // the highest-signal zero-LLM contradiction finding possible.
+    for edge in reader.contradiction_edges(workspace_id, project_id).await? {
+        let message = if edge.resolved {
+            format!(
+                "Page {} declares it contradicts {} — reconcile them or \
+                 supersede the outdated one",
+                edge.from_path, edge.to_path,
+            )
+        } else {
+            format!(
+                "Page {} declares it contradicts {}, which does not resolve \
+                 to a page (deleted or renamed) — the declaration is stale",
+                edge.from_path, edge.to_path,
+            )
+        };
+        findings.push(LintFinding {
+            kind: "contradiction".into(),
+            severity: "warning".into(),
+            message,
+            pages: vec![edge.from_path, edge.to_path],
+            detail: None,
+        });
+    }
+
     // Explicit `stale` / `wrong` feedback (memory_feedback). An agent or
     // user asserting a page is outdated or incorrect is the highest-signal
     // finding the zero-LLM path can produce — it came from a human/agent
@@ -257,8 +286,21 @@ pub async fn run_lint(
 
     let report = LintReport { findings };
 
-    if !dry_run && !report.findings.is_empty() {
-        write_report_page(wiki, workspace_id, project_id, &report).await?;
+    if !dry_run {
+        if report.findings.is_empty() {
+            // A clean project carries no lint page at all: a stale
+            // report claiming findings that no longer exist is itself
+            // the kind of noise the lint exists to flag.
+            remove_report_page(wiki, workspace_id, project_id, &candidates).await;
+        } else {
+            write_report_page(wiki, workspace_id, project_id, &report).await?;
+        }
+        // One report per project: the daily `_lint/<YYYY-MM-DD>.md`
+        // pages the pre-2.0.1 lint accumulated (thousands across a
+        // long-lived store — indexed, searched, and embedded) are
+        // machinery, not knowledge. Each pass prunes any it finds, so
+        // existing stores self-heal without a migration.
+        prune_legacy_dated_reports(wiki, workspace_id, project_id, &candidates).await;
     }
 
     Ok(report)
@@ -315,8 +357,14 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
             });
         }
         // Duplicate-title tracking: peek the frontmatter for a `title` field.
+        // An empty/blank title is not a meaningful shared title — several
+        // pages carrying `title: ""` (e.g. auto-improve pages whose stored
+        // frontmatter title was never filled) must not all collapse into one
+        // bogus `Multiple pages share title ""` finding (#599). Real titles
+        // still dedupe as before.
         if let Some(fm) = frontmatter.as_ref()
             && let Some(t) = fm.get("title").and_then(serde_json::Value::as_str)
+            && !t.trim().is_empty()
         {
             titles
                 .entry(t.to_lowercase())
@@ -411,6 +459,87 @@ async fn contradiction_pass(
     Ok(report.findings)
 }
 
+/// Stable per-project lint report path — superseded in place each run.
+const REPORT_PATH: &str = "_lint/report.md";
+
+/// Matches the legacy daily report naming: `_lint/YYYY-MM-DD.md`.
+fn is_legacy_dated_report(path: &str) -> bool {
+    let Some(name) = path
+        .strip_prefix("_lint/")
+        .and_then(|rest| rest.strip_suffix(".md"))
+    else {
+        return false;
+    };
+    name.len() == 10
+        && name.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+/// Delete `_lint/report.md` when the current pass found nothing.
+/// Best-effort: a delete rejected by an admission webhook or racing
+/// write only leaves a stale report for the next pass to retry.
+async fn remove_report_page(
+    wiki: &Wiki,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    candidates: &[ai_memory_store::DecayCandidate],
+) {
+    if !candidates.iter().any(|c| c.path.as_str() == REPORT_PATH) {
+        return;
+    }
+    let Ok(path) = PagePath::new(REPORT_PATH) else {
+        return;
+    };
+    if let Err(e) = wiki
+        .delete_page(
+            workspace_id,
+            project_id,
+            &path,
+            Some(AdmissionContext {
+                op: AdmissionOp::Consolidate,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+    {
+        warn!(error = %e, "lint: could not remove clean project's stale report");
+    }
+}
+
+/// Delete the accumulated pre-2.0.1 daily reports. Best-effort per
+/// page; anything that survives is retried by the next pass.
+async fn prune_legacy_dated_reports(
+    wiki: &Wiki,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    candidates: &[ai_memory_store::DecayCandidate],
+) {
+    for cand in candidates {
+        if !is_legacy_dated_report(cand.path.as_str()) {
+            continue;
+        }
+        let path = cand.path.clone();
+        if let Err(e) = wiki
+            .delete_page(
+                workspace_id,
+                project_id,
+                &path,
+                Some(AdmissionContext {
+                    op: AdmissionOp::Consolidate,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await
+        {
+            warn!(path = %cand.path, error = %e, "lint: could not prune legacy dated report");
+        }
+    }
+}
+
 async fn write_report_page(
     wiki: &Wiki,
     workspace_id: WorkspaceId,
@@ -421,7 +550,10 @@ async fn write_report_page(
         .to_zoned(TimeZone::UTC)
         .strftime("%Y-%m-%d")
         .to_string();
-    let path = PagePath::new(format!("_lint/{date}.md"))?;
+    // One stable path per project: each run supersedes the previous
+    // report (history stays in the version chain) instead of minting a
+    // new page per day.
+    let path = PagePath::new(REPORT_PATH)?;
     let title = format!("Lint report {date}");
     let body = render_markdown(report);
     wiki.write_page(WritePageRequest {
@@ -602,6 +734,34 @@ mod tests {
         let dupes: Vec<_> = findings.iter().filter(|f| f.kind == "duplicate").collect();
         assert_eq!(dupes.len(), 1);
         assert_eq!(dupes[0].pages.len(), 2);
+    }
+
+    #[test]
+    fn rule_pass_ignores_empty_titles_as_duplicates() {
+        // Several pages carrying `title: ""` (or blank) must NOT collapse
+        // into one bogus `Multiple pages share title ""` finding (#599).
+        let base = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/a.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: Timestamp::now().as_microsecond(),
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": ""}"#.into(),
+            expires_at_us: None,
+            salience: None,
+        };
+        let blank = DecayCandidate {
+            path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
+            frontmatter_json: r#"{"title": "   "}"#.into(),
+            ..base.clone()
+        };
+        let findings = rule_based_findings(&[base, blank], STALE_DAYS);
+        assert!(
+            !findings.iter().any(|f| f.kind == "duplicate"),
+            "empty/blank titles must not be reported as a shared title"
+        );
     }
 
     /// M20: a page tagged `kind: rule` in its frontmatter triggers

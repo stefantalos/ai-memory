@@ -47,7 +47,7 @@ git -C "$REPO" config user.name "ai-memory acceptance"
 git -C "$REPO" config user.email "acceptance@localhost"
 printf '# Managed workstream acceptance\n' >"$REPO/README.md"
 git -C "$REPO" add README.md
-git -C "$REPO" commit -qm "acceptance fixture"
+git -C "$REPO" commit -q --no-gpg-sign -m "acceptance fixture"
 
 TOKEN="managed-acceptance-$(date +%s)-$$"
 PORT=${AI_MEMORY_ACCEPTANCE_PORT:-$((52000 + ($$ % 10000)))}
@@ -1174,6 +1174,156 @@ mapfile -t adoption_claude_argv <"$TMP/adoption-claude-argv.log"
 }
 [ "${adoption_claude_argv[1]:-}" != obsolete-claude-id ] || {
   printf 'established workstream adopted an obsolete Claude session\n' >&2
+  exit 1
+}
+
+# `ai-memory workstreams` must answer from the same checkout identity `run`
+# selects with, without turning that identity into readable output. The list is
+# taken from the repository the previous legs launched in, so `edge-adopt` --
+# the workstream the Claude adoption leg selected last -- has to lead it.
+workstreams_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" workstreams --json)
+jq -e '(type == "array") and (length > 1)' <<<"$workstreams_json" >/dev/null || {
+  printf 'workstreams did not list this checkout\n' >&2
+  printf '%s\n' "$workstreams_json" >&2
+  exit 1
+}
+jq -e '[.[] | select(.current)] | length == 1' <<<"$workstreams_json" >/dev/null || {
+  printf 'workstreams did not mark exactly one current selection\n' >&2
+  printf '%s\n' "$workstreams_json" >&2
+  exit 1
+}
+jq -e '.[0].current and .[0].name == "edge-adopt"' <<<"$workstreams_json" >/dev/null || {
+  printf 'workstreams did not lead with the checkout current workstream\n' >&2
+  printf '%s\n' "$workstreams_json" >&2
+  exit 1
+}
+jq -e --arg name edge-kimi \
+  '[.[] | select(.name == $name and (.linked_harnesses | index("kimi-code")))] | length == 1' \
+  <<<"$workstreams_json" >/dev/null || {
+  printf 'workstreams did not report the harnesses linked to edge-kimi\n' >&2
+  printf '%s\n' "$workstreams_json" >&2
+  exit 1
+}
+# Discovery is a read of workstream metadata only: the checkout path, its
+# fingerprints, and native session ids must never travel back to the client.
+for leaked in "$REPO" "$kimi_session_id" adoption-codex-id; do
+  ! grep -qF -- "$leaked" <<<"$workstreams_json" || {
+    printf 'workstreams leaked private checkout or native session data: %s\n' \
+      "$leaked" >&2
+    exit 1
+  }
+done
+limited_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" workstreams --limit 1 --json)
+jq -e 'length == 1 and .[0].current' <<<"$limited_json" >/dev/null || {
+  printf 'workstreams --limit did not keep the current selection\n' >&2
+  printf '%s\n' "$limited_json" >&2
+  exit 1
+}
+workstreams_human=$(cd "$REPO" && "$BIN" --data-dir "$DATA" workstreams)
+grep -q '^\* edge-adopt' <<<"$workstreams_human" || {
+  printf 'human workstreams output did not mark the current selection\n' >&2
+  printf '%s\n' "$workstreams_human" >&2
+  exit 1
+}
+
+# A different worktree of the same project shares the workspace and project
+# names but must not inherit the first checkout list.
+OTHER_REPO="$TMP/repo-elsewhere"
+mkdir -p "$OTHER_REPO"
+git -C "$OTHER_REPO" init -q
+git -C "$OTHER_REPO" config user.name "ai-memory acceptance"
+git -C "$OTHER_REPO" config user.email "acceptance@localhost"
+printf '# elsewhere\n' >"$OTHER_REPO/README.md"
+git -C "$OTHER_REPO" add README.md
+git -C "$OTHER_REPO" commit -q --no-gpg-sign -m "acceptance fixture"
+other_json=$(cd "$OTHER_REPO" && "$BIN" --data-dir "$DATA" workstreams \
+  --project "$(basename "$REPO")" --json)
+jq -e 'length == 0' <<<"$other_json" >/dev/null || {
+  printf 'workstreams returned another checkout workstreams\n' >&2
+  printf '%s\n' "$other_json" >&2
+  exit 1
+}
+
+# `ai-memory rename-workstream` must correct a name without disturbing anything
+# keyed on the workstream. The id is stable, so the ledger, managed runs, and
+# linked native sessions follow the rename, and neither the listing order nor
+# the workstream a bare `ai-memory run` resumes may move as a side effect of
+# relabelling.
+before_rename_json=$workstreams_json
+adopt_id=$(jq -r '.[] | select(.name == "edge-adopt") | .workstream_id' \
+  <<<"$workstreams_json")
+rename_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --from edge-adopt --to edge-adopt-fixed --json)
+jq -e --arg id "$adopt_id" \
+  '.workstream_id == $id and .from == "edge-adopt" and .to == "edge-adopt-fixed"' \
+  <<<"$rename_json" >/dev/null || {
+  printf 'rename-workstream did not report the retitled workstream\n' >&2
+  printf '%s\n' "$rename_json" >&2
+  exit 1
+}
+renamed_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" workstreams --json)
+jq -e --arg id "$adopt_id" \
+  '.[0].current and .[0].name == "edge-adopt-fixed" and .[0].workstream_id == $id' \
+  <<<"$renamed_json" >/dev/null || {
+  printf 'rename moved the listing order or the current selection\n' >&2
+  printf '%s\n' "$renamed_json" >&2
+  exit 1
+}
+jq -e '[.[] | select(.name == "edge-adopt")] | length == 0' \
+  <<<"$renamed_json" >/dev/null || {
+  printf 'the name the rename replaced survived in the listing\n' >&2
+  printf '%s\n' "$renamed_json" >&2
+  exit 1
+}
+
+# A name another workstream in this checkout already holds is refused, as is a
+# name `run --new` would reject. Both must fail before writing anything.
+if (cd "$REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --from edge-kimi --to edge-adopt-fixed) >/dev/null 2>&1; then
+  printf 'rename-workstream took a name another workstream already holds\n' >&2
+  exit 1
+fi
+if (cd "$REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --from edge-kimi --to 'nested/name') >/dev/null 2>&1; then
+  printf 'rename-workstream took a name run --new would reject\n' >&2
+  exit 1
+fi
+
+# The stable id is unique across every checkout, so the scope predicate has to
+# repeat on the id selector: an id belonging to another worktree must read as
+# absent rather than as a renamable target.
+if (cd "$OTHER_REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --project "$(basename "$REPO")" --workstream-id "$adopt_id" \
+  --to hijacked) >/dev/null 2>&1; then
+  printf 'rename-workstream reached a workstream outside the calling checkout\n' >&2
+  exit 1
+fi
+
+# Renaming to the name it already carries writes nothing and is not an error.
+noop_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --from edge-adopt-fixed --to edge-adopt-fixed --json)
+jq -e '.from == .to and .to == "edge-adopt-fixed"' <<<"$noop_json" >/dev/null || {
+  printf 'renaming to the current name was not reported as a no-op\n' >&2
+  printf '%s\n' "$noop_json" >&2
+  exit 1
+}
+
+# Renaming back by id has to restore the listing exactly. Anything the refused
+# attempts, the no-op, or the rename itself touched -- a bumped `updated_at`, a
+# moved selection, a reordered row -- surfaces as a diff here.
+rename_back=$(cd "$REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --workstream-id "$adopt_id" --to edge-adopt)
+grep -q "Renamed workstream 'edge-adopt-fixed' to 'edge-adopt'" \
+  <<<"$rename_back" || {
+  printf 'human rename output did not report both names\n' >&2
+  printf '%s\n' "$rename_back" >&2
+  exit 1
+}
+after_rename_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" workstreams --json)
+[ "$after_rename_json" = "$before_rename_json" ] || {
+  printf 'a rename round trip left the listing changed\n' >&2
+  diff <(printf '%s\n' "$before_rename_json") \
+    <(printf '%s\n' "$after_rename_json") >&2 || true
   exit 1
 }
 

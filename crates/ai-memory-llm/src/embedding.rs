@@ -9,8 +9,9 @@
 //!   embedding so integration tests can demonstrate semantic
 //!   retrieval without an API key.
 //!
-//! Future: a local `ort` + `bge-small-en-v1.5` embedder. The trait is
-//! generic so dropping it in later doesn't touch consumers.
+//! * [`LocalEmbedder`](crate::local::LocalEmbedder) — in-process
+//!   pure-Rust BERT (`all-MiniLM-L6-v2`), no key and no server; see
+//!   `docs/local-embeddings.md`.
 
 use std::time::Duration;
 

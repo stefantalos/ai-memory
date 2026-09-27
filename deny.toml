@@ -11,7 +11,13 @@ feature-depth = 1
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # RUSTSEC-2024-0436: `paste` is unmaintained. Compile-time
+    # proc-macro helper pulled by the candle ML stack (local
+    # embeddings); no runtime code ships from it. Revisit when candle
+    # replaces it upstream.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2

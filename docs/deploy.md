@@ -105,7 +105,7 @@ CLI sends an `Authorization: Bearer <token>` header on every call; ai-memory's
 middleware validates with a constant-time comparison.
 
 **Encrypted transport.** Plain HTTP on the LAN means anyone with a
-packet capture can read the bearer token (and per-user tokens once
+packet capture can read the bearer token (and native `aim_` keys once
 multi-user mode is on) in transit. Add a TLS-terminating reverse
 proxy in front of ai-memory — Caddy with Let's Encrypt, Caddy with
 its internal CA, Cloudflare Tunnel, nginx, or external cert files —
@@ -188,6 +188,13 @@ gateway's worst-case generation time.
 
 ## Backups
 
+> **2.0 upgrade note:** the first start of a 2.0 image runs the OKF
+> format migration, which archives the entire data dir to
+> `/data/backups/` on the volume before touching anything (containers
+> are detected automatically; `AI_MEMORY_BACKUP_DIR` overrides). The
+> wiki homepage shows the archive's location until you delete it. See
+> [`MIGRATION-2.0.md`](MIGRATION-2.0.md).
+
 The data dir is whatever you mounted in `docker-compose.prod.yml`
 (default: `/var/opt/docker/utils/ai-memory/data/`). It contains:
 
@@ -209,6 +216,141 @@ scp "$SERVER:$DEPLOY_DIR/data/snapshot-$(date +%F).tar.gz" ./backups/
 
 The `ai-memory backup` command uses SQLite's online backup API so
 writes during the snapshot are coherent.
+
+## Sharing one server between people or harnesses
+
+A deployed server is the supported way to share a project — between teammates,
+or between several harnesses you run yourself. Two things are worth knowing
+before you hand out the URL.
+
+**One server per data directory.** Point two `ai-memory serve` processes at the
+same `data/` (a synced folder, an NFS mount, two containers on one volume) and
+they will each run their own writer and their own git handle on the wiki. SQLite
+survives it; the wiki and the in-process state do not. Run one server and let
+everyone connect to it — which is also what makes the shared-knowledge model
+work.
+
+**Check the isolation mode.** Unscoped MCP calls resolve "current project"
+through a pointer that, since v1.39, is keyed per caller. The startup line says
+which mode is live:
+
+```
+active-project isolation mode mode=PerActor …
+```
+
+`PerActor` is the default and the one you want on a shared server. `Single` is
+a single process-wide slot — fine for one harness, but concurrent sessions then
+share it, and unscoped **writes** resolve through it too. See
+[auto-scope.md](auto-scope.md) and [users.md](users.md#running-for-a-team).
+
+### How much load one server absorbs
+
+Every write goes through a single writer actor — the right design for SQLite,
+and the obvious question it raises is when that becomes the ceiling. Measured
+rather than estimated, with
+`cargo test -p ai-memory-store --test writer_throughput -- --ignored --nocapture`:
+
+| concurrent writers | throughput | mean latency |
+|---|---|---|
+| 1 | 42/s | 23.9 ms |
+| 8 | 295/s | 3.4 ms |
+| 32 | 698/s | 1.43 ms |
+| 128 | 700/s | 1.43 ms |
+
+Read it in two parts.
+
+**The ceiling is ~700 writes/second**, reached around 32 concurrent writers and
+flat from there — 128 writers produce the same throughput at the same latency.
+Past saturation the server applies backpressure instead of degrading: the queue
+is bounded at 1024 with an awaiting send, so a burst larger than the queue slows
+its producers down and still lands every write. Nothing is dropped, and nothing
+grows without limit.
+
+**Single-writer latency is dominated by `fsync`, not CPU.** One observation per
+commit costs about one disk sync; concurrency lets SQLite coalesce WAL commits,
+which is why throughput rises 17× while per-write latency *falls*.
+
+For capacity planning: an actively working agent emits on the order of one
+lifecycle write per tool call. Even at a pessimistic one tool call per second
+per agent, ~700/s is several hundred concurrently active agents — far beyond a
+team, and beyond most shared installs. The writer is not the thing that will
+break first.
+
+Two caveats before you lean on the numbers. They were taken on a fast local
+disk; because the cost is `fsync`, a network filesystem or a slow volume will
+be materially lower, which is another reason to keep the data dir on local
+storage. And they measure the store, not the HTTP front door — an install that
+saturates this is far more likely to be limited by the agent side than by
+SQLite.
+
+## Reclaiming disk space
+
+SQLite does not return deleted space to the filesystem. Deleted rows leave
+their pages on a **freelist**, which SQLite reuses as the database grows again.
+For a store in steady use that is the right behaviour and needs no attention.
+
+`ai-memory status` reports the figure that decides it:
+
+```
+  storage:      2.4 GiB on disk, 610.0 MiB reclaimable (25.4%)
+    `ai-memory compact --confirm` would return it (blocks writes while it runs)
+```
+
+The advisory line only appears once the backlog is worth acting on. When it
+does:
+
+```bash
+ssh "$SERVER" "docker exec ai-memory /usr/local/bin/ai-memory compact --confirm"
+```
+
+Compaction deletes nothing — it rebuilds the FTS indexes and `VACUUM`s.
+
+### Do not schedule an unconditional nightly VACUUM
+
+The obvious move is a nightly cron entry. Resist it:
+
+- `VACUUM` takes an **exclusive lock** and rewrites the entire database. Every
+  write blocks for the duration, which on a large store is minutes — and this
+  server's job is answering hook traffic, so blocking writes drops captures.
+- It needs free disk space of roughly the database's own size, so the nightly
+  job also sets a permanent floor on free space.
+- Because SQLite reuses free pages, a store in steady use usually has almost
+  nothing to reclaim. The nightly run pays the full cost for no benefit on most
+  nights.
+
+The case that genuinely leaves a large freelist is a **one-off deletion** — a
+`purge-project`, a big retention sweep, a `forget-sweep` over months of
+episodic pages. Those are events, not a schedule, and the destructive commands
+already offer `--compact` inline for exactly that moment.
+
+If you do want it automated, make it **conditional** on the figure above and
+put it in off hours:
+
+```bash
+#!/usr/bin/env bash
+# /usr/local/bin/ai-memory-compact-if-worthwhile
+set -euo pipefail
+
+RECLAIMABLE=$(ai-memory status --json | jq '.storage.reclaimable_bytes')
+THRESHOLD=$((1024 * 1024 * 1024))   # 1 GiB — tune to your store
+
+if [ "$RECLAIMABLE" -ge "$THRESHOLD" ]; then
+    ai-memory compact --confirm
+fi
+```
+
+Drive it from a systemd timer (`OnCalendar=Sun 04:00`, `Persistent=true`) or a
+host cron entry. A weekly check that usually does nothing costs one cheap
+`status` call; a nightly `VACUUM` that usually does nothing costs a write stall
+every night.
+
+### What compaction does not do
+
+It is not erasure. The wiki git history keeps page content in its objects and
+commit messages, and any backup taken earlier still holds everything. Compaction
+returns bytes from the live SQLite file — worth doing on its own terms, and not
+a guarantee that content is unrecoverable. See
+[lifecycle-ops.md](lifecycle-ops.md) for the full boundary.
 
 ## Rolling back
 

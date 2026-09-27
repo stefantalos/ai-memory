@@ -8,19 +8,22 @@ use std::str::FromStr as _;
 
 use ai_memory_core::{
     AgentKind, AuthLevel, Capability, FinishManagedRunRequest, FinishManagedRunResponse,
-    LinkManagedRunRequest, ManagedRunContextResponse, ManagedRunId, ManagedRunStatus,
-    NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse, Sanitizer,
+    LinkManagedRunRequest, ListManagedWorkstreamsRequest, ManagedRunContextResponse, ManagedRunId,
+    ManagedRunStatus, ManagedWorkstreamSummary, NewWorkstreamEvent, PrepareManagedRunRequest,
+    PrepareManagedRunResponse, RenameManagedWorkstreamRequest, RenamedManagedWorkstream, Sanitizer,
     WorkstreamEventKind, WorkstreamId,
 };
 use ai_memory_store::{
-    FinishWorkstreamRun, PrepareWorkstreamRun, ReaderPool, StoreError, WorkstreamSelection,
-    WriterHandle, create_explicit_scope,
+    FinishWorkstreamRun, PrepareWorkstreamRun, ReaderPool, RenameWorkstream, ScopeResolutionError,
+    StoreError, WorkstreamSelection, WorkstreamSelector, WriterHandle, create_explicit_scope,
+    lookup_existing_scope,
 };
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tracing::warn;
@@ -61,6 +64,8 @@ pub fn workstream_router(state: WorkstreamState) -> Router {
         )
         .route("/workstream/runs/{run_id}/link", post(link_run))
         .route("/workstream/runs/{run_id}/finish", post(finish_run))
+        .route("/workstream/recent", post(list_recent_workstreams))
+        .route("/workstream/rename", post(rename_workstream))
         .route("/workstream/{workstream_id}/events", get(search_events))
         .with_state(state)
 }
@@ -379,6 +384,184 @@ const fn default_event_limit() -> usize {
     20
 }
 
+async fn list_recent_workstreams(
+    State(state): State<WorkstreamState>,
+    level: Option<Extension<AuthLevel>>,
+    Json(request): Json<ListManagedWorkstreamsRequest>,
+) -> Response {
+    if let Err(response) = authorize(level, Capability::NormalRead) {
+        return response.into_response();
+    }
+    for (label, value) in [
+        ("workspace", request.workspace.as_str()),
+        ("project", request.project.as_str()),
+        ("repo_fingerprint", request.repo_fingerprint.as_str()),
+        (
+            "worktree_fingerprint",
+            request.worktree_fingerprint.as_str(),
+        ),
+    ] {
+        if value.trim().is_empty() {
+            return error(StatusCode::BAD_REQUEST, format!("{label} cannot be empty"));
+        }
+        if value.len() > MAX_NAME_BYTES {
+            return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
+        }
+    }
+    let scope = match lookup_existing_scope(
+        &state.reader,
+        request.workspace.trim(),
+        request.project.trim(),
+    )
+    .await
+    {
+        Ok(scope) => scope,
+        Err(failure) if failure.is_not_found() => {
+            return error(StatusCode::NOT_FOUND, failure.to_string());
+        }
+        Err(failure) if failure.is_bad_request() => {
+            return error(StatusCode::BAD_REQUEST, failure.to_string());
+        }
+        Err(ScopeResolutionError::Store(message)) => {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, message);
+        }
+        Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+    };
+    let summaries = match state
+        .reader
+        .recent_workstreams(
+            scope.workspace_id,
+            scope.project_id,
+            request.repo_fingerprint,
+            request.worktree_fingerprint,
+            request.limit.clamp(1, 100),
+        )
+        .await
+    {
+        Ok(summaries) => summaries,
+        Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+    };
+    let mut response = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let created_at = match Timestamp::from_microsecond(summary.created_at) {
+            Ok(timestamp) => timestamp.to_string(),
+            Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+        };
+        let last_active_at = match Timestamp::from_microsecond(summary.last_active_at) {
+            Ok(timestamp) => timestamp.to_string(),
+            Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+        };
+        response.push(ManagedWorkstreamSummary {
+            workstream_id: summary.workstream_id,
+            name: summary.name,
+            created_at,
+            last_active_at,
+            current: summary.current,
+            linked_harnesses: summary.linked_harnesses,
+        });
+    }
+    Json(response).into_response()
+}
+
+/// Retitle one checkout-local managed workstream.
+///
+/// A write surface, so it takes `NormalWrite` rather than the `NormalRead`
+/// the sibling discovery read uses. Scope still resolves through
+/// `lookup_existing_scope`: a rename never creates the workspace or project
+/// it names, and the store repeats the checkout predicate on the id lookup so
+/// an id belonging to another checkout reads as absent rather than renamable.
+async fn rename_workstream(
+    State(state): State<WorkstreamState>,
+    level: Option<Extension<AuthLevel>>,
+    Json(request): Json<RenameManagedWorkstreamRequest>,
+) -> Response {
+    if let Err(response) = authorize(level, Capability::NormalWrite) {
+        return response.into_response();
+    }
+    for (label, value) in [
+        ("workspace", request.workspace.as_str()),
+        ("project", request.project.as_str()),
+        ("repo_fingerprint", request.repo_fingerprint.as_str()),
+        (
+            "worktree_fingerprint",
+            request.worktree_fingerprint.as_str(),
+        ),
+        ("to", request.to.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return error(StatusCode::BAD_REQUEST, format!("{label} cannot be empty"));
+        }
+        if value.len() > MAX_NAME_BYTES {
+            return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
+        }
+    }
+    let selector = match (request.from.as_deref(), request.workstream_id) {
+        (Some(name), None) => {
+            let name = name.trim();
+            if name.is_empty() {
+                return error(StatusCode::BAD_REQUEST, "from cannot be empty");
+            }
+            if name.len() > MAX_NAME_BYTES {
+                return error(StatusCode::BAD_REQUEST, "from is too long");
+            }
+            WorkstreamSelector::Name(name.to_string())
+        }
+        (None, Some(id)) => WorkstreamSelector::Id(id),
+        (Some(_), Some(_)) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "from and workstream_id are mutually exclusive",
+            );
+        }
+        (None, None) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "one of from or workstream_id is required",
+            );
+        }
+    };
+    let scope = match lookup_existing_scope(
+        &state.reader,
+        request.workspace.trim(),
+        request.project.trim(),
+    )
+    .await
+    {
+        Ok(scope) => scope,
+        Err(failure) if failure.is_not_found() => {
+            return error(StatusCode::NOT_FOUND, failure.to_string());
+        }
+        Err(failure) if failure.is_bad_request() => {
+            return error(StatusCode::BAD_REQUEST, failure.to_string());
+        }
+        Err(ScopeResolutionError::Store(message)) => {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, message);
+        }
+        Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+    };
+    let renamed = match state
+        .writer
+        .rename_workstream(RenameWorkstream {
+            workspace_id: scope.workspace_id,
+            project_id: scope.project_id,
+            repo_fingerprint: request.repo_fingerprint,
+            worktree_fingerprint: request.worktree_fingerprint,
+            selector,
+            new_name: request.to,
+        })
+        .await
+    {
+        Ok(renamed) => renamed,
+        Err(failure) => return store_error_response(failure),
+    };
+    Json(RenamedManagedWorkstream {
+        workstream_id: renamed.workstream_id,
+        from: renamed.from,
+        to: renamed.to,
+    })
+    .into_response()
+}
+
 async fn search_events(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
@@ -554,7 +737,9 @@ fn parse_run_id(raw: &str) -> Result<ManagedRunId, ApiFailure> {
 
 fn store_error_response(failure: StoreError) -> Response {
     let status = match failure {
-        StoreError::WorkstreamBusy(_) | StoreError::Duplicate(_) => StatusCode::CONFLICT,
+        StoreError::WorkstreamBusy(_)
+        | StoreError::Duplicate(_)
+        | StoreError::WorkstreamNameTaken(_) => StatusCode::CONFLICT,
         StoreError::NotFound(_) => StatusCode::NOT_FOUND,
         StoreError::InvalidState(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -786,6 +971,186 @@ mod tests {
             .await
             .unwrap();
         (workspace_id, project_id)
+    }
+
+    #[tokio::test]
+    async fn rename_endpoint_is_scoped_and_reports_selector_misuse() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let prepared = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                selection: WorkstreamSelection::New("typo-nmae".into()),
+                ..prepare_input(workspace_id, project_id, AgentKind::OpenCode, "launcher")
+            })
+            .await
+            .unwrap();
+
+        fn request(from: Option<&str>, to: &str) -> RenameManagedWorkstreamRequest {
+            RenameManagedWorkstreamRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                from: from.map(str::to_owned),
+                workstream_id: None,
+                to: to.into(),
+            }
+        }
+
+        let ok = rename_workstream(
+            State(state.clone()),
+            None,
+            Json(request(Some("typo-nmae"), "refactor-db")),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let body = to_bytes(ok.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["from"], "typo-nmae");
+        assert_eq!(json["to"], "refactor-db");
+        assert_eq!(json["workstream_id"], prepared.workstream_id.to_string());
+        // The rename response is metadata like its sibling read: no checkout
+        // path, and no native session id.
+        let encoded = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!encoded.contains("/repo"));
+
+        // A name that exists, but in another worktree, must not be reachable.
+        let mut wrong_worktree = request(Some("refactor-db"), "stolen");
+        wrong_worktree.worktree_fingerprint = "other-worktree".into();
+        let response = rename_workstream(State(state.clone()), None, Json(wrong_worktree)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Unknown scopes stay 404 rather than being created by the write.
+        let mut missing = request(Some("refactor-db"), "stolen");
+        missing.workspace = "missing".into();
+        let response = rename_workstream(State(state.clone()), None, Json(missing)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Neither selector, and both selectors, are caller errors the server
+        // rejects on its own rather than trusting clap to have done it.
+        let neither = rename_workstream(State(state.clone()), None, Json(request(None, "x"))).await;
+        assert_eq!(neither.status(), StatusCode::BAD_REQUEST);
+        let mut both = request(Some("refactor-db"), "x");
+        both.workstream_id = Some(prepared.workstream_id);
+        let both = rename_workstream(State(state.clone()), None, Json(both)).await;
+        assert_eq!(both.status(), StatusCode::BAD_REQUEST);
+
+        // An invalid destination name is a 400, not a 500.
+        let invalid = rename_workstream(
+            State(state.clone()),
+            None,
+            Json(request(Some("refactor-db"), "a/b")),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        // A collision is a 409 naming the taken name.
+        store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                selection: WorkstreamSelection::New("taken".into()),
+                ..prepare_input(workspace_id, project_id, AgentKind::OpenCode, "other")
+            })
+            .await
+            .unwrap();
+        let conflict = rename_workstream(
+            State(state),
+            None,
+            Json(request(Some("refactor-db"), "taken")),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn recent_workstream_endpoint_is_checkout_scoped_and_read_only() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let prepared = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                selection: WorkstreamSelection::New("decide-after-death".into()),
+                ..prepare_input(workspace_id, project_id, AgentKind::OpenCode, "launcher")
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: prepared.run_id,
+                native_session_id: Some("private-native-id".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+
+        let response = list_recent_workstreams(
+            State(state.clone()),
+            None,
+            Json(ListManagedWorkstreamsRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                limit: 20,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json[0]["name"], "decide-after-death");
+        assert_eq!(
+            json[0]["linked_harnesses"],
+            serde_json::json!(["open-code"])
+        );
+        assert_eq!(json[0]["current"], true);
+        let encoded = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!encoded.contains("private-native-id"));
+        assert!(!encoded.contains("/repo"));
+
+        let other_checkout = list_recent_workstreams(
+            State(state.clone()),
+            None,
+            Json(ListManagedWorkstreamsRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "other-worktree".into(),
+                limit: 20,
+            }),
+        )
+        .await;
+        let body = to_bytes(other_checkout.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!([])
+        );
+
+        let missing = list_recent_workstreams(
+            State(state),
+            None,
+            Json(ListManagedWorkstreamsRequest {
+                workspace: "missing".into(),
+                project: "managed".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                limit: 20,
+            }),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

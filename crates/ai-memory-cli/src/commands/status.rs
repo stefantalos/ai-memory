@@ -41,12 +41,31 @@ struct Report {
     /// Derived-index diagnostics.
     #[serde(default)]
     derived: Derived,
+    /// Physical storage figures (absent from pre-#549 servers).
+    #[serde(default)]
+    storage: Storage,
     /// Hook-ingestion counters from the server process.
     #[serde(default)]
     ingest: Option<IngestReport>,
     /// Passive process-scoped provider health.
     #[serde(default)]
     providers: ProviderHealthSnapshot,
+    /// Write-queue depth `(queued, capacity)` (2.0 servers).
+    #[serde(default)]
+    write_queue: Option<(usize, usize)>,
+    /// Wiki-format state (2.0 servers).
+    #[serde(default)]
+    wiki_format: Option<WikiFormatReport>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct WikiFormatReport {
+    #[serde(default)]
+    okf_migrated: bool,
+    #[serde(default)]
+    backup_archive: Option<String>,
+    #[serde(default)]
+    backup_archive_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -64,11 +83,41 @@ struct Derived {
     observations_rows: u64,
     observations_fts_rows: u64,
     latest_pages_missing_embeddings: u64,
+    #[serde(default)]
+    latest_pages_unembeddable: u64,
+    #[serde(default)]
+    typed_links_from_latest_pages: Vec<(String, u64)>,
+    #[serde(default)]
+    embed_failures_unresolved: u64,
+    #[serde(default)]
+    embed_failures_recovered: u64,
     embedding_rows: u64,
     embedding_triples: Vec<EmbeddingTriple>,
     links_from_latest_pages: u64,
     unresolved_links_from_latest_pages: u64,
     stale_links_from_latest_pages: u64,
+}
+
+/// Suggest compaction only above this share of the file. Below it the
+/// exclusive lock costs more than the space is worth, and SQLite will reuse
+/// those pages on its own as the store grows.
+const RECLAIM_ADVICE_PCT: f64 = 20.0;
+
+/// …and only when the absolute figure is worth a stall. 20% of a 4 MiB
+/// database is not a reason to block every write.
+const RECLAIM_ADVICE_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct Storage {
+    page_size: u64,
+    page_count: u64,
+    freelist_count: u64,
+    database_bytes: u64,
+    reclaimable_bytes: u64,
+    /// Free space on the filesystem holding the database (absent from
+    /// pre-#629 servers).
+    #[serde(default)]
+    data_dir_free_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -122,10 +171,24 @@ fn report_offline_spool(spool: &SpoolHealth, json: bool) {
     }
 }
 
+/// Which capture mode the hook would enforce for this install (#446).
+///
+/// Reads the same file the hook reads rather than keeping a second source of
+/// truth that could drift from the one actually gating events. Anything
+/// unreadable or unrecognised reports the historical default, matching the
+/// hook's own fallback.
+fn resolve_capture_mode(data_dir: &std::path::Path) -> &'static str {
+    match std::fs::read_to_string(data_dir.join(crate::commands::hook::CAPTURE_MODE_FILE)) {
+        Ok(text) if text.trim().eq_ignore_ascii_case("allowlist") => "allowlist",
+        _ => "denylist",
+    }
+}
+
 /// Returns an error if the server is unreachable, returns non-2xx, or
 /// the response can't be parsed.
 pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+    let capture_mode = resolve_capture_mode(&config.data_dir);
 
     // Read the spool BEFORE contacting the server, and surface it even when
     // that call fails.
@@ -160,8 +223,10 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                     "observations": report.counts.observations,
                 },
                 "derived": report.derived,
+                "storage": report.storage,
                 "providers": report.providers,
                 "spool": spool,
+                "capture_mode": capture_mode,
                 "ingest": report.ingest,
                 "client": { "server_url": ep.url, "auth": ep.auth_token.is_some() },
             }))?
@@ -189,12 +254,86 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             "  embeddings:   {} rows; {} latest pages missing",
             report.derived.embedding_rows, report.derived.latest_pages_missing_embeddings
         );
+        if report.derived.latest_pages_unembeddable > 0 {
+            println!(
+                "    unembeddable: {} (empty body; no embedder can cover these)",
+                report.derived.latest_pages_unembeddable
+            );
+        }
+        for triple in &report.derived.embedding_triples {
+            println!(
+                "    {}/{} dim {}: {} rows",
+                triple.provider, triple.model, triple.dim, triple.count
+            );
+        }
+        // Only shown when there is something to act on. A recovered count with
+        // no outstanding failures is history, not a problem.
+        if report.derived.embed_failures_unresolved > 0 {
+            println!(
+                "    embed failures: {} unresolved ({} recovered since)",
+                report.derived.embed_failures_unresolved, report.derived.embed_failures_recovered
+            );
+        }
+        // The figure that makes a `compact` decision possible. Reported
+        // always, so "should I VACUUM?" has an answer other than a guess; the
+        // advisory line only appears once it is worth the exclusive lock.
+        if report.storage.database_bytes > 0 {
+            let pct = (report.storage.reclaimable_bytes as f64
+                / report.storage.database_bytes as f64)
+                * 100.0;
+            println!(
+                "  storage:      {} on disk, {} reclaimable ({pct:.1}%)",
+                super::compact::human_bytes(report.storage.database_bytes),
+                super::compact::human_bytes(report.storage.reclaimable_bytes),
+            );
+            if let Some(free) = report.storage.data_dir_free_bytes {
+                println!("    filesystem free: {}", super::compact::human_bytes(free));
+            }
+            if pct >= RECLAIM_ADVICE_PCT
+                && report.storage.reclaimable_bytes >= RECLAIM_ADVICE_MIN_BYTES
+            {
+                println!(
+                    "    `ai-memory compact --confirm` would return it \
+                     (blocks writes while it runs)"
+                );
+            }
+        }
         println!(
             "  links:        {} latest-page links (unresolved: {}, stale: {})",
             report.derived.links_from_latest_pages,
             report.derived.unresolved_links_from_latest_pages,
             report.derived.stale_links_from_latest_pages
         );
+        if !report.derived.typed_links_from_latest_pages.is_empty() {
+            let typed: Vec<String> = report
+                .derived
+                .typed_links_from_latest_pages
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect();
+            println!("    typed edges: {}", typed.join(", "));
+        }
+        if let Some(wiki) = &report.wiki_format {
+            let migrated = if wiki.okf_migrated {
+                "OKF v0.2 (migrated)"
+            } else {
+                "OKF v0.2 (native, no migration needed)"
+            };
+            match (&wiki.backup_archive, wiki.backup_archive_bytes) {
+                (Some(path), Some(bytes)) => println!(
+                    "  wiki format:  {migrated}; pre-migration backup still on disk: \
+                     {path} ({})",
+                    super::compact::human_bytes(bytes)
+                ),
+                _ => println!("  wiki format:  {migrated}"),
+            }
+        }
+        if let Some((queued, capacity)) = report.write_queue {
+            // A queue pinned near capacity is the wedged-writer signal.
+            if queued > 0 {
+                println!("  write queue:  {queued}/{capacity}");
+            }
+        }
         println!("  spool:");
         println!("    pending:    {}", spool.pending);
         println!("    oldest:     {}", spool_age_line(spool.oldest_age_ms));
@@ -213,6 +352,17 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             println!(
                 "    last write: {}",
                 last_write_line(ingest.last_persisted_ms)
+            );
+        }
+        // #446 + #428 interact here: under allowlist mode an unmarked
+        // repository never sends, so zero counters read exactly like a broken
+        // install. Deliberately outside the ingest block above: the mode is a
+        // client-side fact, and an older server returns no ingest section at
+        // all — which is precisely a case where the operator needs telling.
+        if capture_mode == "allowlist" {
+            println!(
+                "  capture mode: allowlist — repositories without a \
+                 .ai-memory.toml marker send nothing"
             );
         }
         println!("  providers:");
@@ -305,6 +455,34 @@ fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #428's counters and #446's gate compose into a trap: under allowlist
+    /// mode an unmarked repository never sends, so `accepted: 0` with an empty
+    /// spool looks exactly like a broken install. `status` must be able to say
+    /// which of the two it is. Resolved from the same file the hook enforces
+    /// from, so the two cannot drift.
+    #[test]
+    fn capture_mode_defaults_to_denylist_when_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_capture_mode(tmp.path()), "denylist");
+    }
+
+    #[test]
+    fn capture_mode_reports_allowlist_when_the_hook_would_enforce_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(crate::commands::hook::CAPTURE_MODE_FILE),
+            "allowlist\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_capture_mode(tmp.path()), "allowlist");
+        // The status reader and the hook enforcer must agree.
+        assert_eq!(
+            crate::commands::hook::CAPTURE_MODE_FILE,
+            "capture-mode",
+            "status reads the file the hook enforces from"
+        );
+    }
     use jiff::Timestamp;
 
     /// The offline path must be readable and, critically, must not write the
@@ -333,6 +511,32 @@ mod tests {
         report_offline_spool(&SpoolHealth::default(), true);
         report_offline_spool(&spool, false);
         report_offline_spool(&spool, true);
+    }
+
+    /// A pre-#629 server's `/admin/status` response has no
+    /// `data_dir_free_bytes` key at all; the field must default to `None`
+    /// rather than fail the whole `storage` object.
+    #[test]
+    fn storage_deserializes_without_free_space_from_an_older_server() {
+        let storage: Storage = serde_json::from_str(
+            r#"{"page_size":4096,"page_count":10,"freelist_count":0,
+                "database_bytes":40960,"reclaimable_bytes":0}"#,
+        )
+        .unwrap();
+        assert_eq!(storage.data_dir_free_bytes, None);
+    }
+
+    /// The signal #629 adds: once a server reports free space, it round-trips
+    /// through the CLI's own struct unchanged.
+    #[test]
+    fn storage_deserializes_free_space_from_a_current_server() {
+        let storage: Storage = serde_json::from_str(
+            r#"{"page_size":4096,"page_count":10,"freelist_count":0,
+                "database_bytes":40960,"reclaimable_bytes":0,
+                "data_dir_free_bytes":80740352}"#,
+        )
+        .unwrap();
+        assert_eq!(storage.data_dir_free_bytes, Some(80_740_352));
     }
 
     #[test]

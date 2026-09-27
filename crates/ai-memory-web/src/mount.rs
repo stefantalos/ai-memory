@@ -1,11 +1,10 @@
 //! Mounting orchestration for the `/api/v1` + web-UI HTTP surfaces.
 //!
-//! The host binary (`ai-memory serve`) builds its MCP/hook/admin router,
-//! then hands it to [`mount_web_router`] to nest the JSON API and mount
-//! either the operator's custom SPA (`--web-ui-dir`) or the built-in
-//! server-rendered wiki browser. Base-path / web-slug normalisation and
-//! `<base href>` injection live here too so the served HTML always
-//! resolves relative URLs under the configured prefix.
+//! The host binary (`ai-memory serve`) splits the JSON API and either the
+//! operator's custom SPA (`--web-ui-dir`) or built-in server-rendered wiki,
+//! attaches the appropriate public/dual-auth middleware, then merges them.
+//! Base-path normalisation and `<base href>` injection live here too so
+//! served HTML resolves relative URLs under the configured prefix.
 
 use std::convert::Infallible;
 use std::path::Path;
@@ -17,7 +16,7 @@ use ai_memory_wiki::Wiki;
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{HeaderName, Method, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tower::service_fn;
@@ -275,10 +274,9 @@ mod web_base_tests {
     }
 }
 
-/// Path / URL config the web mount needs. Bundling these together
-/// keeps `mount_web_router` and its helpers under clippy's
-/// `too_many_arguments` threshold without `#[allow]` papering over
-/// the call shape.
+/// Path / URL config the web mount needs. Bundling these together keeps
+/// [`split_web_routers`] below clippy's `too_many_arguments` threshold
+/// without hiding the call shape.
 pub struct WebMountSpec<'a> {
     /// Operator-supplied custom SPA directory (`--web-ui-dir`). `None`
     /// mounts the built-in server-rendered wiki browser instead.
@@ -295,49 +293,70 @@ pub struct WebMountSpec<'a> {
     pub base_path: &'a str,
 }
 
-/// Orchestrator: assemble the `/api/v1` + web-UI surfaces on top of
-/// `router`. Skips everything when web is disabled. Each concern lives
-/// in a dedicated helper below so this function reads as a four-step
-/// recipe (CORS-scoped API, slug normalisation, SPA-vs-builtin choice,
-/// final mount).
-pub fn mount_web_router(
+/// Public SPA vs dual-auth wiki/API split.
+///
+/// Custom `--web-ui-dir` shells are public (session login lives in the SPA).
+/// Builtin wiki pages and `/api/v1` are dual-auth.
+pub struct SplitWebRouters {
+    /// Unauthenticated custom SPA (empty when builtin wiki is mounted).
+    pub public: axum::Router,
+    /// `/api/v1` plus the builtin wiki when that is the chosen UI.
+    pub protected: axum::Router,
+}
+
+/// Split the web surfaces so the host can attach different auth layers.
+///
+/// # Errors
+/// Custom SPA `index.html` cannot be read.
+pub fn split_web_routers(
+    enable_web: bool,
+    reader: ReaderPool,
+    wiki: Wiki,
+    spec: WebMountSpec<'_>,
+) -> Result<SplitWebRouters> {
+    if !enable_web {
+        return Ok(SplitWebRouters {
+            public: axum::Router::new(),
+            protected: axum::Router::new(),
+        });
+    }
+    let api = build_api_router(&reader, &wiki, spec.cors_origins);
+    let protected_api = axum::Router::new().nest("/api/v1", api);
+    let slug = normalize_prefix(spec.web_slug);
+    let mount = if slug.is_empty() { "/" } else { slug.as_str() };
+    if let Some(dir) = spec.web_ui_dir {
+        let public = mount_custom_spa(
+            axum::Router::new(),
+            dir,
+            &slug,
+            spec.base_href,
+            spec.base_path,
+            mount,
+        )?;
+        return Ok(SplitWebRouters {
+            public,
+            protected: protected_api,
+        });
+    }
+    Ok(SplitWebRouters {
+        public: axum::Router::new(),
+        protected: mount_builtin_browser(protected_api, reader, wiki, &slug, spec.base_href, mount),
+    })
+}
+
+/// Test-only composition helper. Production must attach distinct auth
+/// middleware to [`SplitWebRouters::public`] and
+/// [`SplitWebRouters::protected`] before merging them.
+#[cfg(test)]
+fn mount_web_router(
     router: axum::Router,
     enable_web: bool,
     reader: ReaderPool,
     wiki: Wiki,
     spec: WebMountSpec<'_>,
 ) -> Result<axum::Router> {
-    if !enable_web {
-        return Ok(router);
-    }
-    // Register the web surfaces BEFORE applying the bearer middleware. In
-    // axum 0.8, `.layer()` only attaches to routes registered before the
-    // call; nesting after the layer would silently bypass auth for /web/*.
-    let router = router.nest(
-        "/api/v1",
-        build_api_router(&reader, &wiki, spec.cors_origins),
-    );
-
-    // Where the UI is mounted WITHIN the (already-applied) base path.
-    // Empty slug => the UI is the root of the base path itself.
-    let slug = normalize_prefix(spec.web_slug);
-    let mount = if slug.is_empty() { "/" } else { slug.as_str() };
-
-    // Custom SPA via --web-ui-dir (SPA fallback to index.html), otherwise
-    // the built-in server-side wiki browser. In both cases the served
-    // index carries an injected `<base href>` so relative asset/router
-    // URLs resolve under `{base_path}{web_slug}`.
-    if let Some(dir) = spec.web_ui_dir {
-        return mount_custom_spa(router, dir, &slug, spec.base_href, spec.base_path, mount);
-    }
-    Ok(mount_builtin_browser(
-        router,
-        reader,
-        wiki,
-        &slug,
-        spec.base_href,
-        mount,
-    ))
+    let split = split_web_routers(enable_web, reader, wiki, spec)?;
+    Ok(router.merge(split.protected).merge(split.public))
 }
 
 /// Build the `/api/v1` router and apply the per-origin CORS layer if
@@ -358,7 +377,11 @@ fn build_api_router(reader: &ReaderPool, wiki: &Wiki, cors_origins: &[String]) -
     let cors = CorsLayer::new()
         .allow_origin(parsed)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-csrf-token"),
+        ])
         .allow_credentials(true)
         .max_age(Duration::from_secs(600));
     info!(origins = ?cors_origins, "CORS layer attached to /api/v1");
@@ -580,6 +603,120 @@ mod tests {
         // absolute host root, outside the base-path nest.
         let router = router.merge(crate::favicon_router());
         (tmp, router)
+    }
+
+    /// The homepage shows the pre-migration backup notice while the
+    /// archive exists, and drops it once the archive is deleted
+    /// (docs/okf.md).
+    /// 2.0.1: the always-on backup banner is gone — the migration
+    /// dialog is the single carrier of the archive path and restore
+    /// pointer (and `ai-memory status` keeps the durable reminder).
+    #[tokio::test]
+    async fn homepage_has_no_backup_banner_and_dialog_carries_the_archive() {
+        let (tmp, router) = based_web_router("", "/web");
+
+        async fn body_of(router: &axum::Router) -> String {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        // No receipt: neither banner nor dialog.
+        let body = body_of(&router).await;
+        assert!(!body.contains("pre-migration backup of your memory"));
+        assert!(!body.contains("okf-dialog-overlay"));
+
+        // Receipt + archive present: still no banner — the dialog holds
+        // the archive path and the restore pointer instead.
+        let archive = tmp.path().join("fake-archive.tar.gz");
+        std::fs::write(&archive, b"gz").unwrap();
+        let receipt = ai_memory_wiki::backup::BackupReceipt {
+            archive_path: archive.clone(),
+            size_bytes: 2,
+            entries: 1,
+            created_at: "2026-09-01T00:00:00Z".into(),
+            label: "okf-v0.2".into(),
+            dest_free_bytes: None,
+        };
+        std::fs::write(
+            tmp.path().join(ai_memory_wiki::backup::BACKUP_RECEIPT_FILE),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        let body = body_of(&router).await;
+        assert!(
+            !body.contains("pre-migration backup of your memory"),
+            "the redundant banner must never render"
+        );
+        assert!(body.contains("okf-dialog-overlay"), "dialog missing");
+        assert!(body.contains("fake-archive.tar.gz"), "archive path missing");
+        assert!(body.contains("MIGRATION-2.0.md"), "restore pointer missing");
+    }
+
+    /// The one-time 2.0 explainer dialog renders whenever a migration
+    /// receipt exists — with recovery steps while the archive is
+    /// present, with the git-checkpoint fallback after it was deleted —
+    /// keyed for per-browser "do not show me again" dismissal.
+    #[tokio::test]
+    async fn homepage_migration_dialog_adapts_to_the_archive() {
+        let (tmp, router) = based_web_router("", "/web");
+
+        async fn body_of(router: &axum::Router) -> String {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        // No receipt → no dialog at all.
+        assert!(!body_of(&router).await.contains("okf-dialog-overlay"));
+
+        let archive = tmp.path().join("fake-archive.tar.gz");
+        std::fs::write(&archive, b"gz").unwrap();
+        let receipt = ai_memory_wiki::backup::BackupReceipt {
+            archive_path: archive.clone(),
+            size_bytes: 2,
+            entries: 1,
+            created_at: "2026-09-01T00:00:00Z".into(),
+            label: "okf-v0.2".into(),
+            dest_free_bytes: None,
+        };
+        std::fs::write(
+            tmp.path().join(ai_memory_wiki::backup::BACKUP_RECEIPT_FILE),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+
+        // Archive present → dialog with restore steps + dismissal key.
+        let body = body_of(&router).await;
+        assert!(body.contains("okf-dialog-overlay"));
+        assert!(body.contains("upgraded to the 2.0 format"));
+        assert!(body.contains("Do not show me again"));
+        assert!(
+            body.contains("ai-memory-okf-dialog-2026-09-01T00:00:00Z"),
+            "dismissal key must be migration-stamped"
+        );
+        assert!(body.contains("Unpack the archive"));
+
+        // Archive deleted → dialog still explains, recovery falls back
+        // to the git checkpoint; the inline banner is gone.
+        std::fs::remove_file(&archive).unwrap();
+        let body = body_of(&router).await;
+        assert!(body.contains("okf-dialog-overlay"));
+        assert!(body.contains("pre-okf-migration checkpoint"));
+        assert!(!body.contains("pre-migration backup of your memory"));
     }
 
     #[tokio::test]

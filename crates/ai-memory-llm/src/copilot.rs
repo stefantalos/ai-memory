@@ -20,7 +20,7 @@ use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use crate::types::{ChatRequest, ChatResponse, Usage};
 
 /// GitHub Copilot's public OAuth client id used by Copilot clients.
 pub const GITHUB_COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -409,10 +409,7 @@ fn build_chat_request<'a>(
     }
     for m in &request.messages {
         messages.push(CopilotMsg {
-            role: match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            },
+            role: m.role.as_str(),
             content: &m.content,
         });
     }
@@ -635,7 +632,6 @@ fn unix_epoch_to_ms(value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::ExposeSecret as _;
     use serde_json::json;
 
     use super::*;
@@ -814,10 +810,7 @@ mod tests {
     fn chat_request_uses_openai_compatible_shape() {
         let request = ChatRequest {
             system: Some("sys".into()),
-            messages: vec![crate::types::ChatMessage {
-                role: Role::User,
-                content: "hello".into(),
-            }],
+            messages: vec![crate::types::ChatMessage::user("hello")],
             temperature: Some(0.2),
             max_tokens: 123,
         };
