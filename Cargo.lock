@@ -92,6 +92,7 @@ dependencies = [
  "jiff",
  "rusqlite",
  "schemars",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2",
